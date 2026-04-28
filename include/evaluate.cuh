@@ -21,6 +21,22 @@ namespace phantom {
                                                      size_t size_QlP, size_t size_QlP_n, size_t size_Q, size_t size_Ql,
                                                      size_t beta, size_t reduction_threshold);
 
+    // Test/microbench-only host wrappers for the two matmul variants.
+    // These are exported from libPhantom; they let benchmarks call into the
+    // kernels without depending on hidden-visibility symbol pointers.
+    void launch_ks_matmul_legacy(uint64_t *dst, const uint64_t *c2, const uint64_t *const *evks,
+                                 const DModulus *modulus, size_t n, size_t size_QP, size_t size_QP_n,
+                                 size_t size_QlP, size_t size_QlP_n, size_t size_Q, size_t size_Ql,
+                                 size_t beta, size_t reduction_threshold, cudaStream_t stream);
+    void launch_ks_matmul_pipelined(uint64_t *dst, const uint64_t *c2, const uint64_t *const *evks,
+                                    const DModulus *modulus, size_t n, size_t size_QP, size_t size_QP_n,
+                                    size_t size_QlP, size_t size_QlP_n, size_t size_Q, size_t size_Ql,
+                                    size_t beta, cudaStream_t stream);
+    void launch_ks_matmul_vec(uint64_t *dst, const uint64_t *c2, const uint64_t *const *evks,
+                              const DModulus *modulus, size_t n, size_t size_QP, size_t size_QP_n,
+                              size_t size_QlP, size_t size_QlP_n, size_t size_Q, size_t size_Ql,
+                              size_t beta, cudaStream_t stream);
+
     // used by keyswitch_inplace
     void key_switch_inner_prod(uint64_t *p_cx, const uint64_t *p_t_mod_up, const uint64_t *const *rlk,
                                const phantom::DRNSTool &rns_tool, const DModulus *modulus_QP,
