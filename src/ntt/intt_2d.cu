@@ -1,10 +1,16 @@
 #include "ntt.cuh"
 #include "butterfly.cuh"
+#include "ntt_radix8_tmpl.cuh"
 
 using namespace std;
 using namespace phantom;
 using namespace phantom::util;
 using namespace phantom::arith;
+
+// The templated inverse NTT kernels live in include/ntt_radix8_tmpl.cuh
+// (namespace phantom::ntt::radix8) and are shared with the modup launchers in
+// ntt_modup.cu. The legacy non-templated kernel below stays for the
+// include_temp_mod / include_special_mod variants.
 
 __global__ static void
 inplace_inwt_radix8_phase1(uint64_t *inout,
@@ -721,14 +727,64 @@ inplace_inwt_radix8_phase2_include_temp_mod_and_scale(uint64_t *inout,
     }
 }
 
+// Templated launcher for the basic inverse NTT path. Uses the shared header
+// kernels.
+template <int LOG_N1, int LOG_N2>
+static inline void launch_inwt_2d_tmpl(uint64_t *inout,
+                                       const DNTTTable &ntt_tables,
+                                       size_t coeff_modulus_size,
+                                       size_t start_modulus_idx,
+                                       const cudaStream_t &stream) {
+    constexpr size_t n1         = 1ULL << LOG_N1;
+    constexpr size_t n2         = 1ULL << LOG_N2;
+    constexpr size_t block_p1   = 128;
+    // Phase 1 uses the bank-padded row-NTT layout.
+    constexpr size_t smem_p1    = phantom::ntt::radix8::smem_padded_total_uint64(n2)
+                                  * sizeof(uint64_t);
+    constexpr size_t group_p2   = n1 >> 3;
+    constexpr size_t block_p2   = group_p2 * per_block_pad;
+    constexpr size_t smem_p2    = (n1 + per_block_pad + 1) * per_block_pad * sizeof(uint64_t);
+
+    namespace r8 = phantom::ntt::radix8;
+    r8::inwt_phase1_oop<LOG_N1, LOG_N2>
+        <<<gridDimNTT, block_p1, smem_p1, stream>>>(
+            inout, inout,                         // in-place: src == dst
+            ntt_tables.itwiddle(),
+            ntt_tables.itwiddle_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx);
+
+    r8::inwt_phase2<LOG_N1, LOG_N2, false>
+        <<<gridDimNTT, block_p2, smem_p2, stream>>>(
+            inout,
+            ntt_tables.itwiddle(), ntt_tables.itwiddle_shoup(),
+            ntt_tables.n_inv_mod_q(), ntt_tables.n_inv_mod_q_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx,
+            nullptr, nullptr);
+}
+
 void nwt_2d_radix8_backward_inplace(uint64_t *inout,
                                     const DNTTTable &ntt_tables,
                                     size_t coeff_modulus_size,
                                     size_t start_modulus_idx,
                                     const cudaStream_t &stream) {
-    size_t poly_degree = ntt_tables.n();
-    size_t phase2_sample_size = SAMPLE_SIZE(poly_degree);
+    const size_t poly_degree = ntt_tables.n();
 
+    switch (poly_degree) {
+        case 4096:   launch_inwt_2d_tmpl<6, 6>(inout, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 8192:   launch_inwt_2d_tmpl<7, 6>(inout, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 16384:  launch_inwt_2d_tmpl<8, 6>(inout, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 32768:  launch_inwt_2d_tmpl<8, 7>(inout, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 65536:  launch_inwt_2d_tmpl<8, 8>(inout, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 131072: launch_inwt_2d_tmpl<8, 9>(inout, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        default: break;
+    }
+
+    // Legacy fallback for non-templated sizes.
+    size_t phase2_sample_size = SAMPLE_SIZE(poly_degree);
     const size_t phase1_sample_size = poly_degree / phase2_sample_size;
     constexpr size_t per_block_memory = blockDimNTT.x * per_thread_sample_size * sizeof(uint64_t);
     inplace_inwt_radix8_phase1<<<

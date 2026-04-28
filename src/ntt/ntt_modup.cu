@@ -1,10 +1,52 @@
 #include "ntt.cuh"
 #include "butterfly.cuh"
+#include "ntt_radix8_tmpl.cuh"
 
 using namespace std;
 using namespace phantom;
 using namespace phantom::util;
 using namespace phantom::arith;
+
+// Templated launchers for the modup backward path. Phase 1 is out-of-place
+// (in→out, modup pre-stage); phase 2 is in-place with optional scale.
+template <int LOG_N1, int LOG_N2, bool ScaleEnabled>
+static inline void launch_inwt_2d_modup_tmpl(
+    uint64_t *out, const uint64_t *in,
+    const DNTTTable &ntt_tables,
+    size_t coeff_modulus_size,
+    size_t start_modulus_idx,
+    const uint64_t *scale, const uint64_t *scale_shoup,
+    const cudaStream_t &stream) {
+    constexpr size_t n1       = 1ULL << LOG_N1;
+    constexpr size_t n2       = 1ULL << LOG_N2;
+    constexpr size_t block_p1 = 128;
+    // Phase 1 inverse uses the bank-padded row-NTT layout.
+    constexpr size_t smem_p1  = phantom::ntt::radix8::smem_padded_total_uint64(n2)
+                                * sizeof(uint64_t);
+    constexpr size_t group_p2 = n1 >> 3;
+    constexpr size_t block_p2 = group_p2 * per_block_pad;
+    constexpr size_t smem_p2  = (n1 + per_block_pad + 1) * per_block_pad * sizeof(uint64_t);
+
+    namespace r8 = phantom::ntt::radix8;
+
+    r8::inwt_phase1_oop<LOG_N1, LOG_N2><<<gridDimNTT, block_p1, smem_p1, stream>>>(
+            in, out,
+            ntt_tables.itwiddle(),
+            ntt_tables.itwiddle_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx);
+
+    r8::inwt_phase2<LOG_N1, LOG_N2, ScaleEnabled>
+        <<<gridDimNTT, block_p2, smem_p2, stream>>>(
+            out,
+            ntt_tables.itwiddle(), ntt_tables.itwiddle_shoup(),
+            ntt_tables.n_inv_mod_q(), ntt_tables.n_inv_mod_q_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx,
+            scale, scale_shoup);
+}
 
 __global__ static void
 inwt_radix8_phase1(uint64_t *out,
@@ -323,14 +365,23 @@ void nwt_2d_radix8_backward(uint64_t *out,
                             size_t coeff_modulus_size,
                             size_t start_modulus_idx,
                             const cudaStream_t &stream) {
-    size_t poly_degree = ntt_tables.n();
-    size_t phase2_sample_size = SAMPLE_SIZE(poly_degree);
+    const size_t poly_degree = ntt_tables.n();
 
+    switch (poly_degree) {
+        case 4096:   launch_inwt_2d_modup_tmpl<6, 6, false>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, nullptr, nullptr, stream); return;
+        case 8192:   launch_inwt_2d_modup_tmpl<7, 6, false>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, nullptr, nullptr, stream); return;
+        case 16384:  launch_inwt_2d_modup_tmpl<8, 6, false>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, nullptr, nullptr, stream); return;
+        case 32768:  launch_inwt_2d_modup_tmpl<8, 7, false>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, nullptr, nullptr, stream); return;
+        case 65536:  launch_inwt_2d_modup_tmpl<8, 8, false>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, nullptr, nullptr, stream); return;
+        case 131072: launch_inwt_2d_modup_tmpl<8, 9, false>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, nullptr, nullptr, stream); return;
+        default: break;
+    }
+
+    size_t phase2_sample_size = SAMPLE_SIZE(poly_degree);
     const size_t phase1_sample_size = poly_degree / phase2_sample_size;
     const size_t per_block_memory = blockDimNTT.x * per_thread_sample_size * sizeof(uint64_t);
     inwt_radix8_phase1<<<gridDimNTT, blockDimNTT, per_block_memory, stream>>>(
-            out,
-            in,
+            out, in,
             ntt_tables.itwiddle(),
             ntt_tables.itwiddle_shoup(),
             ntt_tables.modulus(),
@@ -361,14 +412,23 @@ void nwt_2d_radix8_backward_scale(uint64_t *out,
                                   const uint64_t *scale,
                                   const uint64_t *scale_shoup,
                                   const cudaStream_t &stream) {
-    size_t poly_degree = ntt_tables.n();
-    size_t phase2_sample_size = SAMPLE_SIZE(poly_degree);
+    const size_t poly_degree = ntt_tables.n();
 
+    switch (poly_degree) {
+        case 4096:   launch_inwt_2d_modup_tmpl<6, 6, true>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, scale, scale_shoup, stream); return;
+        case 8192:   launch_inwt_2d_modup_tmpl<7, 6, true>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, scale, scale_shoup, stream); return;
+        case 16384:  launch_inwt_2d_modup_tmpl<8, 6, true>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, scale, scale_shoup, stream); return;
+        case 32768:  launch_inwt_2d_modup_tmpl<8, 7, true>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, scale, scale_shoup, stream); return;
+        case 65536:  launch_inwt_2d_modup_tmpl<8, 8, true>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, scale, scale_shoup, stream); return;
+        case 131072: launch_inwt_2d_modup_tmpl<8, 9, true>(out, in, ntt_tables, coeff_modulus_size, start_modulus_idx, scale, scale_shoup, stream); return;
+        default: break;
+    }
+
+    size_t phase2_sample_size = SAMPLE_SIZE(poly_degree);
     const size_t phase1_sample_size = poly_degree / phase2_sample_size;
     const size_t per_block_memory = blockDimNTT.x * per_thread_sample_size * sizeof(uint64_t);
     inwt_radix8_phase1<<<gridDimNTT, blockDimNTT, per_block_memory, stream>>>(
-            out,
-            in,
+            out, in,
             ntt_tables.itwiddle(),
             ntt_tables.itwiddle_shoup(),
             ntt_tables.modulus(),

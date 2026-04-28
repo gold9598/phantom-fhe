@@ -1,10 +1,55 @@
 #include "ntt.cuh"
 #include "butterfly.cuh"
+#include "ntt_radix8_tmpl.cuh"
 
 using namespace std;
 using namespace phantom;
 using namespace phantom::util;
 using namespace phantom::arith;
+
+// Templated launcher for the fused moddown variant. Phase 1 reuses the basic
+// templated forward NTT; phase 2 reuses the same templated kernel with a custom
+// epilogue that fuses the (cx - NTT(delta)) * PInv computation, eliminating the
+// separate ct/delta write+read round-trip.
+template <int LOG_N1, int LOG_N2>
+static inline void launch_fnwt_2d_fuse_moddown_tmpl(
+    uint64_t *ct, const uint64_t *cx,
+    const uint64_t *bigPInv_mod_q, const uint64_t *bigPInv_mod_q_shoup,
+    uint64_t *delta,
+    const DNTTTable &ntt_tables,
+    size_t coeff_modulus_size,
+    size_t start_modulus_idx,
+    const cudaStream_t &stream) {
+    constexpr size_t n1       = 1ULL << LOG_N1;
+    constexpr size_t n2       = 1ULL << LOG_N2;
+    constexpr size_t group_p1 = n1 >> 3;
+    constexpr size_t block_p1 = group_p1 * per_block_pad;
+    constexpr size_t smem_p1  = (n1 + per_block_pad + 1) * per_block_pad * sizeof(uint64_t);
+    constexpr size_t block_p2 = 128;
+    constexpr size_t smem_p2  = phantom::ntt::radix8::smem_padded_total_uint64(n2)
+                                * sizeof(uint64_t);
+
+    namespace r8 = phantom::ntt::radix8;
+
+    r8::fnwt_phase1<LOG_N1, LOG_N2><<<gridDimNTT, block_p1, smem_p1, stream>>>(
+            delta,
+            ntt_tables.twiddle(),
+            ntt_tables.twiddle_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx);
+
+    r8::FuseModDownEpilogue epi{ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup};
+    r8::fnwt_phase2<LOG_N1, LOG_N2, r8::FuseModDownEpilogue>
+        <<<gridDimNTT, block_p2, smem_p2, stream>>>(
+            delta,
+            ntt_tables.twiddle(),
+            ntt_tables.twiddle_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx,
+            epi);
+}
 
 __global__ static void
 inplace_fnwt_radix8_phase1(uint64_t *inout,
@@ -227,7 +272,19 @@ void nwt_2d_radix8_forward_inplace_fuse_moddown(uint64_t *ct, const uint64_t *cx
                                                 size_t coeff_modulus_size,
                                                 size_t start_modulus_idx,
                                                 const cudaStream_t &stream) {
-    size_t poly_degree = ntt_tables.n();
+    const size_t poly_degree = ntt_tables.n();
+
+    switch (poly_degree) {
+        case 4096:   launch_fnwt_2d_fuse_moddown_tmpl<6, 6>(ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup, delta, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 8192:   launch_fnwt_2d_fuse_moddown_tmpl<7, 6>(ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup, delta, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 16384:  launch_fnwt_2d_fuse_moddown_tmpl<8, 6>(ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup, delta, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 32768:  launch_fnwt_2d_fuse_moddown_tmpl<8, 7>(ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup, delta, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 65536:  launch_fnwt_2d_fuse_moddown_tmpl<8, 8>(ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup, delta, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 131072: launch_fnwt_2d_fuse_moddown_tmpl<8, 9>(ct, cx, bigPInv_mod_q, bigPInv_mod_q_shoup, delta, ntt_tables, coeff_modulus_size, start_modulus_idx, stream); return;
+        default: break;
+    }
+
+    // Legacy fallback for unsupported sizes (e.g. n=2048).
     size_t phase1_sample_size = SAMPLE_SIZE(poly_degree);
     const size_t phase2_sample_size = poly_degree / phase1_sample_size;
     const size_t per_block_memory = blockDimNTT.x * per_thread_sample_size * sizeof(uint64_t);
@@ -244,7 +301,6 @@ void nwt_2d_radix8_forward_inplace_fuse_moddown(uint64_t *ct, const uint64_t *cx
             poly_degree,
             phase1_sample_size,
             per_block_pad);
-    // max 512 threads per block
     inplace_fnwt_radix8_phase2_fuse_moddown<<<
     gridDimNTT, blockDimNTT, per_block_memory, stream>>>(
             ct, cx,
