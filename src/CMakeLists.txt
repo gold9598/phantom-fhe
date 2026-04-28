@@ -11,6 +11,7 @@ add_library(Phantom SHARED
         rns_bconv.cu
         scalingvariant.cu
         evaluate.cu
+        evalmod.cu
         fft.cu
         ckks.cu
         galois.cu
