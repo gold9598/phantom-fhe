@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 
 #include "phantom.h"
+#include "bootstrap.h"
 
 namespace py = pybind11;
 
@@ -55,10 +56,15 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def(py::init<>());
 
     py::class_<PhantomContext>(m, "context")
-            .def(py::init<phantom::EncryptionParameters &>());
+            .def(py::init<phantom::EncryptionParameters &>())
+            .def("total_parm_size", &PhantomContext::total_parm_size)
+            .def("get_first_index", &PhantomContext::get_first_index);
 
     py::class_<PhantomSecretKey>(m, "secret_key")
+            .def(py::init<>())
             .def(py::init<const PhantomContext &>())
+            .def("generate_sparse", &PhantomSecretKey::generate_sparse,
+                 py::arg("context"), py::arg("hamming_weight"))
             .def("gen_publickey", &PhantomSecretKey::gen_publickey)
             .def("gen_relinkey", &PhantomSecretKey::gen_relinkey)
             .def("create_galois_keys", &PhantomSecretKey::create_galois_keys)
@@ -120,7 +126,9 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     py::class_<PhantomCiphertext>(m, "ciphertext")
             .def(py::init<>())
-            .def("set_scale", &PhantomCiphertext::set_scale);
+            .def("set_scale", &PhantomCiphertext::set_scale)
+            .def("chain_index", [](const PhantomCiphertext &ct) { return ct.chain_index(); })
+            .def("scale", [](const PhantomCiphertext &ct) { return ct.scale(); });
 
     m.def("negate", &phantom::negate, py::arg(), py::arg());
 
@@ -158,9 +166,68 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("mod_switch_to", py::overload_cast<const PhantomContext &, const PhantomCiphertext &, size_t>(
             &phantom::mod_switch_to), py::arg(), py::arg(), py::arg());
 
-    m.def("apply_galois", &phantom::apply_galois, py::arg(), py::arg(), py::arg(), py::arg());
+    m.def("mod_switch_to_inplace",
+          py::overload_cast<const PhantomContext &, PhantomCiphertext &, size_t>(
+                  &phantom::mod_switch_to_inplace),
+          py::arg(), py::arg(), py::arg());
 
-    m.def("rotate", &phantom::rotate, py::arg(), py::arg(), py::arg(), py::arg());
+    m.def("mod_switch_to_inplace",
+          py::overload_cast<const PhantomContext &, PhantomPlaintext &, size_t>(
+                  &phantom::mod_switch_to_inplace),
+          py::arg(), py::arg(), py::arg());
+
+    m.def("apply_galois",
+          py::overload_cast<const PhantomContext &, const PhantomCiphertext &, size_t,
+                            const PhantomGaloisKey &>(&phantom::apply_galois),
+          py::arg(), py::arg(), py::arg(), py::arg());
+
+    m.def("rotate",
+          py::overload_cast<const PhantomContext &, const PhantomCiphertext &, int,
+                            const PhantomGaloisKey &>(&phantom::rotate),
+          py::arg(), py::arg(), py::arg(), py::arg());
 
     m.def("hoisting", &phantom::hoisting, py::arg(), py::arg(), py::arg(), py::arg());
+
+    // ===== CKKS bootstrap (Phase 6) =====
+    py::class_<phantom::SmallBootstrapKey>(m, "small_bootstrap_key");
+
+    py::class_<phantom::BootstrapKey>(m, "bootstrap_key");
+
+    // Compute the union of Galois elements needed by C2S + S2C for the given
+    // log_n and stages_per_layer, plus the conjugation element (2N-1).
+    // Returns a list of uint32_t galois elements suitable for
+    // params.set_galois_elts(). Default stages=[5,5,5] for logN=16.
+    m.def("bootstrap_required_galois_elts",
+          [](int log_n, std::vector<int> stages_per_layer) -> std::vector<uint32_t> {
+              const size_t N = size_t(1) << log_n;
+              const int num_slots = static_cast<int>(N >> 1);
+              auto c2s_h = phantom::build_c2s_diagonals(log_n, stages_per_layer);
+              auto s2c_h = phantom::build_s2c_diagonals(log_n, stages_per_layer);
+              auto c2s_steps = phantom::c2s_required_rotation_steps(c2s_h, num_slots);
+              auto s2c_steps = phantom::c2s_required_rotation_steps(s2c_h, num_slots);
+              std::vector<int> all_steps = c2s_steps;
+              all_steps.insert(all_steps.end(), s2c_steps.begin(), s2c_steps.end());
+              std::sort(all_steps.begin(), all_steps.end());
+              all_steps.erase(std::unique(all_steps.begin(), all_steps.end()), all_steps.end());
+              auto elts = phantom::util::get_elts_from_steps(all_steps, N);
+              elts.push_back(static_cast<uint32_t>(2 * N - 1)); // conjugation
+              return elts;
+          },
+          py::arg("log_n"),
+          py::arg("stages_per_layer") = std::vector<int>{5, 5, 5});
+
+    m.def("create_bootstrap_key", &phantom::create_bootstrap_key,
+          py::arg("context"),
+          py::arg("encoder"),
+          py::arg("dense_sk"),
+          py::arg("sparse_hamming_weight") = 128,
+          py::arg("eval_mod_levels") = 0,
+          py::arg("user_scale") = 0.0);
+
+    m.def("bootstrap", &phantom::bootstrap,
+          py::arg("context"),
+          py::arg("encoder"),
+          py::arg("ct"),
+          py::arg("bk"),
+          py::arg("user_scale"));
 }

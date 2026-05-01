@@ -3,6 +3,10 @@
 #include "scalingvariant.cuh"
 #include "secretkey.h"
 
+#include <cstdint>
+#include <random>
+#include <vector>
+
 using namespace std;
 using namespace phantom;
 using namespace phantom::util;
@@ -294,6 +298,59 @@ void PhantomSecretKey::encrypt_zero_symmetric(const PhantomContext &context, Pha
     }
 }
 
+void PhantomRelinKey::mod_drop_to_inplace(const PhantomContext &context,
+                                          std::size_t target_chain_index) {
+    if (!gen_flag_) {
+        throw std::invalid_argument("mod_drop_to_inplace: KSK not generated");
+    }
+
+    // Compute the keyswitch decomposition (`beta_k`) needed at the
+    // target chain index. The keyswitch kernel iterates `i < beta_k`
+    // over `public_keys_`; entries beyond `beta_k` are unused and can
+    // be freed.
+    auto &key_parms = context.get_context_data(0).parms();
+    const std::size_t size_P  = key_parms.special_modulus_size();
+    const std::size_t size_QP = key_parms.coeff_modulus().size();
+    const std::size_t size_Q  = size_QP - size_P;
+    const std::size_t alpha   = size_P; // dnum partitioning unit
+
+    // size_Ql at `target_chain_index`: each step of `target_chain_index`
+    // beyond first_idx (=1) drops one ordinary prime. At chain_index k
+    // (1 <= k <= total_parm_size - 1), size_Ql = size_Q - (k - 1).
+    if (target_chain_index < 1 || target_chain_index > size_Q) {
+        throw std::invalid_argument("mod_drop_to_inplace: target_chain_index out of range");
+    }
+    const std::size_t levels_dropped = target_chain_index - 1;
+    const std::size_t size_Ql = size_Q - levels_dropped;
+    const std::size_t beta_k =
+        (size_Ql + alpha - 1) / alpha; // ceil(size_Ql / alpha)
+
+    if (beta_k > public_keys_.size()) {
+        throw std::logic_error(
+            "mod_drop_to_inplace: target chain requires more dnum entries than KSK has");
+    }
+    if (beta_k == public_keys_.size()) {
+        // Already at (or below) the target — nothing to drop.
+        return;
+    }
+
+    // Truncate the host-side vector first; this drops the device buffers
+    // of the unused dnum entries via PhantomCiphertext destructors.
+    public_keys_.resize(beta_k);
+
+    // Rebuild the device pointer table with only the surviving entries.
+    const auto &stream = cudaStreamPerThread;
+    public_keys_ptr_ = phantom::util::make_cuda_auto_ptr<uint64_t *>(beta_k, stream);
+    std::vector<uint64_t *> pk_ptr(beta_k);
+    for (std::size_t i = 0; i < beta_k; ++i) {
+        pk_ptr[i] = public_keys_[i].pk_.data();
+    }
+    cudaMemcpyAsync(public_keys_ptr_.get(), pk_ptr.data(),
+                    sizeof(uint64_t *) * beta_k,
+                    cudaMemcpyHostToDevice, stream);
+    cudaStreamSynchronize(stream);
+}
+
 void PhantomSecretKey::generate_one_kswitch_key(const PhantomContext &context, uint64_t *new_key,
                                                 PhantomRelinKey &relin_keys, const cudaStream_t &stream) const {
     // Extract encryption parameters.
@@ -340,6 +397,80 @@ void PhantomSecretKey::generate_one_kswitch_key(const PhantomContext &context, u
             alpha, bigP_mod_q, bigP_mod_q_shoup);
 }
 
+void PhantomSecretKey::generate_one_kswitch_key_at_level(const PhantomContext &context, uint64_t *new_key,
+                                                         PhantomRelinKey &relin_keys,
+                                                         std::size_t target_chain_index,
+                                                         const cudaStream_t &stream) const {
+    // Fall back to the full-Q variant when no level was specified.
+    if (target_chain_index == 0) {
+        generate_one_kswitch_key(context, new_key, relin_keys, stream);
+        return;
+    }
+
+    // Extract encryption parameters.
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto &key_modulus = key_parms.coeff_modulus();
+    auto poly_degree = key_parms.poly_modulus_degree();
+    auto base_rns = context.gpu_rns_tables().modulus();
+
+    const size_t size_P  = key_parms.special_modulus_size();
+    const size_t size_QP = key_modulus.size();
+    const size_t size_Q  = size_QP - size_P;
+    const size_t dnum_full = size_Q / size_P; // full-Q partition count
+    const size_t alpha   = size_P;
+
+    // Mirror `mod_drop_to_inplace`'s level math: at chain_index k>=1,
+    // size_Ql = size_Q - (k - 1), and beta_k = ceil(size_Ql / size_P).
+    if (target_chain_index > size_Q) {
+        throw std::invalid_argument(
+            "generate_one_kswitch_key_at_level: target_chain_index out of range");
+    }
+    const size_t levels_dropped = target_chain_index - 1;
+    const size_t size_Ql        = size_Q - levels_dropped;
+    const size_t beta_k         = (size_Ql + alpha - 1) / alpha;
+    if (beta_k == 0 || beta_k > dnum_full) {
+        throw std::logic_error(
+            "generate_one_kswitch_key_at_level: computed beta_k is invalid");
+    }
+
+    auto bigP_mod_q = context.get_context_data(0).gpu_rns_tool().bigP_mod_q();
+    auto bigP_mod_q_shoup = context.get_context_data(0).gpu_rns_tool().bigP_mod_q_shoup();
+
+    // Generate only `beta_k` partition entries; each pk_ is still encrypted
+    // at the full key-level RNS (size_QP) because the keyswitch kernel
+    // addresses partitions by absolute tower index. This produces a KSK that
+    // is structurally identical to a `dnum=beta_k`-truncated full-Q KSK, but
+    // never materialises the dropped `dnum_full - beta_k` partitions.
+    relin_keys.public_keys_.resize(beta_k);
+    relin_keys.public_keys_ptr_ = make_cuda_auto_ptr<uint64_t *>(beta_k, stream);
+
+    for (size_t twr = 0; twr < beta_k; twr++) {
+        PhantomPublicKey pk;
+        pk.prng_seed_a_ = make_cuda_auto_ptr<uint8_t>(phantom::util::global_variables::prng_seed_byte_count, stream);
+        random_bytes(pk.prng_seed_a_.get(), phantom::util::global_variables::prng_seed_byte_count, stream);
+        encrypt_zero_symmetric(context, pk.pk_, pk.prng_seed_a_.get(), 0, true, stream);
+        pk.gen_flag_ = true;
+        relin_keys.public_keys_[twr] = std::move(pk);
+    }
+
+    std::vector<uint64_t *> pk_ptr(beta_k);
+    for (size_t twr = 0; twr < beta_k; twr++)
+        pk_ptr[twr] = relin_keys.public_keys_[twr].pk_.data();
+    cudaMemcpyAsync(relin_keys.public_keys_ptr_.get(), pk_ptr.data(),
+                    sizeof(uint64_t *) * beta_k, cudaMemcpyHostToDevice, stream);
+
+    // Add P_{w,q}(s')+(-(as+e)) only over the `beta_k` surviving partitions.
+    // The kernel's per-thread mapping uses (dnum, alpha) to decide which Q
+    // partition each tower belongs to; passing `beta_k` here matches the
+    // partition count used by the keyswitch kernel at this level.
+    uint64_t gridDimGlb = poly_degree * beta_k * alpha / blockDimGlb.x;
+    multiply_temp_mod_and_add_rns_poly<<<gridDimGlb, blockDimGlb, 0, stream>>>(
+            new_key, relin_keys.public_keys_ptr_.get(), base_rns,
+            relin_keys.public_keys_ptr_.get(), poly_degree, beta_k, alpha,
+            bigP_mod_q, bigP_mod_q_shoup);
+}
+
 void PhantomSecretKey::gen_secretkey(const PhantomContext &context) {
     if (gen_flag_) {
         throw std::logic_error("cannot generate secret key twice");
@@ -374,6 +505,71 @@ void PhantomSecretKey::gen_secretkey(const PhantomContext &context) {
     // Compute the NTT form of secret key and
     // save secret_key to the first coeff_mod_size * N elements of secret_key_array
     nwt_2d_radix8_forward_inplace(secret_key_array_.get(), context.gpu_rns_tables(), coeff_mod_size, 0, s);
+
+    sk_max_power_ = 1;
+    gen_flag_ = true;
+}
+
+void PhantomSecretKey::gen_secretkey_sparse(const PhantomContext &context,
+                                            std::size_t hamming_weight) {
+    if (gen_flag_) {
+        throw std::logic_error("cannot generate secret key twice");
+    }
+
+    const cudaStream_t &stream = cudaStreamPerThread;
+
+    auto &context_data = context.get_context_data(0);
+    auto &parms = context_data.parms();
+    auto &coeff_modulus = parms.coeff_modulus();
+    const auto poly_degree    = parms.poly_modulus_degree();
+    const auto coeff_mod_size = coeff_modulus.size();
+
+    if (hamming_weight == 0 || hamming_weight > poly_degree) {
+        throw std::invalid_argument(
+            "gen_secretkey_sparse: hamming_weight must be in (0, N]");
+    }
+
+    poly_modulus_degree_ = poly_degree;
+    coeff_modulus_size_ = coeff_mod_size;
+
+    // Build the sparse ternary poly host-side: pick `hw` distinct positions
+    // uniformly, assign ±1 uniformly, others 0. Then lift to each RNS tower
+    // (−1 → modulus − 1, +1 → 1, 0 → 0).
+    std::vector<int8_t> coeffs(poly_degree, 0);
+    {
+        std::random_device rd;
+        std::mt19937_64 rng(((uint64_t)rd() << 32) ^ rd());
+
+        // Reservoir-style: pick `hw` distinct indices via partial Fisher–Yates.
+        std::vector<std::size_t> idx(poly_degree);
+        for (std::size_t i = 0; i < poly_degree; ++i) idx[i] = i;
+        for (std::size_t k = 0; k < hamming_weight; ++k) {
+            std::size_t r = k + (rng() % (poly_degree - k));
+            std::swap(idx[k], idx[r]);
+            coeffs[idx[k]] = (rng() & 1ULL) ? +1 : -1;
+        }
+    }
+
+    // RNS-lift to host buffer of size coeff_mod_size * poly_degree.
+    std::vector<uint64_t> host_sk(poly_degree * coeff_mod_size);
+    for (std::size_t twr = 0; twr < coeff_mod_size; ++twr) {
+        const uint64_t q = coeff_modulus[twr].value();
+        uint64_t *row = host_sk.data() + twr * poly_degree;
+        for (std::size_t i = 0; i < poly_degree; ++i) {
+            const int8_t c = coeffs[i];
+            row[i] = (c == 0) ? 0ULL : (c == 1 ? 1ULL : q - 1ULL);
+        }
+    }
+
+    secret_key_array_ = make_cuda_auto_ptr<uint64_t>(poly_degree * coeff_mod_size, stream);
+    cudaMemcpyAsync(secret_key_array_.get(), host_sk.data(),
+                    sizeof(uint64_t) * host_sk.size(),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Forward NTT in place (same as the dense path).
+    nwt_2d_radix8_forward_inplace(secret_key_array_.get(),
+                                  context.gpu_rns_tables(),
+                                  coeff_mod_size, 0, stream);
 
     sk_max_power_ = 1;
     gen_flag_ = true;
@@ -418,6 +614,31 @@ PhantomRelinKey PhantomSecretKey::gen_relinkey(const PhantomContext &context) {
     return relin_key;
 }
 
+PhantomRelinKey PhantomSecretKey::create_kswitch_key(const PhantomContext &context,
+                                                     const PhantomSecretKey &target_sk) const {
+    if (!gen_flag_ || target_sk.gen_flag_ == false) {
+        throw std::logic_error("create_kswitch_key: both secret keys must be generated");
+    }
+    if (target_sk.poly_modulus_degree_ != poly_modulus_degree_ ||
+        target_sk.coeff_modulus_size_ != coeff_modulus_size_) {
+        throw std::invalid_argument(
+            "create_kswitch_key: target_sk shape mismatch (must share the same context)");
+    }
+
+    PhantomRelinKey ksk;
+    const auto &s = cudaStreamPerThread;
+
+    // *this is the encryptor secret; we encapsulate target_sk's secret poly
+    // (already NTT/RNS-decomposed at the key level) under *this. The result is
+    // a KSK that switches a ciphertext under target_sk into one under *this.
+    generate_one_kswitch_key(
+        context,
+        const_cast<uint64_t *>(target_sk.secret_array_device_ptr()),
+        ksk, s);
+    ksk.gen_flag_ = true;
+    return ksk;
+}
+
 PhantomGaloisKey PhantomSecretKey::create_galois_keys(const PhantomContext &context) const {
     PhantomGaloisKey galois_keys;
 
@@ -458,6 +679,84 @@ PhantomGaloisKey PhantomSecretKey::create_galois_keys(const PhantomContext &cont
     galois_keys.gen_flag_ = true;
 
     return galois_keys;
+}
+
+PhantomGaloisKey PhantomSecretKey::create_galois_keys_for_indices(
+        const PhantomContext &context,
+        const std::vector<std::size_t> &indices) const {
+    PhantomGaloisKey galois_keys;
+
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto &key_modulus = key_parms.coeff_modulus();
+    auto &key_galois_tool = context.key_galois_tool_;
+    auto poly_degree = key_parms.poly_modulus_degree();
+    auto key_mod_size = key_modulus.size();
+
+    const auto &s = cudaStreamPerThread;
+    auto &galois_elts = key_galois_tool->galois_elts();
+    auto relin_key_num = galois_elts.size();
+
+    // Size the vector to match the full galois_elts table; only fill `indices`.
+    galois_keys.relin_keys_.resize(relin_key_num);
+
+    auto rotated_secret_key = make_cuda_auto_ptr<uint64_t>(key_mod_size * poly_degree, s);
+    auto secret_key = secret_key_array_.get();
+
+    for (std::size_t galois_elt_idx : indices) {
+        if (galois_elt_idx >= relin_key_num) {
+            throw std::out_of_range("create_galois_keys_for_indices: index out of range");
+        }
+        auto galois_elt = galois_elts[galois_elt_idx];
+        if (!(galois_elt & 1) || (galois_elt >= poly_degree << 1)) {
+            throw std::invalid_argument("Galois element is not valid");
+        }
+        key_galois_tool->apply_galois_ntt(secret_key, key_mod_size, galois_elt_idx,
+                                          rotated_secret_key.get(), s);
+        PhantomRelinKey relin_key;
+        generate_one_kswitch_key(context, rotated_secret_key.get(), relin_key, s);
+        relin_key.gen_flag_ = true;
+        galois_keys.relin_keys_[galois_elt_idx] = std::move(relin_key);
+    }
+    galois_keys.gen_flag_ = true;
+
+    return galois_keys;
+}
+
+PhantomRelinKey PhantomSecretKey::create_one_galois_key(
+        const PhantomContext &context,
+        std::size_t galois_elt_idx,
+        std::size_t target_chain_index) const {
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto &key_modulus = key_parms.coeff_modulus();
+    auto &key_galois_tool = context.key_galois_tool_;
+    auto poly_degree = key_parms.poly_modulus_degree();
+    auto key_mod_size = key_modulus.size();
+
+    const auto &s = cudaStreamPerThread;
+    auto &galois_elts = key_galois_tool->galois_elts();
+
+    if (galois_elt_idx >= galois_elts.size()) {
+        throw std::out_of_range("create_one_galois_key: index out of range");
+    }
+    auto galois_elt = galois_elts[galois_elt_idx];
+    if (!(galois_elt & 1) || (galois_elt >= poly_degree << 1)) {
+        throw std::invalid_argument("create_one_galois_key: Galois element is not valid");
+    }
+
+    auto rotated_secret_key = make_cuda_auto_ptr<uint64_t>(key_mod_size * poly_degree, s);
+    key_galois_tool->apply_galois_ntt(secret_key_array_.get(), key_mod_size, galois_elt_idx,
+                                      rotated_secret_key.get(), s);
+    PhantomRelinKey relin_key;
+    if (target_chain_index == 0) {
+        generate_one_kswitch_key(context, rotated_secret_key.get(), relin_key, s);
+    } else {
+        generate_one_kswitch_key_at_level(context, rotated_secret_key.get(), relin_key,
+                                          target_chain_index, s);
+    }
+    relin_key.gen_flag_ = true;
+    return relin_key;
 }
 
 void PhantomSecretKey::encrypt_symmetric(const PhantomContext &context, const PhantomPlaintext &plain,

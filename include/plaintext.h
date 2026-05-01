@@ -46,6 +46,10 @@ public:
         chain_index_ = chain_index;
     }
 
+    void set_scale(const double scale) {
+        scale_ = scale;
+    }
+
     [[nodiscard]] std::size_t coeff_count() const noexcept {
         return poly_modulus_degree_ * coeff_modulus_size_;
     }

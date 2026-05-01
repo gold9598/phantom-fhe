@@ -73,8 +73,46 @@ constexpr std::array<double, 8> K16_R_LOW = {
      7.22752525999589279e-01,  2.62006578429296658e-02,
 };
 
+// K=28 R=3 degree-49 Chebyshev (ported from the_lib bootstrap.cpp).
+//   Structure: baby T_1..T_7, giant T_14/T_28, PS basis T_49.
+//   sine(x) = (aux_ct · quotient + remainder − T_49), then R=3 DA.
+//   aux_ct = ws(baby, aux_coeffs) + T_28
+//   quotient = (T_14 + ws(baby, q_coeffs[0])) · ws(baby, q_coeffs[1]) + ws(baby, q_coeffs[2])
+//   remainder = same shape, no relin
+//   All ws arrays: coeffs[0]=constant, coeffs[1..7]=T_1..T_7 coeff.
+//   Total levels: 3 (baby) + 3 (T_14,T_28,T_49) + 3 (PS) = 9. R=3 DA = +3. Total = 9.
+constexpr std::array<double, 8> K28_AUX_COEFFS = {
+    -0.4674215360340989,   -0.24807246365084598,
+    -0.03360736343811264,   0.10485552200765141,
+     0.012171628025753911, -0.031034212401993305,
+    -0.003985828764410408,  0.0,
+};
+constexpr std::array<std::array<double, 8>, 3> K28_QUOT_COEFFS = {{
+    {-0.7500012154934053,      4.148627473785995e-06,   2.707983311367457e-07,
+     -4.324538856989888e-07,  -2.648274421485692e-08,   3.9515438249932484e-08,
+      2.4720260690299275e-09,  0.0},
+    {-6.511205244110998e-09,  -7.076428529570776e-10,   1.0183620860162692e-09,
+      0.0,                     0.0,                      0.0,
+      0.0,                     4.0},
+    { 0.007868944223231958,    0.0014193060148561195,   -0.003081157124604844,
+     -0.00025275745577540515,  0.0005030348400875631,    3.734766164626263e-05,
+     -7.780382338014487e-05,   1.0},
+}};
+constexpr std::array<std::array<double, 8>, 3> K28_REM_COEFFS = {{
+    {-1.1324455480972702,  -0.8116709016985189,  -0.20294197180913795,
+      0.5290215620326779,  -0.32084902738708476,  0.43458317383580536,
+     -0.06303880005650665,  0.0},
+    { 0.23316927298939902,  0.12938749185636858,  -0.3042902283756468,
+     -0.008967445477730096, -0.6955791340472846,  -0.07562064123442451,
+      1.2510854562849574,   2.0},
+    { 0.1429148264191405,   0.4544397978460022,   -0.8401926425765848,
+     -0.4292803758141986,   -1.495563076527614,    0.3580084476476745,
+      1.7971594278092713,   1.0},
+}};
+
 constexpr int  EVALMOD_R       = 3;
 constexpr int  CHEB_MAX_POWER  = 8;
+constexpr int  CHEB_BABY_K28   = 7;
 
 // ----------------------------------------------------------------------------
 // Tiny helpers wrapping phantom's public ops.
@@ -320,12 +358,19 @@ weighted_sum_chebyshev(const PhantomContext &ctx,
 //   result = T_16·Q + R                               baby+3 (R aligned up)
 // → 6 levels total for sine. With R=3 DA, EvalMod = 9 levels.
 // ----------------------------------------------------------------------------
+// Generic degree-31 sine evaluator with PS factorization
+//   P(x) = T_16 · (T_8·Q_high + Q_low) + (T_8·R_high + R_low)
+// Used by K=16 R=3 (K=28 R=3 has its own degree-49 PS structure in sine_chebyshev_k28).
 PhantomCiphertext
-sine_chebyshev_k16(const PhantomContext &ctx,
-                   PhantomCKKSEncoder &enc,
-                   const PhantomCiphertext &ct,
-                   const PhantomRelinKey &rk,
-                   double target_scale) {
+sine_chebyshev_deg31(const PhantomContext &ctx,
+                     PhantomCKKSEncoder &enc,
+                     const PhantomCiphertext &ct,
+                     const PhantomRelinKey &rk,
+                     double target_scale,
+                     const double *q_high_coeffs,
+                     const double *q_low_coeffs,
+                     const double *r_high_coeffs,
+                     const double *r_low_coeffs) {
     auto baby = build_chebyshev_basis(ctx, enc, ct, CHEB_MAX_POWER, rk, target_scale);
 
     // T_16 = 2·T_8² − 1.
@@ -336,11 +381,12 @@ sine_chebyshev_k16(const PhantomContext &ctx,
     double_ct(ctx, t16);
 
     // Inner weighted sums over T_1..T_7 (parallel; each consumes 1 level).
+    // Lapis convention: coeffs[0] is the constant term, coeffs[i] (i≥1) is T_i.
     std::vector<PhantomCiphertext> baby7(baby.begin(), baby.begin() + 7);
-    auto q_high = weighted_sum_chebyshev(ctx, enc, baby7, K16_Q_HIGH.data(), K16_Q_HIGH.size(), target_scale);
-    auto q_low  = weighted_sum_chebyshev(ctx, enc, baby7, K16_Q_LOW .data(), K16_Q_LOW .size(), target_scale);
-    auto r_high = weighted_sum_chebyshev(ctx, enc, baby7, K16_R_HIGH.data(), K16_R_HIGH.size(), target_scale);
-    auto r_low  = weighted_sum_chebyshev(ctx, enc, baby7, K16_R_LOW .data(), K16_R_LOW .size(), target_scale);
+    auto q_high = weighted_sum_chebyshev(ctx, enc, baby7, q_high_coeffs, 8, target_scale);
+    auto q_low  = weighted_sum_chebyshev(ctx, enc, baby7, q_low_coeffs,  8, target_scale);
+    auto r_high = weighted_sum_chebyshev(ctx, enc, baby7, r_high_coeffs, 8, target_scale);
+    auto r_low  = weighted_sum_chebyshev(ctx, enc, baby7, r_low_coeffs,  8, target_scale);
 
     // T_8 · Q_high → rescale.
     PhantomCiphertext t8a = baby[7];
@@ -412,6 +458,146 @@ sine_chebyshev_k7(const PhantomContext &ctx,
 }
 
 // ----------------------------------------------------------------------------
+// sine_chebyshev_k28: degree-49 PS evaluation (ported from the_lib sine()).
+//
+// Level analysis (depth d = baby chain_index after build_chebyshev_basis(7)):
+//   baby  T_1..T_7        : depth d        (3 levels consumed)
+//   T_14  = 2·T_7² − 1    : depth d+1
+//   ws_*  (aux/Q[i]/R[i]) : depth d+1      (1 rescale; baby NOT pre-aligned)
+//   T_28  = 2·T_14² − 1   : depth d+2
+//   T_21  = 2·T_14·T_7−T_7: depth d+2      (T_14·T_7 at d+1, rescale +1)
+//   T_49  = 2·T_28·T_21−T7: depth d+3
+//   aux_ct = ws_aux + T_28 : depth d+2     (align ws_aux down)
+//   quotient = (T_14 + Q[0])·Q[1] + Q[2]   : depth d+2  (no level cost
+//                                             on the add since T_14, Q[0]
+//                                             both at d+1)
+//   remainder= (T_14 + R[0])·R[1] + R[2]   : depth d+2
+//   result   = aux_ct·quotient + remainder − T_49 : depth d+3
+//
+// Total sine levels: 3 (baby) + 3 (above) = 6 levels.
+// With R=3 DA: total EvalMod = 9 levels (same as K=16 R=3 chain budget).
+// ----------------------------------------------------------------------------
+PhantomCiphertext
+sine_chebyshev_k28(const PhantomContext &ctx,
+                   PhantomCKKSEncoder &enc,
+                   const PhantomCiphertext &ct,
+                   const PhantomRelinKey &rk,
+                   double target_scale) {
+    // Baby: T_1..T_7  (size 7 vector, baby[i] = T_{i+1}).
+    auto baby = build_chebyshev_basis(ctx, enc, ct, CHEB_BABY_K28, rk, target_scale);
+    PhantomCiphertext &t7 = baby[6];
+
+    // T_14 = 2·T_7² − 1   (depth d+1).
+    PhantomCiphertext t14 = square_and_relin(ctx, t7, rk);
+    rescale_to_next_inplace(ctx, t14);
+    snap_scale(t14, target_scale);
+    add_scalar_inplace(ctx, enc, t14, -0.5);
+    double_ct(ctx, t14);
+
+    // T_28 = 2·T_14² − 1   (depth d+2).
+    PhantomCiphertext t28 = square_and_relin(ctx, t14, rk);
+    rescale_to_next_inplace(ctx, t28);
+    snap_scale(t28, target_scale);
+    add_scalar_inplace(ctx, enc, t28, -0.5);
+    double_ct(ctx, t28);
+
+    // Weighted sums over baby (depth d) → output at d+1. Critically,
+    // we do NOT pre-align baby up to T_14 level; we let ws's internal
+    // rescale collapse one baby level → output naturally at T_14's level.
+    auto ws_aux = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_AUX_COEFFS.data(),
+                                         K28_AUX_COEFFS.size(), target_scale);
+    auto ws_q0  = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_QUOT_COEFFS[0].data(), 8, target_scale);
+    auto ws_q1  = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_QUOT_COEFFS[1].data(), 8, target_scale);
+    auto ws_q2  = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_QUOT_COEFFS[2].data(), 8, target_scale);
+    auto ws_r0  = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_REM_COEFFS[0].data(),  8, target_scale);
+    auto ws_r1  = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_REM_COEFFS[1].data(),  8, target_scale);
+    auto ws_r2  = weighted_sum_chebyshev(ctx, enc, baby,
+                                         K28_REM_COEFFS[2].data(),  8, target_scale);
+
+    // T_21 = 2·T_14·T_7 − T_7  (depth d+2).
+    // T_14 at d+1, T_7 (baby[6]) at d. Align T_7 up to T_14 level.
+    PhantomCiphertext t14_for_t21 = t14;       // copy, will be reused
+    PhantomCiphertext t7_for_t21  = t7;         // copy, baby[6] preserved
+    align_pair(ctx, t14_for_t21, t7_for_t21);  // both at d+1
+    PhantomCiphertext t21 = mul_and_relin(ctx, t14_for_t21, t7_for_t21, rk);
+    rescale_to_next_inplace(ctx, t21);          // d+2
+    snap_scale(t21, target_scale);
+    double_ct(ctx, t21);                        // 2·T_14·T_7
+    {
+        PhantomCiphertext t7_a = t7;
+        align_to(ctx, t7_a, t21.chain_index()); // d+2
+        sub_inplace(ctx, t21, t7_a);            // − T_7
+    }
+
+    // T_49 = 2·T_28·T_21 − T_7  (depth d+3).
+    PhantomCiphertext t28_for_t49 = t28;
+    align_pair(ctx, t28_for_t49, t21);          // both at d+2
+    PhantomCiphertext t49 = mul_and_relin(ctx, t28_for_t49, t21, rk);
+    rescale_to_next_inplace(ctx, t49);          // d+3
+    snap_scale(t49, target_scale);
+    double_ct(ctx, t49);
+    {
+        PhantomCiphertext t7_b = t7;
+        align_to(ctx, t7_b, t49.chain_index()); // d+3
+        sub_inplace(ctx, t49, t7_b);            // − T_7
+    }
+
+    // aux_ct = ws_aux + T_28   (depth d+2). ws_aux at d+1 → align down.
+    PhantomCiphertext aux_ct = ws_aux;
+    PhantomCiphertext t28_for_aux = t28;
+    align_pair(ctx, aux_ct, t28_for_aux);       // both at d+2
+    add_inplace(ctx, aux_ct, t28_for_aux);
+
+    // quotient = (T_14 + ws_q0) · ws_q1 + ws_q2.
+    // T_14 at d+1, ws_q0 at d+1 → add at d+1 (no level cost).
+    PhantomCiphertext t14_plus_q0 = t14;
+    add_inplace(ctx, t14_plus_q0, ws_q0);       // d+1
+    PhantomCiphertext quotient = mul_and_relin(ctx, t14_plus_q0, ws_q1, rk);
+    rescale_to_next_inplace(ctx, quotient);     // d+2
+    snap_scale(quotient, target_scale);
+    {
+        PhantomCiphertext q2 = ws_q2;
+        align_to(ctx, q2, quotient.chain_index()); // d+2
+        add_inplace(ctx, quotient, q2);
+    }
+
+    // remainder = (T_14 + ws_r0) · ws_r1 + ws_r2.
+    PhantomCiphertext t14_plus_r0 = t14;
+    add_inplace(ctx, t14_plus_r0, ws_r0);       // d+1
+    PhantomCiphertext remainder = mul_and_relin(ctx, t14_plus_r0, ws_r1, rk);
+    rescale_to_next_inplace(ctx, remainder);    // d+2
+    snap_scale(remainder, target_scale);
+    {
+        PhantomCiphertext r2 = ws_r2;
+        align_to(ctx, r2, remainder.chain_index());
+        add_inplace(ctx, remainder, r2);
+    }
+
+    // result = aux_ct · quotient + remainder − T_49   (depth d+3).
+    PhantomCiphertext result = mul_and_relin(ctx, aux_ct, quotient, rk);
+    rescale_to_next_inplace(ctx, result);       // d+3
+    snap_scale(result, target_scale);
+    {
+        PhantomCiphertext rem = remainder;
+        align_to(ctx, rem, result.chain_index());
+        add_inplace(ctx, result, rem);
+    }
+    {
+        PhantomCiphertext t49_a = t49;
+        align_to(ctx, t49_a, result.chain_index());
+        sub_inplace(ctx, result, t49_a);
+    }
+
+    return result;
+}
+
+// ----------------------------------------------------------------------------
 // apply_double_angle: ct ← 2·ct² − (2π)^{−2^{j−R}}  for j = 1..R.
 // Each iteration consumes 1 level via square + rescale.
 // ----------------------------------------------------------------------------
@@ -451,8 +637,33 @@ PhantomCiphertext evalmod_k16_r3(const PhantomContext &ctx,
                                  const PhantomCiphertext &ct,
                                  const PhantomRelinKey &rk) {
     const double target_scale = ct.scale();
-    PhantomCiphertext sine = sine_chebyshev_k16(ctx, enc, ct, rk, target_scale);
+    PhantomCiphertext sine = sine_chebyshev_deg31(ctx, enc, ct, rk, target_scale,
+                                                  K16_Q_HIGH.data(), K16_Q_LOW.data(),
+                                                  K16_R_HIGH.data(), K16_R_LOW.data());
     apply_double_angle(ctx, enc, sine, rk, EVALMOD_R, target_scale);
+    return sine;
+}
+
+PhantomCiphertext evalmod_k28_r3(const PhantomContext &ctx,
+                                 PhantomCKKSEncoder &enc,
+                                 const PhantomCiphertext &ct,
+                                 const PhantomRelinKey &rk) {
+    const double target_scale = ct.scale();
+    PhantomCiphertext sine = sine_chebyshev_k28(ctx, enc, ct, rk, target_scale);
+    apply_double_angle(ctx, enc, sine, rk, EVALMOD_R, target_scale);
+    return sine;
+}
+
+// K=28 R=4: same sine polynomial as K=28 R=3 but with one extra DA iteration.
+// apply_double_angle's per-iteration scalar = -(2π)^{−2^{j−R}} already takes R
+// as a runtime arg, so the only change is R: 3 → 4. Total levels: 6 + 4 = 10.
+PhantomCiphertext evalmod_k28_r4(const PhantomContext &ctx,
+                                 PhantomCKKSEncoder &enc,
+                                 const PhantomCiphertext &ct,
+                                 const PhantomRelinKey &rk) {
+    const double target_scale = ct.scale();
+    PhantomCiphertext sine = sine_chebyshev_k28(ctx, enc, ct, rk, target_scale);
+    apply_double_angle(ctx, enc, sine, rk, /*R=*/4, target_scale);
     return sine;
 }
 

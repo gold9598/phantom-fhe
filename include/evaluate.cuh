@@ -141,6 +141,16 @@ namespace phantom {
     void relinearize_inplace(const PhantomContext &context, PhantomCiphertext &encrypted,
                              const PhantomRelinKey &relin_keys);
 
+    // Apply a generic key-switching key (KSK) to a 2-element ciphertext.
+    //
+    // `ksk` must be a KSK that converts ciphertexts under the source secret
+    // into ciphertexts under the destination secret (i.e. produced via
+    // `dst_sk.create_kswitch_key(ctx, src_sk)`). After this call, `encrypted`
+    // is decryptable under the destination secret. Equivalent semantically to
+    // lapis `switch_key_inplace`.
+    void apply_kswitch_inplace(const PhantomContext &context, PhantomCiphertext &encrypted,
+                               const PhantomRelinKey &ksk);
+
     inline auto relinearize(const PhantomContext &context, const PhantomCiphertext &encrypted,
                             const PhantomRelinKey &relin_keys) {
         PhantomCiphertext destination = encrypted;
@@ -238,6 +248,19 @@ namespace phantom {
         return destination;
     }
 
+    // Variant of apply_galois_inplace that consumes a single KSK directly
+    // (e.g. one truncated to a specific chain level) instead of looking it
+    // up by index inside a PhantomGaloisKey bundle.
+    void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt,
+                              const PhantomRelinKey &galois_ksk);
+
+    inline auto apply_galois(const PhantomContext &context, const PhantomCiphertext &encrypted, size_t galois_elt,
+                             const PhantomRelinKey &galois_ksk) {
+        PhantomCiphertext destination = encrypted;
+        apply_galois_inplace(context, destination, galois_elt, galois_ksk);
+        return destination;
+    }
+
     void rotate_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, int step,
                         const PhantomGaloisKey &galois_key);
 
@@ -245,6 +268,20 @@ namespace phantom {
                        const PhantomGaloisKey &galois_key) {
         PhantomCiphertext destination = encrypted;
         rotate_inplace(context, destination, step, galois_key);
+        return destination;
+    }
+
+    // Variant of rotate_inplace that consumes a single KSK directly
+    // (e.g. one truncated to a specific chain level). The rotation `step`
+    // determines the Galois automorphism applied; the KSK must be the one
+    // generated for that automorphism's rotated secret key.
+    void rotate_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, int step,
+                        const PhantomRelinKey &galois_ksk);
+
+    inline auto rotate(const PhantomContext &context, const PhantomCiphertext &encrypted, int step,
+                       const PhantomRelinKey &galois_ksk) {
+        PhantomCiphertext destination = encrypted;
+        rotate_inplace(context, destination, step, galois_ksk);
         return destination;
     }
 

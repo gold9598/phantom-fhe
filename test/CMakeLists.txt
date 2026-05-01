@@ -18,6 +18,14 @@ add_executable(evalmod_test evalmod_test.cu)
 target_link_libraries(evalmod_test Phantom)
 target_include_directories(evalmod_test PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
+add_executable(bootstrap_test bootstrap_test.cu)
+target_link_libraries(bootstrap_test Phantom)
+target_include_directories(bootstrap_test PUBLIC ${CMAKE_SOURCE_DIR}/include)
+
+add_executable(ckks_engine_test ckks_engine_test.cu)
+target_link_libraries(ckks_engine_test Phantom)
+target_include_directories(ckks_engine_test PUBLIC ${CMAKE_SOURCE_DIR}/include)
+
 # find CUDAToolkit to enable cuFFT
 find_package(CUDAToolkit REQUIRED)
 

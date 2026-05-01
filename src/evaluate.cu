@@ -1373,6 +1373,43 @@ Returns (f, e1, e2) such that
         encrypted.resize(2, decomp_modulus_size, n, s);
     }
 
+    void apply_kswitch_inplace(const PhantomContext &context, PhantomCiphertext &encrypted,
+                               const PhantomRelinKey &ksk) {
+        auto &context_data = context.get_context_data(encrypted.chain_index());
+        auto &parms = context_data.parms();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+        size_t N = parms.poly_modulus_degree();
+        auto scheme = parms.scheme();
+
+        if (encrypted.size() != 2) {
+            throw invalid_argument("apply_kswitch_inplace: ciphertext size must be 2");
+        }
+        if (scheme == scheme_type::bfv && encrypted.is_ntt_form()) {
+            throw invalid_argument("apply_kswitch_inplace: BFV ciphertext cannot be in NTT form");
+        }
+        if (scheme == scheme_type::ckks && !encrypted.is_ntt_form()) {
+            throw invalid_argument("apply_kswitch_inplace: CKKS ciphertext must be in NTT form");
+        }
+        if (scheme == scheme_type::bgv && !encrypted.is_ntt_form()) {
+            throw invalid_argument("apply_kswitch_inplace: BGV ciphertext must be in NTT form");
+        }
+
+        const auto &s = cudaStreamPerThread;
+
+        // Stash c1 into a scratch buffer; that's the polynomial whose secret
+        // dependence we want to switch. After keyswitch_inplace returns,
+        // encrypted = (c0 + cx[0], 0 + cx[1]) — i.e. encrypted under dst.
+        auto temp = make_cuda_auto_ptr<uint64_t>(coeff_modulus_size * N, s);
+        uint64_t *c1 = encrypted.data() + coeff_modulus_size * N;
+        cudaMemcpyAsync(temp.get(), c1, coeff_modulus_size * N * sizeof(uint64_t),
+                        cudaMemcpyDeviceToDevice, s);
+
+        // Zero out c1 so the keyswitch result lands cleanly into it.
+        cudaMemsetAsync(c1, 0, coeff_modulus_size * N * sizeof(uint64_t), s);
+
+        keyswitch_inplace(context, encrypted, temp.get(), ksk, false, s);
+    }
+
     static void mod_switch_scale_to_next(const PhantomContext &context, const PhantomCiphertext &encrypted,
                                          PhantomCiphertext &destination, const cudaStream_t &stream) {
         // Assuming at this point encrypted is already validated.
@@ -1564,8 +1601,13 @@ Returns (f, e1, e2) such that
         return destination;
     }
 
-    void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt,
-                              const PhantomGaloisKey &galois_keys) {
+    // Internal: apply Galois automorphism `galois_elt` to `encrypted`, then
+    // keyswitch using the provided `ksk`. Shared between the
+    // PhantomGaloisKey-bundle and bare-KSK overloads.
+    static void apply_galois_with_ksk(const PhantomContext &context,
+                                      PhantomCiphertext &encrypted,
+                                      size_t galois_elt,
+                                      const PhantomRelinKey &ksk) {
         auto &context_data = context.get_context_data(encrypted.chain_index());
         auto &parms = context_data.parms();
         auto &coeff_modulus = parms.coeff_modulus();
@@ -1576,10 +1618,9 @@ Returns (f, e1, e2) such that
             throw invalid_argument("encrypted size must be 2");
         }
 
-        // Use key_context_data where permutation tables exist since previous runs.
+        // Locate the permutation table for this Galois elt.
         auto &key_galois_tool = context.key_galois_tool_;
         auto &galois_elts = key_galois_tool->galois_elts();
-
         auto iter = find(galois_elts.begin(), galois_elts.end(), galois_elt);
         if (iter == galois_elts.end()) {
             throw std::invalid_argument("Galois elt not present");
@@ -1594,39 +1635,42 @@ Returns (f, e1, e2) such that
         auto c1 = encrypted.data() + encrypted.coeff_modulus_size() * encrypted.poly_modulus_degree();
 
         // DO NOT CHANGE EXECUTION ORDER OF FOLLOWING SECTION
-        // BEGIN: Apply Galois for each ciphertext
-        // Execution order is sensitive, since apply_galois is not inplace!
         if (parms.scheme() == scheme_type::bfv) {
-            // !!! DO NOT CHANGE EXECUTION ORDER!!!
-            // First transform c0
             key_galois_tool->apply_galois(c0, context.gpu_rns_tables(), coeff_modulus_size, galois_elt_index,
-                                          temp.get(),
-                                          s);
-            // Copy result to c0
+                                          temp.get(), s);
             cudaMemcpyAsync(c0, temp.get(), coeff_modulus_size * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
-            // Next transform c1
             key_galois_tool->apply_galois(c1, context.gpu_rns_tables(), coeff_modulus_size, galois_elt_index,
-                                          temp.get(),
-                                          s);
+                                          temp.get(), s);
         } else if (parms.scheme() == scheme_type::ckks || parms.scheme() == scheme_type::bgv) {
-            // !!! DO NOT CHANGE EXECUTION ORDER!!
-            // First transform c0
             key_galois_tool->apply_galois_ntt(c0, coeff_modulus_size, galois_elt_index, temp.get(), s);
-            // Copy result to c0
             cudaMemcpyAsync(c0, temp.get(), coeff_modulus_size * N * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
-            // Next transform c1
             key_galois_tool->apply_galois_ntt(c1, coeff_modulus_size, galois_elt_index, temp.get(), s);
         } else {
             throw logic_error("scheme not implemented");
         }
 
-        // Wipe c1
         cudaMemsetAsync(c1, 0, coeff_modulus_size * N * sizeof(uint64_t), s);
 
-        // END: Apply Galois for each ciphertext
-        // REORDERING IS SAFE NOW
         // Calculate (temp * galois_key[0], temp * galois_key[1]) + (c0, 0)
-        keyswitch_inplace(context, encrypted, temp.get(), galois_keys.get_relin_keys(galois_elt_index), false, s);
+        keyswitch_inplace(context, encrypted, temp.get(), ksk, false, s);
+    }
+
+    void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt,
+                              const PhantomGaloisKey &galois_keys) {
+        auto &key_galois_tool = context.key_galois_tool_;
+        auto &galois_elts = key_galois_tool->galois_elts();
+        auto iter = find(galois_elts.begin(), galois_elts.end(), galois_elt);
+        if (iter == galois_elts.end()) {
+            throw std::invalid_argument("Galois elt not present");
+        }
+        auto galois_elt_index = std::distance(galois_elts.begin(), iter);
+        apply_galois_with_ksk(context, encrypted, galois_elt,
+                              galois_keys.get_relin_keys(galois_elt_index));
+    }
+
+    void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt,
+                              const PhantomRelinKey &galois_ksk) {
+        apply_galois_with_ksk(context, encrypted, galois_elt, galois_ksk);
     }
 
 // TODO: remove recursive chain
@@ -1665,6 +1709,18 @@ Returns (f, e1, e2) such that
     void rotate_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, int step,
                         const PhantomGaloisKey &galois_key) {
         rotate_internal(context, encrypted, step, galois_key);
+    }
+
+    void rotate_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, int step,
+                        const PhantomRelinKey &galois_ksk) {
+        // Direct (non-NAF) rotation using a single KSK. The KSK must
+        // correspond to the Galois automorphism for this `step`, and must
+        // be a single-step KSK (no NAF fallback for level-aware bootstrap
+        // KSKs — these are always direct).
+        auto &context_data = context.get_context_data(encrypted.chain_index());
+        const size_t coeff_count = context_data.parms().poly_modulus_degree();
+        const size_t galois_elt = get_elt_from_step(step, coeff_count);
+        apply_galois_with_ksk(context, encrypted, galois_elt, galois_ksk);
     }
 
     void hoisting_inplace(const PhantomContext &context, PhantomCiphertext &ct, const PhantomGaloisKey &glk,

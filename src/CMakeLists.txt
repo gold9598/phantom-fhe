@@ -12,6 +12,8 @@ add_library(Phantom SHARED
         scalingvariant.cu
         evaluate.cu
         evalmod.cu
+        bootstrap.cu
+        ckks_engine.cu
         fft.cu
         ckks.cu
         galois.cu

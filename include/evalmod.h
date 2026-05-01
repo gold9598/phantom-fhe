@@ -16,6 +16,15 @@
 //
 // Total: 5 + 3 = 8 levels. Input ct must be at chain_index ≤ L−8 with
 // magnitude in [-1, 1] (Chebyshev range).
+//
+// Precision regime: a uniform 40-bit chain leaves no headroom for the 8-level
+// EvalMod (~10 bits at logN=16). Lapis's production setup uses a heterogeneous
+// chain — `boot_setup_4section`:
+//   q_list = [msg(58) | scale(40)×N | ER(58)×9 | special(58)]
+// with `engine.scale = q_msg ≈ 2^58` and a sparse hw=128 secret. EvalMod runs
+// against the 58-bit ER segment; the 40-bit "scale" segment is the
+// post-bootstrap user space. K=16 then reaches ~26–31 bits, K=7 ~17 bits.
+// See test/evalmod_test.cu (`run_lapis_4section`).
 // ----------------------------------------------------------------------------
 
 #include "phantom.h"
@@ -30,6 +39,23 @@ namespace phantom {
     // K=16 R=3: degree-31 polynomial, 33.9-bit polynomial precision, 9 levels.
     // After R=3 DA the result approximates sin(2π·16·x)/(2π).
     PhantomCiphertext evalmod_k16_r3(const PhantomContext &ctx,
+                                     PhantomCKKSEncoder &encoder,
+                                     const PhantomCiphertext &ct,
+                                     const PhantomRelinKey &relin_keys);
+
+    // K=28 R=3: degree-49 polynomial (ported from the_lib bootstrap.cpp sine()).
+    // Baby T_1..T_7, giant T_14/T_28, PS basis T_49. 9 levels total (6 sine + 3 DA).
+    // Approximates sin(2π·28·x)/(2π) with higher precision than K=16.
+    PhantomCiphertext evalmod_k28_r3(const PhantomContext &ctx,
+                                     PhantomCKKSEncoder &encoder,
+                                     const PhantomCiphertext &ct,
+                                     const PhantomRelinKey &relin_keys);
+
+    // K=28 R=4: same degree-49 polynomial as K=28 R=3 but with one extra
+    // double-angle iteration. 10 levels total (6 sine + 4 DA). Effective K
+    // amplification is 28·2^4 = 448 (vs 28·2^3 = 224 for R=3). Reaches ~30
+    // bits per-slot precision vs ~27 bits for R=3.
+    PhantomCiphertext evalmod_k28_r4(const PhantomContext &ctx,
                                      PhantomCKKSEncoder &encoder,
                                      const PhantomCiphertext &ct,
                                      const PhantomRelinKey &relin_keys);
