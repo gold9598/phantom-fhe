@@ -335,8 +335,8 @@ def attention_forward(
 #     sum_reduce_stride pollutes the in-block sum)
 #   - optionally interleaves bootstrap calls between sub-stages A/B and B/C
 #
-# This is the path used by both llama_real_attn_test (no bootstrap_fn) and
-# llama_bootstrap_test (bootstrap_fn=lambda ct: boot_centered(...)).
+# This is the path used by both llama3_simulation (no bootstrap_fn) and
+# llama3 (bootstrap_fn=lambda ct: boot_centered(...)).
 # ---------------------------------------------------------------------------
 
 def attention_forward_llama(

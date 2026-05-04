@@ -8,12 +8,12 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 
 | Headline | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
 |---|---|---|---|---|---|
-| llama_real_attn_test — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
-| llama_real_attn_test — Cachemir IRP | **1006–1851** | 1.5e-4 | 2.1e-5 | 26.3 GiB | 2.8 GiB |
-| llama_bootstrap_test — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
-| llama_bootstrap_test — Cachemir IRP | 1730 | 3.3e-4 | 7.8e-5 | 29.4 GiB | 2.8 GiB |
-| llama_bootstrap_test — Cachemir IRP + DAG | 1352 | 2.6e-4 | 4.7e-5 | 29.4 GiB | 2.8 GiB |
-| llama_bootstrap_test — Cachemir IRP + DAG + cleanup | **1137** | 2.6e-4 | 4.5e-5 | 29.4 GiB | 2.8 GiB |
+| llama3_simulation — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
+| llama3_simulation — Cachemir IRP | **1006–1851** | 1.5e-4 | 2.1e-5 | 26.3 GiB | 2.8 GiB |
+| llama3 — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
+| llama3 — Cachemir IRP | 1730 | 3.3e-4 | 7.8e-5 | 29.4 GiB | 2.8 GiB |
+| llama3 — Cachemir IRP + DAG | 1352 | 2.6e-4 | 4.7e-5 | 29.4 GiB | 2.8 GiB |
+| llama3 — Cachemir IRP + DAG + cleanup | **1137** | 2.6e-4 | 4.5e-5 | 29.4 GiB | 2.8 GiB |
 
 **Summary**: 2.8–3.4× total speedup, 2.9× bootstrap stage speedup, ~10× plaintext
 memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance from GPU
@@ -51,14 +51,15 @@ paper's 1.98×) because the IRP layout shifts already include free decrypt+re-en
 level resets that the search recognises as zero-cost level moves.
 
 **Phase 4 — headline script rewire.**
-Both `llama_real_attn_test.py` and `llama_bootstrap_test.py` are rewired to use
-the Cachemir blocks end-to-end.
+Both `llama3_simulation.py` and `llama3.py` are rewired to use the Cachemir
+blocks end-to-end.
 
 ## Files
 
 ```
-python/llm_project/llama_real_attn_test.py    # plaintext-shim baseline path
-python/llm_project/llama_bootstrap_test.py    # real EvalMod path
+python/llm_project/llama3.py                  # real EvalMod path (production)
+python/llm_project/llama3_simulation.py       # plaintext-shim path (reference only,
+                                              # decrypt+re-encrypt instead of bootstrap)
 
 python/llm_project/blocks/irp.py              # Cachemir §4.1 IRP (square + rect)
 python/llm_project/blocks/kv_cache.py         # Cachemir §5 KV cache + ct·ct attn
@@ -86,8 +87,8 @@ cmake --build build -j 8
 Run headlines:
 
 ```bash
-PYTHONPATH=build/lib python3 python/llm_project/llama_real_attn_test.py
-PYTHONPATH=build/lib python3 python/llm_project/llama_bootstrap_test.py
+PYTHONPATH=build/lib python3 python/llm_project/llama3.py             # real bootstrap
+PYTHONPATH=build/lib python3 python/llm_project/llama3_simulation.py  # reference-only
 ```
 
 Run all 11 block regression tests:

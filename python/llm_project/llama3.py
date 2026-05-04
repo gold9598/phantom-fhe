@@ -5,7 +5,7 @@ galois target chain indices to fit on a 32 GB GPU.
 
 The pre-IRP version of this file (BSGS Wq/Wo + complex BSGS Wgate/Wup/Wdown)
 peaked at ~30,580 MiB and OOMed during the first `engine.bootstrap_inplace`.
-This version mirrors `llama_real_attn_test.py`'s host-stored IRP plaintext
+This version mirrors `llama3_simulation.py`'s host-stored IRP plaintext
 encoding (Wq, Wo, Wgate, Wup, Wdown) and uses the new
 `CKKSEngineConfig.user_rotation_target_chain_indices` to assign each user
 rotation step the smallest galois key (deepest chain target) compatible with
@@ -159,7 +159,7 @@ def rope_matrix_np(cos_p, sin_p):
 
 # ============================ Layout shim helpers ============================
 # Decrypt + re-encrypt at a chosen user level (chain index = engine.user_level_chain_index(L)).
-# This reuses the same refresh mechanism used by llama_real_attn_test.py for
+# This reuses the same refresh mechanism used by llama3_simulation.py for
 # layout shifts between IRP-interleaved and periodic packings; the only
 # difference here is that we encrypt at a chain in the engine's user segment.
 def _re_encrypt_slots(engine, ctx, encoder, sk, slots, user_level, scale=SCALE):
