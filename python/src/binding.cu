@@ -81,6 +81,9 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("create_galois_keys_per_level",
                  &PhantomSecretKey::create_galois_keys_per_level,
                  py::arg("context"), py::arg("indices"), py::arg("target_chain_indices"))
+            .def("create_one_galois_key",
+                 &PhantomSecretKey::create_one_galois_key,
+                 py::arg("context"), py::arg("galois_elt_idx"), py::arg("target_chain_index") = 0)
             .def("encrypt_symmetric",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
                          &PhantomSecretKey::encrypt_symmetric, py::const_), py::arg(), py::arg())
@@ -197,6 +200,16 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("rotate",
           py::overload_cast<const PhantomContext &, const PhantomCiphertext &, int,
                             const PhantomGaloisKey &>(&phantom::rotate),
+          py::arg(), py::arg(), py::arg(), py::arg());
+
+    m.def("apply_galois_with_key",
+          py::overload_cast<const PhantomContext &, const PhantomCiphertext &, size_t,
+                            const PhantomRelinKey &>(&phantom::apply_galois),
+          py::arg(), py::arg(), py::arg(), py::arg());
+
+    m.def("rotate_with_key",
+          py::overload_cast<const PhantomContext &, const PhantomCiphertext &, int,
+                            const PhantomRelinKey &>(&phantom::rotate),
           py::arg(), py::arg(), py::arg(), py::arg());
 
     m.def("hoisting", &phantom::hoisting, py::arg(), py::arg(), py::arg(), py::arg());
