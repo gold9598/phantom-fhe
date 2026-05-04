@@ -1919,4 +1919,159 @@ Returns (f, e1, e2) such that
                             cudaMemcpyDeviceToDevice, s);
         }
     }
+
+    std::vector<PhantomCiphertext> hoist_rotations(const PhantomContext &context,
+                                                   const PhantomCiphertext &ct,
+                                                   const PhantomGaloisKey &glk,
+                                                   const std::vector<int> &steps) {
+        const auto &s = cudaStreamPerThread;
+
+        if (ct.size() > 2)
+            throw invalid_argument("ciphertext size must be 2");
+
+        std::vector<PhantomCiphertext> result;
+        if (steps.empty()) {
+            return result;
+        }
+
+        auto &context_data = context.get_context_data(ct.chain_index());
+        auto &key_context_data = context.get_context_data(0);
+        auto &key_parms = key_context_data.parms();
+        auto scheme = key_parms.scheme();
+        auto n = key_parms.poly_modulus_degree();
+        auto mul_tech = key_parms.mul_tech();
+        auto &key_modulus = key_parms.coeff_modulus();
+        size_t size_P = key_parms.special_modulus_size();
+        size_t size_QP = key_modulus.size();
+
+        // HPS and HPSOverQ does not drop modulus
+        uint32_t levelsDropped;
+
+        if (scheme == scheme_type::bfv) {
+            levelsDropped = 0;
+            if (mul_tech == mul_tech_type::hps_overq_leveled) {
+                size_t depth = ct.GetNoiseScaleDeg();
+                bool isKeySwitch = true;
+                bool is_Asymmetric = ct.is_asymmetric();
+                size_t levels = depth - 1;
+                auto dcrtBits = static_cast<double>(context.get_context_data(1).gpu_rns_tool().qMSB());
+
+                levelsDropped = FindLevelsToDrop(context, levels, dcrtBits, isKeySwitch, is_Asymmetric);
+            }
+        } else if (scheme == scheme_type::bgv || scheme == scheme_type::ckks) {
+            levelsDropped = ct.chain_index() - 1;
+        } else {
+            throw invalid_argument("unsupported scheme in hoist_rotations");
+        }
+
+        auto &rns_tool = context.get_context_data(1 + levelsDropped).gpu_rns_tool();
+        auto &parms = context_data.parms();
+        auto &key_galois_tool = context.key_galois_tool_;
+        auto &galois_elts = key_galois_tool->galois_elts();
+
+        auto modulus_QP = context.gpu_rns_tables().modulus();
+
+        size_t size_Ql = rns_tool.base_Ql().size();
+        size_t size_Q = size_QP - size_P;
+        size_t size_QlP = size_Ql + size_P;
+
+        auto size_Q_n = size_Q * n;
+        auto size_Ql_n = size_Ql * n;
+        auto size_QP_n = size_QP * n;
+        auto size_QlP_n = size_QlP * n;
+
+        auto c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+        auto c1 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+
+        auto elts = key_galois_tool->get_elts_from_steps(steps);
+
+        // ----- copy c0 (with optional HPSOverQLeveled scale-and-round) -----
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            rns_tool.scaleAndRound_HPS_Q_Ql(c0.get(), ct.data(), s);
+        } else {
+            cudaMemcpyAsync(
+                    c0.get(), ct.data(), size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+        }
+
+        // ----- copy c1 -----
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            rns_tool.scaleAndRound_HPS_Q_Ql(c1.get(), ct.data() + size_Q_n, s);
+        } else {
+            cudaMemcpyAsync(
+                    c1.get(), ct.data() + size_Ql_n, size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+        }
+
+        size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
+
+        // ----- modup c1 ONCE: this is the amortized expensive step -----
+        auto modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+        rns_tool.modup(modup_c1.get(), c1.get(), context.gpu_rns_tables(), scheme, s);
+
+        auto reduction_threshold =
+                (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
+
+        // Per-step scratch buffers (reused across iterations).
+        auto temp_c0 = make_cuda_auto_ptr<uint64_t>(size_Ql_n, s);
+        auto temp_modup_c1 = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+
+        result.reserve(elts.size());
+
+        for (size_t i = 0; i < elts.size(); i++) {
+            auto elt = elts[i];
+            auto iter = find(galois_elts.begin(), galois_elts.end(), elt);
+            if (iter == galois_elts.end())
+                throw std::logic_error("Galois key not present in hoist_rotations");
+            auto elt_index = iter - galois_elts.begin();
+
+            // ----- automorphism c0 -----
+            if (parms.scheme() == scheme_type::bfv) {
+                key_galois_tool->apply_galois(c0.get(), context.gpu_rns_tables(), size_Ql, elt_index, temp_c0.get(), s);
+            } else if (parms.scheme() == scheme_type::ckks || parms.scheme() == scheme_type::bgv) {
+                key_galois_tool->apply_galois_ntt(c0.get(), size_Ql, elt_index, temp_c0.get(), s);
+            } else {
+                throw logic_error("scheme not implemented");
+            }
+
+            // ----- automorphism c1 (apply galois to each beta segment of modup_c1) -----
+            for (size_t b = 0; b < beta; b++) {
+                key_galois_tool->apply_galois_ntt(modup_c1.get() + b * size_QlP_n, size_QlP, elt_index,
+                                                  temp_modup_c1.get() + b * size_QlP_n, s);
+            }
+
+            // ----- inner product c1 -----
+            auto cx_i = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
+            key_switch_inner_prod_c2_and_evk<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                    cx_i.get(), temp_modup_c1.get(), glk.get_relin_keys(elt_index).public_keys_ptr(), modulus_QP, n,
+                    size_QP, size_QP_n, size_QlP, size_QlP_n, size_Q, size_Ql, beta, reduction_threshold);
+
+            // ----- mod down cx_i -----
+            rns_tool.moddown_from_NTT(cx_i.get(), cx_i.get(), context.gpu_rns_tables(), scheme, s);
+            rns_tool.moddown_from_NTT(cx_i.get() + size_QlP_n, cx_i.get() + size_QlP_n, context.gpu_rns_tables(),
+                                      scheme, s);
+
+            // ----- build output ciphertext: copy ct's metadata, overwrite c0/c1 -----
+            PhantomCiphertext out_ct = ct;
+
+            if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+                // Combine c0_i = temp_c0 + cx_i[0] in size_Ql, then expand to size_Q.
+                add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                        temp_c0.get(), cx_i.get(), rns_tool.base_Ql().base(),
+                        cx_i.get(), n, size_Ql);
+                rns_tool.ExpandCRTBasis_Ql_Q(out_ct.data(), cx_i.get(), s);
+                rns_tool.ExpandCRTBasis_Ql_Q(out_ct.data() + size_Q_n, cx_i.get() + size_QlP_n, s);
+            } else {
+                // c0_out = temp_c0 + cx_i[0]
+                add_rns_poly<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                        temp_c0.get(), cx_i.get(), rns_tool.base_Ql().base(),
+                        out_ct.data(), n, size_Ql);
+                // c1_out = cx_i[1]
+                cudaMemcpyAsync(out_ct.data() + size_Ql_n, cx_i.get() + size_QlP_n,
+                                size_Ql_n * sizeof(uint64_t), cudaMemcpyDeviceToDevice, s);
+            }
+
+            result.push_back(std::move(out_ct));
+        }
+
+        return result;
+    }
 }

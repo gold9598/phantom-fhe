@@ -173,6 +173,19 @@ void inwt_1d_opt(uint64_t *inout, const uint64_t *itwiddles, const uint64_t *itw
 void nwt_2d_radix8_forward_inplace(uint64_t *inout, const DNTTTable &ntt_tables, size_t coeff_modulus_size,
                                    size_t start_modulus_idx, const cudaStream_t &stream);
 
+// Batched forward NTT: processes M independent polynomials in a single grid
+// launch. inout is laid out as [M][coeff_modulus_size][n] (each baby occupies
+// coeff_modulus_size * n contiguous elements). All babies share the same
+// modulus / twiddle tables (per tower); we extend the work across babies and
+// remap the tower index to the physical modulus at lookup time.
+//
+// Bit-identical to running the per-baby nwt_2d_radix8_forward_inplace M times
+// over each baby's slab of `inout`.
+void nwt_2d_radix8_forward_inplace_batched(uint64_t *inout, const DNTTTable &ntt_tables,
+                                           size_t M, size_t coeff_modulus_size,
+                                           size_t start_modulus_idx,
+                                           const cudaStream_t &stream);
+
 void nwt_2d_radix8_forward_inplace_fuse_moddown(uint64_t *ct, const uint64_t *cx, const uint64_t *bigPInv_mod_q,
                                                 const uint64_t *bigPInv_mod_q_shoup, uint64_t *delta,
                                                 const DNTTTable &ntt_tables, size_t coeff_modulus_size,

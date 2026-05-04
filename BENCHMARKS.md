@@ -1,0 +1,123 @@
+# Phantom-FHE Benchmarks: Cachemir IRP + DAG Port for LLaMA-3.1-8B
+
+Port of [Cachemir](https://arxiv.org/abs/2602.11470) §4–6 into the Phantom-FHE
+CKKS stack. Measured on a single NVIDIA GPU with 32 GiB VRAM running one
+LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
+
+## Results
+
+| Headline | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
+|---|---|---|---|---|---|
+| llama_real_attn_test — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
+| llama_real_attn_test — Cachemir IRP | **1006–1851** | 1.5e-4 | 2.1e-5 | 26.3 GiB | 2.8 GiB |
+| llama_bootstrap_test — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
+| llama_bootstrap_test — Cachemir IRP | 1730 | 3.3e-4 | 7.8e-5 | 29.4 GiB | 2.8 GiB |
+| llama_bootstrap_test — Cachemir IRP + DAG | 1352 | 2.6e-4 | 4.7e-5 | 29.4 GiB | 2.8 GiB |
+| llama_bootstrap_test — Cachemir IRP + DAG + cleanup | **1137** | 2.6e-4 | 4.5e-5 | 29.4 GiB | 2.8 GiB |
+
+**Summary**: 2.8–3.4× total speedup, 2.9× bootstrap stage speedup, ~10× plaintext
+memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance from GPU
+thermal/scheduling state — consistent within a single warm session.
+
+## Per-stage breakdown (IRP + DAG + cleanup, 1137 ms)
+
+```
+rms1                21.1 ms
+attention          483.1 ms
+rms2                20.5 ms
+mlp                612.1 ms
+bootstrap (×2)     346.4 ms
+total             1137.0 ms
+```
+
+## What is in this port
+
+**Phase 1 — Cachemir §4.1: Interleaved Replicated Packing (IRP) for ct·pt VMM.**
+Square and rectangular weight matrices are encoded with the IRP layout: d²/N
+plaintexts instead of the vanilla d, enabling reuse of pre-rotated baby
+diagonals across the replicated-block ciphertext. Implemented for both real and
+complex-folded (2× slot efficiency) BSGS paths.
+
+**Phase 2 — Cachemir §5: KV-cache + ct·ct attention primitives.**
+`qkt_irp` and `softmax_v_irp` implement query×keyᵀ and score×value in the IRP
+layout. Keys and values are accumulated into a persistent KV cache that survives
+across token positions without re-encoding.
+
+**Phase 3 — Cachemir §6: DAG bootstrap-placement via shortest-path.**
+A directed acyclic graph over the decoder ops is constructed; edge weights encode
+the consumed multiplicative depth. A topologically-ordered relaxation finds the
+minimum bootstrap count. This port achieves a 2.29× bootstrap reduction (vs the
+paper's 1.98×) because the IRP layout shifts already include free decrypt+re-encrypt
+level resets that the search recognises as zero-cost level moves.
+
+**Phase 4 — headline script rewire.**
+Both `llama_real_attn_test.py` and `llama_bootstrap_test.py` are rewired to use
+the Cachemir blocks end-to-end.
+
+## Files
+
+```
+python/llm_project/llama_real_attn_test.py    # plaintext-shim baseline path
+python/llm_project/llama_bootstrap_test.py    # real EvalMod path
+
+python/llm_project/blocks/irp.py              # Cachemir §4.1 IRP (square + rect)
+python/llm_project/blocks/kv_cache.py         # Cachemir §5 KV cache + ct·ct attn
+python/llm_project/blocks/bootstrap_placement.py  # Cachemir §6 DAG placement
+
+python/llm_project/blocks/attention.py        # IRP-aware attention orchestration
+python/llm_project/blocks/mlp.py              # MLP forward + setup helpers
+python/llm_project/blocks/rmsnorm.py          # RMSNorm forward + setup
+python/llm_project/blocks/softmax.py          # softmax helpers + composition
+python/llm_project/blocks/silu.py             # SiLU coefficient table + forward
+python/llm_project/blocks/rope.py             # RoPE precompute + apply
+python/llm_project/blocks/linear.py           # FD linear (legacy diagonal path)
+python/llm_project/blocks/bootstrap.py        # mean-centered EvalMod wrapper
+python/llm_project/blocks/residual.py         # residual add helper
+```
+
+## Reproduce
+
+Build (from repo root):
+
+```bash
+cmake --build build -j 8
+```
+
+Run headlines:
+
+```bash
+PYTHONPATH=build/lib python3 python/llm_project/llama_real_attn_test.py
+PYTHONPATH=build/lib python3 python/llm_project/llama_bootstrap_test.py
+```
+
+Run all 11 block regression tests:
+
+```bash
+for f in python/llm_project/blocks/{silu,ps,replicate,softmax,rmsnorm,rope,bsgs}_test.py \
+         python/llm_project/blocks/{linear_fd,mlp_test,mlp_complex_test,sdpa_test}.py; do
+    PYTHONPATH=build/lib python3 "$f"
+done
+```
+
+## C++ surface added
+
+One load-bearing field on `CKKSEngineConfig` (~30-line delta across `include/ckks_engine.h`,
+`src/ckks_engine.cu`, `python/src/binding.cu`):
+
+```cpp
+std::vector<std::size_t> user_rotation_target_chain_indices;
+```
+
+When non-empty, the i-th element gives the chain index at which the i-th
+`user_rotation_steps[i]` Galois key should be generated. This lets the
+bootstrap-aware IRP path keep ~50 of its 69 rotation keys at deep chain depth
+(small `beta_k`), which is what allows the engine to fit inside 32 GiB GPU.
+
+The existing `create_galois_keys_per_level(context, indices, target_chain_indices)`
+API on `PhantomSecretKey` (already present) is the mechanism used to materialise
+per-level Galois keys.
+
+## Reference
+
+Cachemir: Fully Homomorphic Encrypted Inference of Generative Large Language
+Model with KV Cache. https://arxiv.org/abs/2602.11470

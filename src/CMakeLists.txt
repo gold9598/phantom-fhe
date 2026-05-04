@@ -14,6 +14,14 @@ add_library(Phantom SHARED
         evalmod.cu
         bootstrap.cu
         ckks_engine.cu
+        linear.cu
+        bsgs.cu
+        ps.cu
+        rmsnorm.cu
+        softmax.cu
+        mlp.cu
+        attention.cu
+        single_chain_plaintext.cu
         fft.cu
         ckks.cu
         galois.cu

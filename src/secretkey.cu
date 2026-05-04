@@ -723,6 +723,57 @@ PhantomGaloisKey PhantomSecretKey::create_galois_keys_for_indices(
     return galois_keys;
 }
 
+PhantomGaloisKey PhantomSecretKey::create_galois_keys_per_level(
+        const PhantomContext &context,
+        const std::vector<std::size_t> &indices,
+        const std::vector<std::size_t> &target_chain_indices) const {
+    if (indices.size() != target_chain_indices.size()) {
+        throw std::invalid_argument(
+            "create_galois_keys_per_level: indices and target_chain_indices must have the same length");
+    }
+    PhantomGaloisKey galois_keys;
+
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto &key_modulus = key_parms.coeff_modulus();
+    auto &key_galois_tool = context.key_galois_tool_;
+    auto poly_degree = key_parms.poly_modulus_degree();
+    auto key_mod_size = key_modulus.size();
+
+    const auto &s = cudaStreamPerThread;
+    auto &galois_elts = key_galois_tool->galois_elts();
+    auto relin_key_num = galois_elts.size();
+    galois_keys.relin_keys_.resize(relin_key_num);
+
+    auto rotated_secret_key = make_cuda_auto_ptr<uint64_t>(key_mod_size * poly_degree, s);
+    auto secret_key = secret_key_array_.get();
+
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        std::size_t idx = indices[i];
+        std::size_t target_chain_index = target_chain_indices[i];
+        if (idx >= relin_key_num) {
+            throw std::out_of_range("create_galois_keys_per_level: index out of range");
+        }
+        auto galois_elt = galois_elts[idx];
+        if (!(galois_elt & 1) || (galois_elt >= poly_degree << 1)) {
+            throw std::invalid_argument("create_galois_keys_per_level: Galois element is not valid");
+        }
+        key_galois_tool->apply_galois_ntt(secret_key, key_mod_size, idx,
+                                          rotated_secret_key.get(), s);
+        PhantomRelinKey relin_key;
+        if (target_chain_index == 0) {
+            generate_one_kswitch_key(context, rotated_secret_key.get(), relin_key, s);
+        } else {
+            generate_one_kswitch_key_at_level(context, rotated_secret_key.get(),
+                                              relin_key, target_chain_index, s);
+        }
+        relin_key.gen_flag_ = true;
+        galois_keys.relin_keys_[idx] = std::move(relin_key);
+    }
+    galois_keys.gen_flag_ = true;
+    return galois_keys;
+}
+
 PhantomRelinKey PhantomSecretKey::create_one_galois_key(
         const PhantomContext &context,
         std::size_t galois_elt_idx,

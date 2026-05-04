@@ -587,4 +587,285 @@ void inwt_phase2(uint64_t *inout,
     }
 }
 
+// =============================================================================
+// Batched forward NTT kernels.
+//
+// Process M independent polynomials (each of shape [num_towers, n]) in a single
+// grid launch. The polynomials share the same modulus / twiddle table per
+// tower; we extend the work distribution to M*coeff_mod_size logical "towers"
+// and remap (logical_tower) -> (physical modulus index, baby slab index) at
+// the start of each iteration.
+//
+// Memory layout: inout = pooled[baby][tower][slot] flattened, total
+// M * coeff_mod_size * n elements.
+//
+// Twiddles / modulus tables are reused: physical tower idx is
+// (logical_twr - start_mod_idx) % coeff_mod_size + start_mod_idx, but inside
+// the kernel we just compute (twr_idx_in_chunk + start_mod_idx) for the table
+// lookup and (baby * coeff_mod_size + twr_idx_in_chunk) for the data offset.
+// =============================================================================
+
+template <int LOG_N1, int LOG_N2>
+__global__ __launch_bounds__(((1 << LOG_N1) >> 3) * per_block_pad, 1)
+void fnwt_phase1_batched(uint64_t *inout,
+                         const uint64_t *twiddles,
+                         const uint64_t *twiddles_shoup,
+                         const DModulus *modulus,
+                         size_t coeff_mod_size,
+                         size_t start_mod_idx,
+                         size_t M) {
+    constexpr int LOG_N             = LOG_N1 + LOG_N2;
+    constexpr size_t n              = 1ULL << LOG_N;
+    constexpr size_t n1             = 1ULL << LOG_N1;
+    constexpr int log_group         = LOG_N1 - 3;
+    constexpr size_t group          = 1ULL << log_group;
+    constexpr size_t pad            = per_block_pad;
+    constexpr int log_pad           = ct_log2_pow2(pad);
+    constexpr size_t smem_row       = n1 + pad;
+    constexpr int log_t_quarter     = LOG_N - 3;
+    constexpr int log_stride_per_pi = log_t_quarter - log_group;
+
+    extern __shared__ uint64_t buffer[];
+
+    const size_t pad_tid = threadIdx.x & (pad - 1);
+    const size_t pad_idx = threadIdx.x >> log_pad;
+    uint64_t samples[8];
+
+    const size_t total_work = (n >> 3) * coeff_mod_size * M;
+    const size_t per_baby_work = (n >> 3) * coeff_mod_size;
+
+    for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+         tid < total_work;
+         tid += blockDim.x * gridDim.x) {
+
+        const size_t baby_idx     = tid / per_baby_work;
+        const size_t local_tid    = tid - baby_idx * per_baby_work;
+        const size_t twr_in_chunk = local_tid >> log_t_quarter;
+        const size_t twr_phys     = twr_in_chunk + start_mod_idx;
+        const size_t twr_logical  = baby_idx * coeff_mod_size + twr_in_chunk;
+        const size_t n_idx        = local_tid & ((n >> 3) - 1);
+
+        uint64_t *data_ptr        = inout + twr_logical * n;
+        const uint64_t *psi       = twiddles       + twr_phys * n;
+        const uint64_t *psi_shoup = twiddles_shoup + twr_phys * n;
+        const uint64_t mod        = modulus[twr_phys].value();
+        const bool use_lazy       = (mod < (1ULL << kNttLazyPrimeBits));
+
+        const size_t n_init = (pad_idx << log_stride_per_pi) + pad_tid +
+                              ((n_idx >> (log_group + log_pad)) << log_pad);
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            samples[j] = *(data_ptr + n_init + ((size_t)j << log_t_quarter));
+
+        const size_t tw_idx = 1;
+        if (use_lazy) fntt8_lazy(samples, psi, psi_shoup, tw_idx, mod);
+        else          fntt8     (samples, psi, psi_shoup, tw_idx, mod);
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            buffer[pad_tid * smem_row + pad_idx + group * j] = samples[j];
+        __syncthreads();
+
+        size_t remain_iters = 0;
+        #pragma unroll
+        for (size_t j = 8, k = group >> 1, log_k = log_group - 1;
+             j < group + 1;
+             j *= 8, k >>= 3, log_k -= 3) {
+            const size_t k4     = k >> 2;
+            const size_t m_idx2 = (log_k >= 2) ? (pad_idx >> (log_k - 2)) : 0;
+            const size_t t_idx2 = pad_idx & (k4 - 1);
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
+                samples[l] = buffer[smem_row * pad_tid + 2 * m_idx2 * k + t_idx2 + k4 * l];
+            const size_t tw_idx2 = j * tw_idx + m_idx2;
+            if (use_lazy) fntt8_lazy(samples, psi, psi_shoup, tw_idx2, mod);
+            else          fntt8     (samples, psi, psi_shoup, tw_idx2, mod);
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
+                buffer[smem_row * pad_tid + 2 * m_idx2 * k + t_idx2 + k4 * l] = samples[l];
+            if (j == (group >> 1)) remain_iters = 1;
+            if (j == (group >> 2)) remain_iters = 2;
+            __syncthreads();
+        }
+        if constexpr (group < 8) {
+            remain_iters = (group == 4) ? 2 : 1;
+        }
+
+        #pragma unroll
+        for (int l = 0; l < 8; l++)
+            samples[l] = buffer[smem_row * pad_tid + 8 * pad_idx + l];
+
+        if (remain_iters == 1) {
+            const size_t tw_idx2 = (group << 2) * tw_idx + (pad_idx << 2);
+            if (use_lazy) {
+                ct_butterfly_lazy(samples[0], samples[1], psi[tw_idx2],     psi_shoup[tw_idx2],     mod);
+                ct_butterfly_lazy(samples[2], samples[3], psi[tw_idx2 + 1], psi_shoup[tw_idx2 + 1], mod);
+                ct_butterfly_lazy(samples[4], samples[5], psi[tw_idx2 + 2], psi_shoup[tw_idx2 + 2], mod);
+                ct_butterfly_lazy(samples[6], samples[7], psi[tw_idx2 + 3], psi_shoup[tw_idx2 + 3], mod);
+            } else {
+                ct_butterfly(samples[0], samples[1], psi[tw_idx2],     psi_shoup[tw_idx2],     mod);
+                ct_butterfly(samples[2], samples[3], psi[tw_idx2 + 1], psi_shoup[tw_idx2 + 1], mod);
+                ct_butterfly(samples[4], samples[5], psi[tw_idx2 + 2], psi_shoup[tw_idx2 + 2], mod);
+                ct_butterfly(samples[6], samples[7], psi[tw_idx2 + 3], psi_shoup[tw_idx2 + 3], mod);
+            }
+        } else if (remain_iters == 2) {
+            const size_t tw_idx2 = (group << 1) * tw_idx + (pad_idx << 1);
+            if (use_lazy) {
+                fntt4_lazy(samples,     psi, psi_shoup, tw_idx2,     mod);
+                fntt4_lazy(samples + 4, psi, psi_shoup, tw_idx2 + 1, mod);
+            } else {
+                fntt4(samples,     psi, psi_shoup, tw_idx2,     mod);
+                fntt4(samples + 4, psi, psi_shoup, tw_idx2 + 1, mod);
+            }
+        }
+
+        if (use_lazy) {
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
+                samples[l] = lazy_reduce_to_2q(samples[l], mod);
+        }
+
+        #pragma unroll
+        for (int l = 0; l < 8; l++)
+            buffer[smem_row * pad_tid + 8 * pad_idx + l] = samples[l];
+        __syncthreads();
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            *(data_ptr + n_init + ((size_t)j << log_t_quarter))
+                = buffer[pad_tid * smem_row + pad_idx + group * j];
+    }
+}
+
+template <int LOG_N1, int LOG_N2>
+__global__ __launch_bounds__(128, 1)
+void fnwt_phase2_batched(uint64_t *data_ptr_base,
+                         const uint64_t *twiddles,
+                         const uint64_t *twiddles_shoup,
+                         const DModulus *modulus,
+                         size_t coeff_mod_size,
+                         size_t start_mod_idx,
+                         size_t M) {
+    constexpr int LOG_N         = LOG_N1 + LOG_N2;
+    constexpr size_t n          = 1ULL << LOG_N;
+    constexpr size_t n1         = 1ULL << LOG_N1;
+    constexpr size_t n2         = 1ULL << LOG_N2;
+    constexpr int log_t         = LOG_N2 - 1;
+    constexpr int log_t_quarter = LOG_N2 - 3;
+    constexpr size_t t          = 1ULL << log_t;
+    constexpr int log_group     = LOG_N2 - 3;
+    constexpr size_t smem_set   = smem_padded_per_set(n2);
+
+    extern __shared__ uint64_t buffer[];
+    const size_t set = threadIdx.x >> log_group;
+    uint64_t *my_smem = buffer + set * smem_set;
+    uint64_t samples[8];
+
+    const size_t per_baby_work = (n >> 3) * coeff_mod_size;
+    const size_t total_work = per_baby_work * M;
+
+    for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+         tid < total_work;
+         tid += blockDim.x * gridDim.x) {
+
+        const size_t baby_idx     = tid / per_baby_work;
+        const size_t local_tid    = tid - baby_idx * per_baby_work;
+        // Match phase2's reverse-tower iteration: coeff_mod_size - 1 - chunk.
+        const size_t twr_in_chunk_rev = local_tid >> (LOG_N - 3);
+        const size_t twr_in_chunk     = coeff_mod_size - 1 - twr_in_chunk_rev;
+        const size_t twr_phys         = twr_in_chunk + start_mod_idx;
+        const size_t twr_logical      = baby_idx * coeff_mod_size + twr_in_chunk;
+        const size_t n_idx            = local_tid & ((n >> 3) - 1);
+        const size_t m_idx            = n_idx >> log_t_quarter;
+        const size_t t_idx            = n_idx & ((1ULL << log_t_quarter) - 1);
+
+        uint64_t *data_ptr        = data_ptr_base + twr_logical * n;
+        const uint64_t mod        = modulus[twr_phys].value();
+        const uint64_t *psi       = twiddles       + n * twr_phys;
+        const uint64_t *psi_shoup = twiddles_shoup + n * twr_phys;
+        const bool use_lazy       = (mod < (1ULL << kNttLazyPrimeBits));
+
+        const size_t n_init = (m_idx << (log_t + 1)) + t_idx;
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            samples[j] = *(data_ptr + n_init + ((size_t)j << log_t_quarter));
+
+        const size_t tw_idx = n1 + m_idx;
+        if (use_lazy) fntt8_lazy(samples, psi, psi_shoup, tw_idx, mod);
+        else          fntt8     (samples, psi, psi_shoup, tw_idx, mod);
+
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            my_smem[smem_pad_addr(t_idx + ((size_t)j << log_t_quarter))] = samples[j];
+        __syncthreads();
+
+        size_t tail = 0;
+        #pragma unroll
+        for (size_t j = 8, k = t >> 3, log_k = log_t - 3;
+             j < (t >> 2) + 1;
+             j *= 8, k >>= 3, log_k -= 3) {
+            const size_t k4     = k >> 2;
+            const size_t m_idx2 = (log_k >= 2) ? (t_idx >> (log_k - 2)) : 0;
+            const size_t t_idx2 = t_idx & (k4 - 1);
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
+                samples[l] = my_smem[smem_pad_addr(2 * m_idx2 * k + t_idx2 + k4 * l)];
+            const size_t tw_idx2 = j * tw_idx + m_idx2;
+            if (use_lazy) fntt8_lazy(samples, psi, psi_shoup, tw_idx2, mod);
+            else          fntt8     (samples, psi, psi_shoup, tw_idx2, mod);
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
+                my_smem[smem_pad_addr(2 * m_idx2 * k + t_idx2 + k4 * l)] = samples[l];
+            if (j == (t >> 3)) tail = 1;
+            if (j == (t >> 4)) tail = 2;
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int l = 0; l < 8; l++)
+            samples[l] = my_smem[smem_pad_addr(8 * t_idx + l)];
+
+        if (tail == 1) {
+            const size_t tw_idx2 = t * tw_idx + (t_idx << 2);
+            if (use_lazy) {
+                ct_butterfly_lazy(samples[0], samples[1], psi[tw_idx2],     psi_shoup[tw_idx2],     mod);
+                ct_butterfly_lazy(samples[2], samples[3], psi[tw_idx2 + 1], psi_shoup[tw_idx2 + 1], mod);
+                ct_butterfly_lazy(samples[4], samples[5], psi[tw_idx2 + 2], psi_shoup[tw_idx2 + 2], mod);
+                ct_butterfly_lazy(samples[6], samples[7], psi[tw_idx2 + 3], psi_shoup[tw_idx2 + 3], mod);
+            } else {
+                ct_butterfly(samples[0], samples[1], psi[tw_idx2],     psi_shoup[tw_idx2],     mod);
+                ct_butterfly(samples[2], samples[3], psi[tw_idx2 + 1], psi_shoup[tw_idx2 + 1], mod);
+                ct_butterfly(samples[4], samples[5], psi[tw_idx2 + 2], psi_shoup[tw_idx2 + 2], mod);
+                ct_butterfly(samples[6], samples[7], psi[tw_idx2 + 3], psi_shoup[tw_idx2 + 3], mod);
+            }
+        } else if (tail == 2) {
+            const size_t tw_idx2 = (t >> 1) * tw_idx + (t_idx << 1);
+            if (use_lazy) {
+                fntt4_lazy(samples,     psi, psi_shoup, tw_idx2,     mod);
+                fntt4_lazy(samples + 4, psi, psi_shoup, tw_idx2 + 1, mod);
+            } else {
+                fntt4(samples,     psi, psi_shoup, tw_idx2,     mod);
+                fntt4(samples + 4, psi, psi_shoup, tw_idx2 + 1, mod);
+            }
+        }
+
+        #pragma unroll
+        for (int l = 0; l < 8; l++)
+            my_smem[smem_pad_addr(8 * t_idx + l)] = samples[l];
+        __syncthreads();
+
+        const uint64_t mod2 = mod << 1;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            uint64_t v = my_smem[smem_pad_addr(t_idx + ((size_t)j << log_t_quarter))];
+            if (use_lazy) v = lazy_reduce_to_2q(v, mod);
+            csub_q(v, mod2);
+            csub_q(v, mod);
+            data_ptr[n_init + ((size_t)j << log_t_quarter)] = v;
+        }
+    }
+}
+
 } // namespace phantom::ntt::radix8

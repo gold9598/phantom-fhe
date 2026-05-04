@@ -39,9 +39,20 @@ namespace phantom {
         int    num_special_primes = 6;               // for KSK hybrid
         // If true, the engine generates Galois keys for a small fixed set of
         // user rotations (±1, ±2, conjugation) in addition to the C2S/S2C
-        // bootstrap rotations. Production code should override the user
-        // rotation set explicitly (not exposed yet — see comments in .cu).
+        // bootstrap rotations. When `user_rotation_steps` is non-empty, this
+        // flag is ignored and only the explicit list is used (plus conjugation,
+        // which is always added).
         bool   include_user_rotations = true;
+        // Explicit user rotation step list. When non-empty, overrides the
+        // default ±1/±2 set. Conjugation (galois_elt = 2N-1) is always added.
+        // Steps used by C2S/S2C bootstrap are added automatically — callers
+        // need only list the rotations their pipeline needs.
+        std::vector<int> user_rotation_steps;
+        // Optional: per-step target chain indices for user_rotation_steps.
+        // Must be empty OR same length as user_rotation_steps.
+        // If empty, all keys are generated at fresh user-scale (current default).
+        // If provided, the i-th step's key is generated at the i-th target chain index.
+        std::vector<std::size_t> user_rotation_target_chain_indices;
     };
 
     class CKKSEngine {
@@ -84,6 +95,20 @@ namespace phantom {
         // ---- Read-only views (advanced; do NOT use to touch bootstrap primes) ----
         [[nodiscard]] const PhantomContext &context() const noexcept { return *ctx_; }
         [[nodiscard]] const PhantomCKKSEncoder &encoder() const noexcept { return *enc_; }
+        [[nodiscard]] const PhantomSecretKey &secret_key() const noexcept { return *sk_; }
+        [[nodiscard]] const PhantomRelinKey &relin_key() const noexcept { return bk_.relin_key; }
+        [[nodiscard]] const PhantomGaloisKey &galois_key() const noexcept { return bk_.user_galois_keys; }
+        // user_level chain index (for callers that need to encode plaintexts at
+        // a specific level matching this engine's user-scale segment).
+        [[nodiscard]] std::size_t user_level_chain_index(int user_level_) const {
+            if (user_level_ < 0 || user_level_ >= cfg_.num_scale_levels) {
+                throw std::invalid_argument(
+                    "CKKSEngine::user_level_chain_index: user_level out of range");
+            }
+            return freshest_chain_index_ + static_cast<std::size_t>(user_level_);
+        }
+        [[nodiscard]] PhantomCKKSEncoder &mutable_encoder() noexcept { return *enc_; }
+        [[nodiscard]] PhantomSecretKey &mutable_secret_key() noexcept { return *sk_; }
 
     private:
         CKKSEngineConfig cfg_;

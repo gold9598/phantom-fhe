@@ -411,6 +411,17 @@ public:
         const PhantomContext& context,
         const std::vector<std::size_t>& indices) const;
 
+    // Per-level variant: generates each requested KSK DIRECTLY at the matching
+    // entry in `target_chain_indices` (same length as `indices`). A target of 0
+    // falls back to full-Q. The returned bundle's `relin_keys_` is sized to
+    // `galois_elts().size()` with empty entries for non-listed positions.
+    // Saves GPU memory by never materialising full-Q KSKs for keys that will
+    // only be used at deeper chain levels.
+    [[nodiscard]] PhantomGaloisKey create_galois_keys_per_level(
+        const PhantomContext& context,
+        const std::vector<std::size_t>& indices,
+        const std::vector<std::size_t>& target_chain_indices) const;
+
     // Generate a single KSK for the Galois element at position `galois_elt_idx`
     // in `context.key_galois_tool_->galois_elts()`. Returns a standalone
     // `PhantomRelinKey` that can be used with the single-KSK overloads of

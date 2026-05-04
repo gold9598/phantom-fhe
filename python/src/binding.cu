@@ -1,8 +1,18 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/complex.h>
 #include <pybind11/stl.h>
 
 #include "phantom.h"
+#include "attention.h"
 #include "bootstrap.h"
+#include "bsgs.h"
+#include "ckks_engine.h"
+#include "linear.h"
+#include "mlp.h"
+#include "ps.h"
+#include "rmsnorm.h"
+#include "single_chain_plaintext.h"
+#include "softmax.h"
 
 namespace py = pybind11;
 
@@ -68,6 +78,9 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("gen_publickey", &PhantomSecretKey::gen_publickey)
             .def("gen_relinkey", &PhantomSecretKey::gen_relinkey)
             .def("create_galois_keys", &PhantomSecretKey::create_galois_keys)
+            .def("create_galois_keys_per_level",
+                 &PhantomSecretKey::create_galois_keys_per_level,
+                 py::arg("context"), py::arg("indices"), py::arg("target_chain_indices"))
             .def("encrypt_symmetric",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
                          &PhantomSecretKey::encrypt_symmetric, py::const_), py::arg(), py::arg())
@@ -188,6 +201,9 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     m.def("hoisting", &phantom::hoisting, py::arg(), py::arg(), py::arg(), py::arg());
 
+    m.def("hoist_rotations", &phantom::hoist_rotations,
+          py::arg("context"), py::arg("ct"), py::arg("glk"), py::arg("steps"));
+
     // ===== CKKS bootstrap (Phase 6) =====
     py::class_<phantom::SmallBootstrapKey>(m, "small_bootstrap_key");
 
@@ -230,4 +246,237 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("ct"),
           py::arg("bk"),
           py::arg("user_scale"));
+
+    // ===== CKKSEngine: user-facing facade with bootstrap =====
+    py::class_<phantom::CKKSEngineConfig>(m, "ckks_engine_config")
+            .def(py::init<>())
+            .def_readwrite("log_n", &phantom::CKKSEngineConfig::log_n)
+            .def_readwrite("user_scale", &phantom::CKKSEngineConfig::user_scale)
+            .def_readwrite("num_scale_levels", &phantom::CKKSEngineConfig::num_scale_levels)
+            .def_readwrite("sparse_hw", &phantom::CKKSEngineConfig::sparse_hw)
+            .def_readwrite("num_special_primes", &phantom::CKKSEngineConfig::num_special_primes)
+            .def_readwrite("include_user_rotations", &phantom::CKKSEngineConfig::include_user_rotations)
+            .def_readwrite("user_rotation_steps", &phantom::CKKSEngineConfig::user_rotation_steps)
+            .def_readwrite("user_rotation_target_chain_indices",
+                           &phantom::CKKSEngineConfig::user_rotation_target_chain_indices);
+
+    py::class_<phantom::CKKSEngine>(m, "ckks_engine")
+            .def(py::init<const phantom::CKKSEngineConfig &>(), py::arg("config"))
+            .def("slot_count", &phantom::CKKSEngine::slot_count)
+            .def("user_scale", &phantom::CKKSEngine::user_scale)
+            .def("max_user_level", &phantom::CKKSEngine::max_user_level)
+            .def("user_level", &phantom::CKKSEngine::user_level)
+            .def("user_level_chain_index", &phantom::CKKSEngine::user_level_chain_index)
+            .def("encrypt", &phantom::CKKSEngine::encrypt)
+            .def("decrypt_decode", &phantom::CKKSEngine::decrypt_decode)
+            .def("bootstrap_inplace", &phantom::CKKSEngine::bootstrap_inplace)
+            .def("context", &phantom::CKKSEngine::context, py::return_value_policy::reference_internal)
+            .def("encoder", &phantom::CKKSEngine::mutable_encoder, py::return_value_policy::reference_internal)
+            .def("secret_key", &phantom::CKKSEngine::mutable_secret_key, py::return_value_policy::reference_internal)
+            .def("relin_key", &phantom::CKKSEngine::relin_key, py::return_value_policy::reference_internal)
+            .def("galois_key", &phantom::CKKSEngine::galois_key, py::return_value_policy::reference_internal);
+
+    // ===== Single-chain (host-pinned, level-agnostic) plaintext =====
+    py::class_<phantom::SingleChainPlaintext>(m, "single_chain_plaintext")
+            .def_property_readonly("scale",
+                                   [](const phantom::SingleChainPlaintext &p) { return p.scale; })
+            .def_property_readonly("nbytes",
+                                   [](const phantom::SingleChainPlaintext &p) { return p.coeffs.nbytes(); });
+
+    m.def("encode_single_chain_plaintext",
+          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
+             const std::vector<std::complex<double>> &slots, double scale) {
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
+          },
+          py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
+
+    m.def("expand_single_chain_to_full", &phantom::expand_single_chain_to_full,
+          py::arg("context"), py::arg("scp"), py::arg("target_chain_index"));
+
+    // ===== FD-packed matrix-vector multiply =====
+    m.def("inner_sum", &phantom::inner_sum,
+          py::arg("context"), py::arg("galois_key"), py::arg("ct"),
+          py::arg("block_size"));
+
+    m.def("replicate", &phantom::replicate,
+          py::arg("context"), py::arg("galois_key"), py::arg("ct"),
+          py::arg("period"), py::arg("num_slots"));
+
+    // ===== BSGS-diagonal matrix-vector multiply =====
+    py::class_<phantom::BsgsDiagonals>(m, "bsgs_diagonals")
+            .def_property_readonly("d_pad",
+                                   [](const phantom::BsgsDiagonals &d) { return d.d_pad; })
+            .def_property_readonly("baby_steps",
+                                   [](const phantom::BsgsDiagonals &d) { return d.baby_steps; })
+            .def_property_readonly("giant_steps",
+                                   [](const phantom::BsgsDiagonals &d) { return d.giant_steps; });
+
+    m.def("pre_encode_bsgs_diagonals",
+          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
+             const std::vector<double> &matrix,
+             std::size_t num_rows, std::size_t num_cols,
+             std::size_t d_pad, std::size_t baby_steps, double scale) {
+              return phantom::pre_encode_bsgs_diagonals(
+                      ctx, encoder, matrix, num_rows, num_cols, d_pad, baby_steps, scale);
+          },
+          py::arg("context"), py::arg("encoder"), py::arg("matrix"),
+          py::arg("num_rows"), py::arg("num_cols"),
+          py::arg("d_pad"), py::arg("baby_steps"), py::arg("scale"),
+          py::return_value_policy::move);
+
+    m.def("bsgs_required_steps", &phantom::bsgs_required_steps, py::arg("baby_steps"));
+
+    m.def("bsgs_matmul_preencoded", &phantom::bsgs_matmul_preencoded,
+          py::arg("context"), py::arg("galois_key"), py::arg("x"), py::arg("diags"));
+
+    m.def("compute_bsgs_babies", &phantom::compute_bsgs_babies,
+          py::arg("context"), py::arg("galois_key"), py::arg("x"), py::arg("baby_steps"),
+          py::return_value_policy::move);
+
+    m.def("bsgs_apply_giants_with_babies", &phantom::bsgs_apply_giants_with_babies,
+          py::arg("context"), py::arg("galois_key"), py::arg("babies"), py::arg("diags"));
+
+    py::enum_<phantom::ComplexFoldMode>(m, "complex_fold_mode")
+        .value("Rows", phantom::ComplexFoldMode::Rows)
+        .value("ColsConj", phantom::ComplexFoldMode::ColsConj);
+
+    m.def("pre_encode_bsgs_diagonals_complex",
+          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
+             const std::vector<double> &matrix,
+             std::size_t num_rows, std::size_t num_cols,
+             std::size_t d_pad, std::size_t baby_steps, double scale,
+             phantom::ComplexFoldMode fold_mode) {
+              return phantom::pre_encode_bsgs_diagonals_complex(
+                      ctx, encoder, matrix, num_rows, num_cols, d_pad, baby_steps, scale, fold_mode);
+          },
+          py::arg("ctx"), py::arg("encoder"), py::arg("matrix"),
+          py::arg("num_rows"), py::arg("num_cols"),
+          py::arg("d_pad"), py::arg("baby_steps"), py::arg("scale"),
+          py::arg("fold_mode"),
+          py::return_value_policy::move);
+
+    // ===== Paterson-Stockmeyer polynomial evaluation =====
+    m.def("eval_polynomial", &phantom::eval_polynomial,
+          py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
+          py::arg("ct"), py::arg("coeffs"));
+
+    // ===== RMSNorm =====
+    py::class_<phantom::RmsNormParams>(m, "rmsnorm_params")
+            .def(py::init<>())
+            .def_readwrite("d_model", &phantom::RmsNormParams::d_model)
+            .def_readwrite("epsilon", &phantom::RmsNormParams::epsilon)
+            .def_readwrite("z_min", &phantom::RmsNormParams::z_min)
+            .def_readwrite("z_max", &phantom::RmsNormParams::z_max)
+            .def_readwrite("poly_degree", &phantom::RmsNormParams::poly_degree);
+
+    py::class_<phantom::RmsNormWeights>(m, "rmsnorm_weights")
+            .def(py::init<>())
+            .def(py::init([](const std::vector<double> &g_tiled_real,
+                             const std::vector<double> &g) {
+                     phantom::RmsNormWeights w;
+                     w.g_tiled_real = g_tiled_real;
+                     w.g = g;
+                     return w;
+                 }),
+                 py::arg("g_tiled_real"), py::arg("g"))
+            .def_property_readonly("g_tiled_real",
+                                   [](const phantom::RmsNormWeights &w) { return w.g_tiled_real; })
+            .def_property_readonly("g",
+                                   [](const phantom::RmsNormWeights &w) { return w.g; });
+
+    m.def("rmsnorm_forward", &phantom::rmsnorm_forward,
+          py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
+          py::arg("galois_key"), py::arg("x"), py::arg("weights"), py::arg("params"));
+
+    // ===== Softmax =====
+    m.def("ps_exp_init", &phantom::ps_exp_init,
+          py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
+          py::arg("scores"), py::arg("num_tokens"), py::arg("num_squarings"),
+          py::arg("extra_scale"));
+
+    m.def("square_iterations_inplace", &phantom::square_iterations_inplace,
+          py::arg("context"), py::arg("relin_key"), py::arg("ct"),
+          py::arg("num_squarings"));
+
+    m.def("square_iterations_damped_inplace", &phantom::square_iterations_damped_inplace,
+          py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
+          py::arg("ct"), py::arg("damps"));
+
+    m.def("softmax_correct", &phantom::softmax_correct,
+          py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
+          py::arg("e_ct"), py::arg("a_ct"), py::arg("iters"));
+
+    m.def("finalize_softmax", &phantom::finalize_softmax,
+          py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
+          py::arg("galois_key"), py::arg("e_ct"), py::arg("num_tokens"),
+          py::arg("stride"), py::arg("iters"));
+
+    // ===== SwiGLU MLP =====
+    py::class_<phantom::MlpWeights>(m, "mlp_weights")
+            .def(py::init<>())
+            .def(py::init([](phantom::BsgsDiagonals w_gate,
+                             phantom::BsgsDiagonals w_up,
+                             phantom::BsgsDiagonals w_down) {
+                     phantom::MlpWeights w;
+                     w.w_gate = std::move(w_gate);
+                     w.w_up = std::move(w_up);
+                     w.w_down = std::move(w_down);
+                     return w;
+                 }),
+                 py::arg("w_gate"), py::arg("w_up"), py::arg("w_down"));
+
+    m.def("mlp_forward", &phantom::mlp_forward,
+          py::arg("context"), py::arg("encoder"),
+          py::arg("relin_key"), py::arg("galois_key"),
+          py::arg("x"), py::arg("w"));
+
+    // ===== Complex-folded MLP (2x faster matmuls via complex slot packing) =====
+    py::class_<phantom::ComplexBsgsDiagonals>(m, "complex_bsgs_diagonals");
+
+    m.def("bsgs_apply_giants_with_babies_complex",
+          &phantom::bsgs_apply_giants_with_babies_complex,
+          py::arg("context"), py::arg("galois_key"),
+          py::arg("babies"), py::arg("diags"));
+
+    py::class_<phantom::MlpWeightsComplex>(m, "mlp_weights_complex")
+            .def(py::init<>())
+            .def(py::init([](phantom::ComplexBsgsDiagonals w_gate,
+                             phantom::ComplexBsgsDiagonals w_up,
+                             phantom::ComplexBsgsDiagonals w_down,
+                             std::size_t d_model,
+                             std::size_t d_hidden,
+                             std::size_t d_pad) {
+                     phantom::MlpWeightsComplex w;
+                     w.w_gate = std::move(w_gate);
+                     w.w_up = std::move(w_up);
+                     w.w_down = std::move(w_down);
+                     w.d_model = d_model;
+                     w.d_hidden = d_hidden;
+                     w.d_pad = d_pad;
+                     return w;
+                 }),
+                 py::arg("w_gate"), py::arg("w_up"), py::arg("w_down"),
+                 py::arg("d_model"), py::arg("d_hidden"), py::arg("d_pad"))
+            .def_property_readonly("d_model",
+                                   [](const phantom::MlpWeightsComplex &w) { return w.d_model; })
+            .def_property_readonly("d_hidden",
+                                   [](const phantom::MlpWeightsComplex &w) { return w.d_hidden; })
+            .def_property_readonly("d_pad",
+                                   [](const phantom::MlpWeightsComplex &w) { return w.d_pad; });
+
+    m.def("mlp_forward_complex", &phantom::mlp_forward_complex,
+          py::arg("context"), py::arg("encoder"),
+          py::arg("relin_key"), py::arg("galois_key"),
+          py::arg("x"), py::arg("w"));
+
+    // ===== Attention: QK^T =====
+    m.def("compute_qkt", &phantom::compute_qkt,
+          py::arg("context"), py::arg("relin_key"), py::arg("galois_key"),
+          py::arg("q"), py::arg("packed_k"), py::arg("d_head"));
+
+    // ===== Attention: score × V =====
+    m.def("score_times_v", &phantom::score_times_v,
+          py::arg("context"), py::arg("relin_key"), py::arg("galois_key"),
+          py::arg("score_cts"), py::arg("v_cts"), py::arg("mask_pt"),
+          py::arg("d_head"), py::arg("d_total"), py::arg("positions_per_ct"));
 }

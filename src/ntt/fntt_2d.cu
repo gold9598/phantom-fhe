@@ -708,6 +708,81 @@ void nwt_2d_radix8_forward_inplace(uint64_t *inout,
             phase2_sample_size);
 }
 
+// Batched launcher: same templated kernels as launch_fnwt_2d_tmpl, but the
+// kernels iterate over M*coeff_mod_size logical towers instead of just
+// coeff_mod_size. Per-launch overhead amortizes across babies, and twiddle /
+// modulus loads share L2 across babies in the same SM.
+template <int LOG_N1, int LOG_N2>
+static inline void launch_fnwt_2d_tmpl_batched(uint64_t *inout,
+                                               const DNTTTable &ntt_tables,
+                                               size_t M,
+                                               size_t coeff_modulus_size,
+                                               size_t start_modulus_idx,
+                                               const cudaStream_t &stream) {
+    constexpr size_t n1         = 1ULL << LOG_N1;
+    constexpr size_t n2         = 1ULL << LOG_N2;
+    constexpr size_t group_p1   = n1 >> 3;
+    constexpr size_t block_p1   = group_p1 * per_block_pad;
+    constexpr size_t smem_p1    = (n1 + per_block_pad + 1) * per_block_pad * sizeof(uint64_t);
+    constexpr size_t block_p2   = 128;
+    constexpr size_t smem_p2    = phantom::ntt::radix8::smem_padded_total_uint64(n2)
+                                  * sizeof(uint64_t);
+
+    namespace r8 = phantom::ntt::radix8;
+    r8::fnwt_phase1_batched<LOG_N1, LOG_N2><<<gridDimNTT, block_p1, smem_p1, stream>>>(
+            inout,
+            ntt_tables.twiddle(),
+            ntt_tables.twiddle_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx,
+            M);
+
+    r8::fnwt_phase2_batched<LOG_N1, LOG_N2>
+        <<<gridDimNTT, block_p2, smem_p2, stream>>>(
+            inout,
+            ntt_tables.twiddle(),
+            ntt_tables.twiddle_shoup(),
+            ntt_tables.modulus(),
+            coeff_modulus_size,
+            start_modulus_idx,
+            M);
+}
+
+void nwt_2d_radix8_forward_inplace_batched(uint64_t *inout,
+                                           const DNTTTable &ntt_tables,
+                                           size_t M,
+                                           size_t coeff_modulus_size,
+                                           size_t start_modulus_idx,
+                                           const cudaStream_t &stream) {
+    if (M == 0) return;
+    if (M == 1) {
+        // Trivial fast path: defer to the single-poly launcher.
+        nwt_2d_radix8_forward_inplace(inout, ntt_tables, coeff_modulus_size,
+                                      start_modulus_idx, stream);
+        return;
+    }
+
+    const size_t poly_degree = ntt_tables.n();
+    switch (poly_degree) {
+        case 4096:   launch_fnwt_2d_tmpl_batched<6, 6>(inout, ntt_tables, M, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 8192:   launch_fnwt_2d_tmpl_batched<7, 6>(inout, ntt_tables, M, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 16384:  launch_fnwt_2d_tmpl_batched<8, 6>(inout, ntt_tables, M, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 32768:  launch_fnwt_2d_tmpl_batched<8, 7>(inout, ntt_tables, M, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 65536:  launch_fnwt_2d_tmpl_batched<8, 8>(inout, ntt_tables, M, coeff_modulus_size, start_modulus_idx, stream); return;
+        case 131072: launch_fnwt_2d_tmpl_batched<8, 9>(inout, ntt_tables, M, coeff_modulus_size, start_modulus_idx, stream); return;
+        default: break;
+    }
+
+    // Fallback for sizes outside the templated set: loop the single-poly
+    // launcher M times. Preserves correctness for any n.
+    const size_t per_pt = coeff_modulus_size * poly_degree;
+    for (size_t b = 0; b < M; ++b) {
+        nwt_2d_radix8_forward_inplace(inout + b * per_pt, ntt_tables,
+                                      coeff_modulus_size, start_modulus_idx, stream);
+    }
+}
+
 void nwt_2d_radix8_forward_inplace_include_temp_mod(uint64_t *inout,
                                                     const DNTTTable &ntt_tables,
                                                     size_t coeff_modulus_size,

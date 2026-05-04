@@ -114,9 +114,12 @@ namespace phantom {
             all_steps.insert(all_steps.end(), s2c_steps.begin(), s2c_steps.end());
         }
 
-        if (cfg_.include_user_rotations) {
+        if (!cfg_.user_rotation_steps.empty()) {
+            // Explicit user rotation list overrides the default.
+            for (int s : cfg_.user_rotation_steps) all_steps.push_back(s);
+        } else if (cfg_.include_user_rotations) {
             // Minimal rotation set for the test. Production code should pass a
-            // full power-of-2 ladder via a config knob (not yet exposed).
+            // full power-of-2 ladder via cfg.user_rotation_steps.
             for (int s : {1, -1, 2, -2}) all_steps.push_back(s);
         }
 
@@ -135,6 +138,81 @@ namespace phantom {
                                    static_cast<std::size_t>(cfg_.sparse_hw),
                                    /*eval_mod_levels=*/9,
                                    cfg_.user_scale);
+
+        // create_bootstrap_key partitions galois elts as bootstrap XOR user.
+        // Steps that overlap C2S/S2C (e.g. step 1 ↔ galois_elt 5 used by both
+        // a C2S layer AND user rms inner_sum) get classified as bootstrap-only
+        // and are MISSING from bk_.user_galois_keys. User-code rotations
+        // (e.g. phantom::rotate with bk_.user_galois_keys) then look up an
+        // empty key and produce garbage. Override the user bundle with a
+        // complete one covering conjugation + every configured user step.
+        std::vector<int> user_steps_actual;
+        if (!cfg_.user_rotation_steps.empty()) {
+            user_steps_actual = cfg_.user_rotation_steps;
+        } else if (cfg_.include_user_rotations) {
+            user_steps_actual = {1, -1, 2, -2};
+        }
+        if (!user_steps_actual.empty()) {
+            // Compute freshest_chain_index here (mirrors the math below) so we
+            // can size user keys to the user-scale segment depth instead of full-Q.
+            const std::size_t first_idx_local = ctx_->get_first_index();
+            const std::size_t num_c2s_local   = bk_.c2s.layers.size();
+            const std::size_t num_s2c_local   = bk_.s2c.layers.size();
+            constexpr std::size_t kEvalMod_local = 9;
+            const std::size_t fresh_local =
+                first_idx_local + num_c2s_local + kEvalMod_local + num_s2c_local;
+
+            // Per-step target chain indices: empty -> all at fresh_local
+            // (default). Non-empty -> must match user_rotation_steps length and
+            // is honoured verbatim (caller is responsible for picking valid
+            // chain indices). Note: this only applies when the override path
+            // is active (user_rotation_steps non-empty); the legacy
+            // include_user_rotations defaults always go to fresh_local.
+            const bool use_per_step_targets =
+                !cfg_.user_rotation_target_chain_indices.empty();
+            if (use_per_step_targets) {
+                if (cfg_.user_rotation_steps.empty()) {
+                    throw std::invalid_argument(
+                        "CKKSEngine: user_rotation_target_chain_indices set but "
+                        "user_rotation_steps is empty");
+                }
+                if (cfg_.user_rotation_target_chain_indices.size()
+                        != cfg_.user_rotation_steps.size()) {
+                    throw std::invalid_argument(
+                        "CKKSEngine: user_rotation_target_chain_indices size "
+                        "must match user_rotation_steps size");
+                }
+            }
+
+            std::vector<std::size_t> user_indices;
+            std::vector<std::size_t> user_target_levels;
+            auto find_idx = [&](std::uint32_t elt) -> std::size_t {
+                for (std::size_t i = 0; i < galois_elts.size(); ++i) {
+                    if (galois_elts[i] == elt) return i;
+                }
+                throw std::runtime_error(
+                    "CKKSEngine: configured galois elt not in registered set");
+            };
+            // Conjugation: bootstrap fires it at C2S-layer depth (chain < freshest);
+            // must be full-Q so it covers all relevant chain indices.
+            user_indices.push_back(
+                find_idx(static_cast<std::uint32_t>(2 * N - 1)));
+            user_target_levels.push_back(0);  // full-Q
+            // Each user rotation step: per-step target if provided, else fresh_local.
+            for (std::size_t i = 0; i < user_steps_actual.size(); ++i) {
+                const int step = user_steps_actual[i];
+                user_indices.push_back(find_idx(
+                    phantom::util::get_elt_from_step(step, N)));
+                if (use_per_step_targets) {
+                    user_target_levels.push_back(
+                        cfg_.user_rotation_target_chain_indices[i]);
+                } else {
+                    user_target_levels.push_back(fresh_local);
+                }
+            }
+            bk_.user_galois_keys =
+                sk_->create_galois_keys_per_level(*ctx_, user_indices, user_target_levels);
+        }
 
         // Chain-index mapping (num_scale_levels=14, num_special=6):
         //   first_idx = 1
