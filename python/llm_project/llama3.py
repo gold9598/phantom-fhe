@@ -1,7 +1,9 @@
 """
-LLaMA-3.1-8B layer-0 single decoder, REAL FHE bootstrap (no decrypt+re-encrypt
-for chain refresh) + Cachemir IRP plaintext-encoding swap, with per-step
-galois target chain indices to fit on a 32 GB GPU.
+LLaMA-3.1-8B layer-0 single decoder, Phase 1: homomorphic refresh in MLP block
+via boot_centered; layout shifts (relayout_periodic_to_irp / relayout_irp_to_periodic)
+still use decrypt+re-encrypt and are pending Phase 2-3 implementation.
+Cachemir IRP plaintext-encoding swap with per-step galois target chain indices
+to fit on a 32 GB GPU.
 
 The pre-IRP version of this file (BSGS Wq/Wo + complex BSGS Wgate/Wup/Wdown)
 peaked at ~30,580 MiB and OOMed during the first `engine.bootstrap_inplace`.
@@ -106,9 +108,9 @@ RMS2_Z_MIN, RMS2_Z_MAX = 1.4e-4, 2.1e-4
 #   SDPA C:      ~4 levels  (finalize_softmax, score_v ct*ct+rescale, mask+replicate)  → bootstrap between B and C
 #   Wo IRP:      1 level
 #   rms2:        ~5 levels  → bootstrap before rms2
-#   MLP gate/up: 1 level each IRP
-#   silu:        ~4 levels  (deg-8 poly)
-#   swiglu:      1 level    (ct*ct)
+#   MLP gate/up: 1 level each IRP → boot_centered refresh (fresh chain ~13 ul above msg)
+#   silu:        ~4 levels  (deg-8 poly)  ← fits within freshened budget
+#   swiglu:      1 level    (ct*ct)       → boot_centered refresh before Wdown
 #   Wdown IRP:   1 level
 # Total per sub-stage ≤ 10; NSL=14 (13 usable) gives comfortable headroom.
 NUM_SCALE_LEVELS = 14
@@ -350,17 +352,18 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
                                 sub_mask_pt=sub_mask_wide_pt)
     _rec("mlp_gate", t0)
 
-    # ---- Refresh gate_ct via decrypt+re-encrypt at SCALE. ----
-    g_dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, gate_ct)),
-                     dtype=np.float64)
-    gate_ct = _re_encrypt_slots(engine, ctx, encoder, sk, g_dec,
-                                  USER_LEVEL_SILU_REFRESH)
+    # gate_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
+    gate_ct = phantom.rescale_to_next(ctx, gate_ct)
+    gate_ct.set_scale(SCALE)
+    # ---- Refresh gate_ct via homomorphic bootstrap. ----
+    t0 = _t()
+    gate_ct = boot_centered(engine, ctx, encoder, sk, gate_ct)
+    _rec("bootstrap", t0)
 
     # ---- silu(gate). ----
     t0 = _t()
     silu_gate = silu(ctx, encoder, relin_key, gate_ct)
     _rec("mlp_silu", t0)
-
     # ---- up = Wup @ x. (Re-use x_irp; same chain.) ----
     t0 = _t()
     up_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_up_irp,
@@ -369,11 +372,13 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
                               sub_mask_pt=sub_mask_wide_pt)
     _rec("mlp_up", t0)
 
-    # ---- Refresh up_ct similarly. ----
-    u_dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, up_ct)),
-                     dtype=np.float64)
-    up_ct = _re_encrypt_slots(engine, ctx, encoder, sk, u_dec,
-                                USER_LEVEL_SILU_REFRESH)
+    # up_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
+    up_ct = phantom.rescale_to_next(ctx, up_ct)
+    up_ct.set_scale(SCALE)
+    # ---- Refresh up_ct via homomorphic bootstrap. ----
+    t0 = _t()
+    up_ct = boot_centered(engine, ctx, encoder, sk, up_ct)
+    _rec("bootstrap", t0)
 
     # ---- h = silu_gate * up. ----
     t0 = _t()
@@ -389,13 +394,14 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
     h_ct.set_scale(SCALE)
     _rec("mlp_swiglu", t0)
 
-    # ---- Refresh h to fresh IRP_MLP chain (preserve permuted layout). ----
+    # ---- Refresh h via homomorphic bootstrap (preserves permuted layout). ----
     t0 = _t()
-    h_dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, h_ct)),
-                     dtype=np.float64)
-    h_fresh = _re_encrypt_slots(engine, ctx, encoder, sk, h_dec,
-                                  USER_LEVEL_IRP_MLP)
-    _rec("layout_shift", t0)
+    h_fresh = boot_centered(engine, ctx, encoder, sk, h_ct)
+    # Mod-switch to IRP_MLP chain so plaintext chain indices align and GPU
+    # memory stays within budget (chain 16 has 30 primes; chain 26 has 5).
+    irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
+    h_fresh = phantom.mod_switch_to(ctx, h_fresh, irp_mlp_chain)
+    _rec("bootstrap", t0)
 
     # ---- out = Wdown @ h  (rect tall). ----
     t0 = _t()
