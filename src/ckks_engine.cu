@@ -73,32 +73,58 @@ namespace phantom {
             throw std::invalid_argument(
                 "CKKSEngine: num_special_primes must be >= 1");
         }
-        // Verify size_Q % size_P == 0 for the hybrid key-switch decomposition.
-        // size_Q = 1(msg) + num_scale_levels + 3(S2C) + 9(ER) + 3(C2S)
-        // (K=28 R=3 EvalMod consumes 9 levels: 6 sine + 3 DA.)
-        const int size_Q = 1 + cfg_.num_scale_levels + 3 + 9 + 3;
+        // size_Q definition depends on which chain layout we build.
+        //   - Default lapis-style: size_Q = 1(msg) + NSL + 3(S2C) + 9(ER) + 3(C2S)
+        //   - BootstrapTo17Levels: size_Q = NSL + 1(scale_down) + 12(boot) + 1(C2S)
+        //                                = NSL + 14   (no separate q_msg —
+        //                                  bits[0] of user-scale segment IS q_msg,
+        //                                  matching the_lib's convention)
+        const int size_Q = cfg_.use_bootstrap_to_17_levels
+            ? cfg_.num_scale_levels + 14
+            : 1 + cfg_.num_scale_levels + 3 + 9 + 3;
         if (size_Q % cfg_.num_special_primes != 0) {
             throw std::invalid_argument(
                 "CKKSEngine: size_Q must be divisible by num_special_primes "
                 "(required by the hybrid KSK decomposition).");
         }
 
-        // Identical to bootstrap_test's run_bootstrap_round_trip chain.
         EncryptionParameters parms(scheme_type::ckks);
         const std::size_t N = std::size_t(1) << cfg_.log_n;
         parms.set_poly_modulus_degree(N);
         parms.set_special_modulus_size(static_cast<std::size_t>(cfg_.num_special_primes));
 
         std::vector<int> bits;
-        bits.push_back(58);                               // msg (q_0, bottom)
-        for (int i = 0; i < cfg_.num_scale_levels; ++i) {
-            bits.push_back(40);                           // user-scale segment
-        }
-        for (int i = 0; i < 3; ++i) bits.push_back(58);   // S2C
-        for (int i = 0; i < 9; ++i) bits.push_back(58);   // ER / EvalMod (K=28 R=3: 6 sine + 3 DA)
-        for (int i = 0; i < 3; ++i) bits.push_back(29);   // C2S
-        for (int i = 0; i < cfg_.num_special_primes; ++i) {
-            bits.push_back(58);                           // special
+        if (cfg_.use_bootstrap_to_17_levels) {
+            // the_lib BootstrapTo17Levels chain (CKKS_42_54_29_40_60_BOOTSTRAP):
+            //   bits[0..NSL-1]    = 40 (user-scale segment, bits[0] = q_msg)
+            //   bits[NSL]         = 29 (single scale_down prime)
+            //   bits[NSL+1..NSL+12] = 54 (bootstrap segment: 9 ER + 3 S2C)
+            //   bits[NSL+13]      = 42 (single C2S prime)
+            //   bits[NSL+14..]    = 60 (special primes, NSP)
+            // S2C and ER both at 54-bit (the_lib's "bootstrap primes" pool).
+            // Drop order from chain 1: bits[NSL+13]=42 (C2S, dropped first),
+            // then 54×12 (S2C+ER), then 29 (scale_down), then 40×NSL.
+            for (int i = 0; i < cfg_.num_scale_levels; ++i) {
+                bits.push_back(40);                       // user-scale (msg = bits[0])
+            }
+            bits.push_back(29);                           // scale_down
+            for (int i = 0; i < 12; ++i) bits.push_back(54); // bootstrap (ER+S2C)
+            bits.push_back(42);                           // C2S (single layer)
+            for (int i = 0; i < cfg_.num_special_primes; ++i) {
+                bits.push_back(60);                       // special (large)
+            }
+        } else {
+            // Lapis-style chain (legacy path).
+            bits.push_back(58);                           // msg (q_0, bottom)
+            for (int i = 0; i < cfg_.num_scale_levels; ++i) {
+                bits.push_back(40);                       // user-scale segment
+            }
+            for (int i = 0; i < 3; ++i) bits.push_back(58);   // S2C
+            for (int i = 0; i < 9; ++i) bits.push_back(58);   // ER / EvalMod (K=28 R=3)
+            for (int i = 0; i < 3; ++i) bits.push_back(29);   // C2S
+            for (int i = 0; i < cfg_.num_special_primes; ++i) {
+                bits.push_back(58);                       // special
+            }
         }
         parms.set_coeff_modulus(arith::CoeffModulus::Create(N, bits));
 
@@ -134,10 +160,64 @@ namespace phantom {
         sk_  = std::make_unique<PhantomSecretKey>(*ctx_);
         enc_ = std::make_unique<PhantomCKKSEncoder>(*ctx_);
 
+        // Phase 2: when on the BootstrapTo17Levels chain, skip the legacy
+        // 3-stage bootstrap key build — its 3-layer C2S would consume into
+        // the bootstrap segment instead of the single 42-bit C2S prime.
+        // Phase 3+ wires up a single-stage bootstrap key matching the new
+        // chain. For now the engine on this chain supports encode / encrypt
+        // / decrypt only — bootstrap_inplace will throw.
+        if (cfg_.use_bootstrap_to_17_levels) {
+            // the_lib's BootstrapTo17Levels pipeline (verified against
+            // src/ckks/engine/bootstrap.cpp:1026-1095 and :204-215):
+            //   * coeff_to_slot_complex_for_17_levels = 3 OVER_SCALED butterflies
+            //     + 1 rescale_after_multiply  →  consumes 1 chain prime (the
+            //     42-bit C2S prime)
+            //   * round = K·ct − modulo(ct), where modulo = sine + 3 DA
+            //     (K=28 R=3 = 6 sine + 3 DA)  →  consumes 9 chain primes
+            //     (the 9 × 54-bit "ER" segment)
+            //   * slot_to_coeff (regular, rescale-first per stage,
+            //     stage_count=3)  →  consumes 3 chain primes (the 3 × 54-bit
+            //     "S2C" segment)
+            // Total bootstrap-pipeline primes = 1 + 9 + 3 = 13.
+            //
+            // The 29-bit "scale_down" prime in the chain is NOT consumed by
+            // the bootstrap pipeline — it is consumed by the user's FIRST
+            // post-bootstrap rescale (level 17 → 16 in the_lib's level
+            // numbering). Bootstrap output therefore lands at chain
+            //     freshest_chain_index_ = first_idx + 13
+            // which corresponds to user_level=0 with the 29-bit scale_down
+            // prime as the active back prime; the user's first rescale_inplace
+            // drops it and lands at user_level=1 with a 40-bit user-scale back.
+            //
+            // Sanity: with size_Q = NSL + 14 and bottom_chain = size_Q,
+            //   freshest + NSL == bottom
+            // becomes  (1 + 13) + NSL == NSL + 14  ✓
+            const std::size_t first_idx_new = ctx_->get_first_index();
+            freshest_chain_index_ = first_idx_new + 13;
+            bottom_chain_index_   = ctx_->total_parm_size() - 1;
+
+            // Sanity: freshest + NSL == bottom (still must hold).
+            if (freshest_chain_index_ + static_cast<std::size_t>(cfg_.num_scale_levels)
+                    != bottom_chain_index_) {
+                throw std::logic_error(
+                    "CKKSEngine: BootstrapTo17Levels chain mismatch: "
+                    "freshest + num_scale_levels != bottom. "
+                    "(scale_down + 13-prime bootstrap pipeline + NSL must equal "
+                    "size_Q.)");
+            }
+
+            // Build scale arrays (Phase 1 path) and return early.
+            if (cfg_.build_two_scale_arrays) {
+                build_scale_arrays();
+            }
+            return;
+        }
+
         bk_ = create_bootstrap_key(*ctx_, *enc_, *sk_,
                                    static_cast<std::size_t>(cfg_.sparse_hw),
                                    /*eval_mod_levels=*/9,
-                                   cfg_.user_scale);
+                                   cfg_.user_scale,
+                                   cfg_.split_scale_down);
 
         // create_bootstrap_key partitions galois elts as bootstrap XOR user.
         // Steps that overlap C2S/S2C (e.g. step 1 ↔ galois_elt 5 used by both
@@ -248,6 +328,53 @@ namespace phantom {
             throw std::logic_error(
                 "CKKSEngine: pre_boot_index mismatch");
         }
+
+        if (cfg_.build_two_scale_arrays) {
+            build_scale_arrays();
+        }
+    }
+
+    // ---- Phase 1: per-level CKKS scale arrays --------------------------
+    // Mirrors the_lib's `make_ckks_scales` (src/ckks/scale.cpp:1420).
+    //
+    // Recurrence (from the_lib lines 1429-1500 simplified for our chain):
+    //   ckks_scale[0]          = user_scale²       (squared at top)
+    //   ckks_rescaled_scale[L] = ckks_scale[L] / q_drop[L]   (rescale)
+    //   ckks_scale[L+1]        = ckks_rescaled_scale[L]²     (next squared)
+    //
+    // q_drop[L] is the back prime at chain_index L — the prime that gets
+    // dropped on rescale_to_next from L to L+1.
+    //
+    // For the legacy chain the values rapidly underflow because user_scale²
+    // (= 2^80) is too small to survive 28 rescales by 58/40/29-bit primes.
+    // For the BootstrapTo17Levels chain, where user_scale matches the
+    // chain's small-prime size, the rescaled scale stays near user_scale
+    // across the user-scale segment as expected.
+    void CKKSEngine::build_scale_arrays() {
+        const std::size_t total = ctx_->total_parm_size();
+        ckks_scale_.assign(total, 0.0L);
+        ckks_rescaled_scale_.assign(total, 0.0L);
+
+        const long double user_scale_ld =
+            static_cast<long double>(cfg_.user_scale);
+        long double cur_scale = user_scale_ld * user_scale_ld;
+
+        for (std::size_t idx = 0; idx < total; ++idx) {
+            ckks_scale_[idx] = cur_scale;
+
+            const auto &cd = ctx_->get_context_data(idx);
+            const auto &mods = cd.parms().coeff_modulus();
+            if (mods.empty()) {
+                ckks_rescaled_scale_[idx] = cur_scale;
+                break;
+            }
+            const long double q_drop =
+                static_cast<long double>(mods.back().value());
+
+            const long double rescaled = cur_scale / q_drop;
+            ckks_rescaled_scale_[idx] = rescaled;
+            cur_scale = rescaled * rescaled;
+        }
     }
 
     // ---- User-facing properties --------------------------------------------
@@ -348,8 +475,23 @@ namespace phantom {
         // max_user_level() = num_scale_levels - 1.
         // Internally mod-switches to pre_boot_index (bottom - 1), which
         // bootstrap() / scale_up_for_bootstrap() requires (two primes:
-        // q_scale_last + q_msg). Returns ct at freshest_chain_index_
-        // (user_level = 0).
+        // q_scale_last + q_msg).
+        // Returns ct at:
+        //   - freshest_chain_index_         (user_level = 0)  [non-split]
+        //   - freshest_chain_index_ + 1     (user_level = 1)  [split mode]
+        //
+        // Split-scale-down trades 1 user level for ~5 extra bits of
+        // bootstrap precision (the_lib's BootstrapTo14Levels compact-mode
+        // fix: separate scale_down_ratio division to a post-bootstrap step).
+        if (cfg_.use_bootstrap_to_17_levels) {
+            throw std::logic_error(
+                "CKKSEngine::bootstrap_inplace: use_bootstrap_to_17_levels chain "
+                "does not have a bootstrap algorithm yet. Phase 3+ of the "
+                "the_lib BootstrapTo17Levels port (single-stage C2S, encode-"
+                "then-rescale diagonals, rescale-first S2C, scale_down) wires "
+                "this up. For now the new chain supports encode/encrypt/"
+                "decrypt only.");
+        }
         const int lvl = user_level(ct);  // validates range
         (void)lvl;
 
@@ -361,12 +503,17 @@ namespace phantom {
         // Snap scale to remove FP drift from 40-bit rescales.
         ct.set_scale(cfg_.user_scale);
 
-        ct = phantom::bootstrap(*ctx_, *enc_, ct, bk_, cfg_.user_scale);
+        ct = phantom::bootstrap(*ctx_, *enc_, ct, bk_, cfg_.user_scale,
+                                cfg_.split_scale_down);
 
-        if (ct.chain_index() != freshest_chain_index_) {
+        const std::size_t expected_chain =
+            cfg_.split_scale_down ? freshest_chain_index_ + 1
+                                  : freshest_chain_index_;
+        if (ct.chain_index() != expected_chain) {
             throw std::logic_error(
                 "CKKSEngine::bootstrap_inplace: post-bootstrap chain_index "
-                "!= freshest_chain_index_");
+                "!= expected (freshest"
+                + std::string(cfg_.split_scale_down ? "+1" : "") + ")");
         }
         ct.set_scale(cfg_.user_scale);
     }

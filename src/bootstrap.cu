@@ -896,7 +896,8 @@ namespace phantom {
                          const PhantomSecretKey &dense_sk,
                          std::size_t sparse_hamming_weight,
                          std::size_t eval_mod_levels,
-                         double user_scale) {
+                         double user_scale,
+                         bool split_scale_down) {
         BootstrapKey bk;
 
         // 1. Encapsulation key pair (ModRaise).
@@ -956,14 +957,24 @@ namespace phantom {
         // C2S's last_layer_norm = num_slots, the round-trip
         // S2C(C2S(z)) ≈ z (DFT ∘ IDFT = identity).
         //
-        // When `user_scale > 0` (Phase 4 full bootstrap with heterogeneous
-        // chain): encode the LAST S2C layer at user_scale instead of the
-        // chain prime. This bakes the q_msg → user_scale scale-down into
-        // the S2C transform, so post-S2C ct.scale ≈ user_scale.
+        // When `user_scale > 0` and `split_scale_down == false` (Phase 4
+        // full bootstrap with the baked-scale-down path): encode the LAST
+        // S2C layer at user_scale instead of the chain prime. This bakes
+        // the q_msg → user_scale scale-down into the S2C transform, so
+        // post-S2C ct.scale ≈ user_scale.
+        //
+        // When `split_scale_down == true`: encode every S2C layer (including
+        // the last) at the chain prime, so ct.scale is preserved across the
+        // S2C and matches saved's q_msg-aligned scale before subtraction.
+        // bootstrap() then performs a single multiply+rescale on the small
+        // saved-out residual to land at user_scale (1 extra user level,
+        // higher precision).
+        const double s2c_last_layer_user_scale =
+            split_scale_down ? 0.0 : user_scale;
         bk.s2c = pre_encode_diagonals(ctx, encoder, s2c_host,
                                       /*last_layer_norm=*/1.0,
                                       /*start_chain_index=*/s2c_start,
-                                      /*last_layer_user_scale=*/user_scale);
+                                      /*last_layer_user_scale=*/s2c_last_layer_user_scale);
 
         // 6. Level-aware Galois KSK partition.
         //
@@ -1081,11 +1092,23 @@ namespace phantom {
     // For our DIF butterfly with stages={5,5,5} and n1=16, observed k's span
     // [0,16) and g's typically lie in {-2,-1,0,1}. The total rotation count
     // per layer is (#nonzero k) + (#nonzero g) instead of (#diagonals).
+    // `single_stage`: when true, skip per-layer rescale_to_next_inplace and
+    // perform ONE rescale_to_next_inplace after the full loop. Mirrors the_lib's
+    // `coeff_to_slot_complex_for_17_levels` (src/ckks/engine/bootstrap.cpp:714)
+    // — all 3 stages of butterflies multiply WITHOUT rescale (OVER_SCALED
+    // accumulation), then a single `rescale_after_multiply` consumes the
+    // single C2S prime (42-bit in the_lib's CKKS_42_54_29_40_60_BOOTSTRAP).
+    //
+    // For single_stage to be correct, all `params.layers[i].diagonals` must
+    // be encoded at the SAME `target_chain_index` (since ct's chain doesn't
+    // advance per layer). The caller (pre_encode_diagonals with
+    // single_stage=true, see below) is responsible for that.
     static void apply_linear_transform_inplace(const PhantomContext &ctx,
                                                PhantomCiphertext &ct,
                                                const LinearTransformParams &params,
                                                const std::vector<std::map<int, PhantomRelinKey>> &per_layer_galois,
-                                               const char *who) {
+                                               const char *who,
+                                               bool single_stage = false) {
         const int num_layers = static_cast<int>(params.layers.size());
         if (static_cast<int>(per_layer_galois.size()) != num_layers) {
             throw std::logic_error(
@@ -1214,6 +1237,19 @@ namespace phantom {
                 throw std::logic_error(std::string(who) + ": empty layer accumulator");
             }
             ct = std::move(layer_out);
+            // Multi-stage path: rescale per layer (each layer drops one prime).
+            // Single-stage path: skip per-layer rescale; one final rescale
+            // happens after the loop body below.
+            if (!single_stage) {
+                rescale_to_next_inplace(ctx, ct);
+            }
+        }
+
+        // Single-stage final rescale: drops ONE prime after all layers'
+        // OVER_SCALED multiplications have accumulated. Mirrors the_lib's
+        // `rescale_after_multiply(current)` at bootstrap.cpp:733 inside
+        // coeff_to_slot_complex_for_17_levels.
+        if (single_stage) {
             rescale_to_next_inplace(ctx, ct);
         }
     }
@@ -1221,13 +1257,27 @@ namespace phantom {
     void apply_c2s_inplace(const PhantomContext &ctx,
                            PhantomCiphertext &ct,
                            const BootstrapKey &bk) {
-        apply_linear_transform_inplace(ctx, ct, bk.c2s, bk.c2s_galois_keys, "apply_c2s_inplace");
+        apply_linear_transform_inplace(ctx, ct, bk.c2s, bk.c2s_galois_keys,
+                                       "apply_c2s_inplace");
+    }
+
+    void apply_c2s_inplace_single_stage(const PhantomContext &ctx,
+                                        PhantomCiphertext &ct,
+                                        const BootstrapKey &bk) {
+        // BootstrapTo17Levels variant: 3 OVER_SCALED butterflies + 1 final
+        // rescale. Used when the BootstrapKey was built via
+        // `pre_encode_diagonals(... single_stage=true)` so all layer
+        // plaintexts live at the same chain_index.
+        apply_linear_transform_inplace(ctx, ct, bk.c2s, bk.c2s_galois_keys,
+                                       "apply_c2s_inplace_single_stage",
+                                       /*single_stage=*/true);
     }
 
     void apply_s2c_inplace(const PhantomContext &ctx,
                            PhantomCiphertext &ct,
                            const BootstrapKey &bk) {
-        apply_linear_transform_inplace(ctx, ct, bk.s2c, bk.s2c_galois_keys, "apply_s2c_inplace");
+        apply_linear_transform_inplace(ctx, ct, bk.s2c, bk.s2c_galois_keys,
+                                       "apply_s2c_inplace");
     }
 
     // ========================================================================
@@ -1556,7 +1606,8 @@ namespace phantom {
               PhantomCKKSEncoder &encoder,
               const PhantomCiphertext &ct,
               const BootstrapKey &bk,
-              double user_scale) {
+              double user_scale,
+              bool split_scale_down) {
         PhantomCiphertext out = ct;
 
         // 1. Pre-bootstrap scale-up: ct.scale = user_scale → q_msg.
@@ -1688,7 +1739,8 @@ namespace phantom {
                 ctx.get_context_data(bottom_index).parms().coeff_modulus()[0].value();
 
             // Read the chain primes that define out.scale() exactly:
-            //   out.scale() = first_back · user_scale / last_back
+            //   non-split: out.scale() = first_back · user_scale / last_back
+            //   split:     out.scale() = first_back   (S2C preserved scale)
             const size_t num_s2c_layers = bk.s2c.layers.size();
             const size_t s2c_last_chain = s2c_in_chain + num_s2c_layers - 1;
             const uint64_t first_back =
@@ -1703,28 +1755,35 @@ namespace phantom {
                     "bootstrap: user_scale must be representable as u64");
             }
 
-            // D_exact = (first_back · user_scale · q_back_saved) / (last_back · q_msg)
-            // computed in two u128 steps to avoid 2^174 overflow:
-            //   step1 = round(first_back · user_scale / q_msg)         (~2^40, fits in u64)
-            //   D     = round(step1 · q_back_saved / last_back)        (~2^40, fits in u64)
-            // Each intermediate u128 product is ≤ 2^98, well within u128 range.
-            const __uint128_t step1_num =
-                (__uint128_t)first_back * (__uint128_t)user_scale_u64;
-            const __uint128_t step1_den = (__uint128_t)q_msg;
-            const __uint128_t step1 = (step1_num + step1_den / 2) / step1_den;
-            const __uint128_t D_int128 =
-                (step1 * (__uint128_t)q_back_saved + (__uint128_t)last_back / 2) /
-                (__uint128_t)last_back;
-            // D ≈ user_scale (~2^40); fits comfortably in u64 and double.
+            // D_exact_align = (q_back_saved · target_scale) / q_msg,
+            // computed in u128 (intermediate ≤ 2^126, fits).
+            // - non-split target_scale = first_back · user_scale / last_back
+            // - split     target_scale = first_back
+            __uint128_t D_int128;
+            if (split_scale_down) {
+                // Split path: align saved.scale → first_back (= out.scale).
+                // D = round(first_back · q_back_saved / q_msg)   (~2^58, fits in u64).
+                D_int128 = ((__uint128_t)first_back * (__uint128_t)q_back_saved
+                            + (__uint128_t)q_msg / 2) /
+                           (__uint128_t)q_msg;
+            } else {
+                // Non-split: align saved.scale → user_scale (post-baked out).
+                // D = (first_back · user_scale · q_back_saved) / (last_back · q_msg).
+                // Two u128 steps to avoid 2^174 overflow:
+                //   step1 = round(first_back · user_scale / q_msg)
+                //   D     = round(step1 · q_back_saved / last_back)
+                const __uint128_t step1_num =
+                    (__uint128_t)first_back * (__uint128_t)user_scale_u64;
+                const __uint128_t step1_den = (__uint128_t)q_msg;
+                const __uint128_t step1 = (step1_num + step1_den / 2) / step1_den;
+                D_int128 =
+                    (step1 * (__uint128_t)q_back_saved + (__uint128_t)last_back / 2) /
+                    (__uint128_t)last_back;
+            }
             const uint64_t D_exact = static_cast<uint64_t>(D_int128);
 
             // Per-tower integer multiply by D_exact (mod each tower's prime),
-            // followed by rescale_to_next. This is the lapis "level_down_
-            // scale_preserving_amplified" path: it avoids the FP-rounded
-            // encode(1.0 at D_exact) + multiply_plain that the previous
-            // implementation used. Encoding the constant 1.0 routes through
-            // the encoder's NTT/FP arithmetic and adds ~|K·I|/2^40 ≈ 1e-5
-            // noise per slot; per-tower integer multiply is bit-exact.
+            // followed by rescale_to_next. Bit-exact (no encoder FP).
             const auto &saved_cd = ctx.get_context_data(saved.chain_index());
             const size_t saved_num_towers =
                 saved_cd.parms().coeff_modulus().size();
@@ -1746,6 +1805,47 @@ namespace phantom {
         saved.set_scale(out.scale());
 
         sub_inplace(ctx, saved, out);
+
+        // Post-bootstrap scale-down (split path only). At this point `saved`
+        // holds the small residual `m` at scale ≈ first_back (s2c_in chain
+        // prime, ~2^58). Bring it down to user_scale via one integer
+        // multiply + rescale on the *small* residual rather than the large
+        // (m + K·I) — this is what recovers the ~5 bits the_lib's
+        // BootstrapTo14Levels compact mode regains by separating the
+        // scale_down_ratio division out of the bootstrap pipeline.
+        //
+        // After multiply by D2 + rescale (drops q_drop_post at qi_chain):
+        //   new_scale = saved.scale() · D2 / q_drop_post
+        //             = user_scale  (when D2 = q_drop_post · user_scale / saved.scale).
+        if (split_scale_down) {
+            const uint64_t saved_scale_u64 = static_cast<uint64_t>(saved.scale());
+            const auto &qi_cd = ctx.get_context_data(qi_chain);
+            const uint64_t q_drop_post =
+                qi_cd.parms().coeff_modulus().back().value();
+
+            const uint64_t user_scale_u64 = static_cast<uint64_t>(user_scale);
+            if (static_cast<double>(user_scale_u64) != user_scale) {
+                throw std::invalid_argument(
+                    "bootstrap: user_scale must be representable as u64");
+            }
+
+            // D2 = round(q_drop_post · user_scale / saved.scale)  (~user_scale).
+            const __uint128_t D2_int128 =
+                ((__uint128_t)q_drop_post * (__uint128_t)user_scale_u64
+                 + (__uint128_t)saved_scale_u64 / 2) /
+                (__uint128_t)saved_scale_u64;
+            const uint64_t D2 = static_cast<uint64_t>(D2_int128);
+
+            const auto &saved_cd = ctx.get_context_data(saved.chain_index());
+            const size_t saved_num_towers =
+                saved_cd.parms().coeff_modulus().size();
+            std::vector<uint64_t> tower_scalars(saved_num_towers, D2);
+            multiply_uint_scalars_per_tower(ctx, saved, tower_scalars);
+            saved.set_scale(saved.scale() * static_cast<double>(D2));
+            rescale_to_next_inplace(ctx, saved);
+            // Snap to exact user_scale (drift ≪ 1 ulp at scale ~2^40).
+            saved.set_scale(user_scale);
+        }
 
         return saved;
     }

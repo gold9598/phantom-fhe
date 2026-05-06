@@ -185,13 +185,23 @@ namespace phantom {
     // from q_msg back to user_scale into the linear transform — after the
     // last S2C multiply+rescale, ct.scale ≈ user_scale. Pass 0 to encode
     // every S2C layer at its chain prime (Phase 2/3 uniform-58-bit usage).
+    //
+    // `split_scale_down`: when true, encode all S2C layers at their chain
+    // primes (no user_scale baking, regardless of the `user_scale` arg) so
+    // that bootstrap()'s post-S2C scale matches saved's q_msg-aligned scale.
+    // The q_msg → user_scale step is then applied as a single integer
+    // multiply + rescale AFTER the saved-out subtraction, on the small
+    // residual `m` (rather than the large mod-raised `m + K·I`). Costs 1
+    // extra user level but recovers ~5 bits of bootstrap precision (the
+    // scale-down rounding no longer compounds with K·I noise).
     [[nodiscard]] BootstrapKey
     create_bootstrap_key(const PhantomContext &ctx,
                          PhantomCKKSEncoder &encoder,
                          const PhantomSecretKey &dense_sk,
                          std::size_t sparse_hamming_weight = 128,
                          std::size_t eval_mod_levels = 0,
-                         double user_scale = 0.0);
+                         double user_scale = 0.0,
+                         bool split_scale_down = false);
 
     // Apply the pre-encoded C2S linear transform in place.
     //
@@ -202,6 +212,19 @@ namespace phantom {
     void apply_c2s_inplace(const PhantomContext &ctx,
                            PhantomCiphertext &ct,
                            const BootstrapKey &bk);
+
+    // Single-stage C2S variant matching the_lib's `coeff_to_slot_complex_for_
+    // 17_levels` (src/ckks/engine/bootstrap.cpp:714): applies all layer
+    // butterflies WITHOUT per-layer rescale (OVER_SCALED accumulation), then
+    // a single `rescale_after_multiply` consumes one chain prime — the 42-bit
+    // C2S prime in the BootstrapTo17Levels chain.
+    //
+    // The bootstrap key's C2S diagonals must be pre-encoded with all layers
+    // sharing the same `target_chain_index` (see Phase-3 build path in
+    // create_bootstrap_key when use_bootstrap_to_17_levels is set).
+    void apply_c2s_inplace_single_stage(const PhantomContext &ctx,
+                                        PhantomCiphertext &ct,
+                                        const BootstrapKey &bk);
 
     // Apply the pre-encoded S2C linear transform in place.
     //
@@ -242,11 +265,18 @@ namespace phantom {
     // prime q_msg), holding a message originally encoded at `user_scale`
     // (e.g. 2^40). On return, the bootstrapped ciphertext encodes the same
     // plaintext at the same `user_scale`, fresh in the chain.
+    //
+    // `split_scale_down` MUST match the value passed to create_bootstrap_key
+    // (the S2C diagonals are pre-encoded for one path or the other). When
+    // true, the post-S2C ct lives at the s2c_in chain prime; an extra
+    // multiply+rescale brings it down to user_scale at one chain index
+    // deeper than the no-split path.
     [[nodiscard]] PhantomCiphertext
     bootstrap(const PhantomContext &ctx,
               PhantomCKKSEncoder &encoder,
               const PhantomCiphertext &ct,
               const BootstrapKey &bk,
-              double user_scale);
+              double user_scale,
+              bool split_scale_down = false);
 
 } // namespace phantom

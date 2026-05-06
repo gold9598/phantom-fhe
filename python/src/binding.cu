@@ -251,14 +251,16 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("dense_sk"),
           py::arg("sparse_hamming_weight") = 128,
           py::arg("eval_mod_levels") = 0,
-          py::arg("user_scale") = 0.0);
+          py::arg("user_scale") = 0.0,
+          py::arg("split_scale_down") = false);
 
     m.def("bootstrap", &phantom::bootstrap,
           py::arg("context"),
           py::arg("encoder"),
           py::arg("ct"),
           py::arg("bk"),
-          py::arg("user_scale"));
+          py::arg("user_scale"),
+          py::arg("split_scale_down") = false);
 
     // ===== CKKSEngine: user-facing facade with bootstrap =====
     py::class_<phantom::CKKSEngineConfig>(m, "ckks_engine_config")
@@ -271,7 +273,13 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def_readwrite("include_user_rotations", &phantom::CKKSEngineConfig::include_user_rotations)
             .def_readwrite("user_rotation_steps", &phantom::CKKSEngineConfig::user_rotation_steps)
             .def_readwrite("user_rotation_target_chain_indices",
-                           &phantom::CKKSEngineConfig::user_rotation_target_chain_indices);
+                           &phantom::CKKSEngineConfig::user_rotation_target_chain_indices)
+            .def_readwrite("split_scale_down",
+                           &phantom::CKKSEngineConfig::split_scale_down)
+            .def_readwrite("build_two_scale_arrays",
+                           &phantom::CKKSEngineConfig::build_two_scale_arrays)
+            .def_readwrite("use_bootstrap_to_17_levels",
+                           &phantom::CKKSEngineConfig::use_bootstrap_to_17_levels);
 
     py::class_<phantom::CKKSEngine>(m, "ckks_engine")
             .def(py::init<const phantom::CKKSEngineConfig &>(), py::arg("config"))
@@ -287,7 +295,17 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("encoder", &phantom::CKKSEngine::mutable_encoder, py::return_value_policy::reference_internal)
             .def("secret_key", &phantom::CKKSEngine::mutable_secret_key, py::return_value_policy::reference_internal)
             .def("relin_key", &phantom::CKKSEngine::relin_key, py::return_value_policy::reference_internal)
-            .def("galois_key", &phantom::CKKSEngine::galois_key, py::return_value_policy::reference_internal);
+            .def("galois_key", &phantom::CKKSEngine::galois_key, py::return_value_policy::reference_internal)
+            .def("scale_array_size", &phantom::CKKSEngine::scale_array_size)
+            // long double → double (precision-lossy but adequate for inspection).
+            .def("ckks_scale_at",
+                 [](const phantom::CKKSEngine &e, std::size_t idx) {
+                     return static_cast<double>(e.ckks_scale_at(idx));
+                 })
+            .def("ckks_rescaled_scale_at",
+                 [](const phantom::CKKSEngine &e, std::size_t idx) {
+                     return static_cast<double>(e.ckks_rescaled_scale_at(idx));
+                 });
 
     // ===== Single-chain (host-pinned, level-agnostic) plaintext =====
     py::class_<phantom::SingleChainPlaintext>(m, "single_chain_plaintext")
