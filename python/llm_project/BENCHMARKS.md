@@ -8,7 +8,7 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 
 | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
 |---|---|---|---|---|
-| **1922** | 5.7e-4 | 1.8e-4 | 22.2 GiB | 2.8 GiB |
+| **1918** | 5.8e-4 | 1.8e-4 | 21.3 GiB | 2.8 GiB |
 
 Wall time has ±15% run-to-run variance from GPU thermal/scheduling state
 — consistent within a single warm session.
@@ -77,10 +77,23 @@ deduplication passes are layered:
    one KSK at the shallower (C2S) chain via a `PerLayerKSKSlot`'s
    `fallback` pointer.
 
+3. **Per-step chain target tightening.** A per-call `apply_galois_inplace`
+   audit revealed that 15 user steps (rmsnorm `sum_reduce_stride` + the
+   QK^T Q-preprocess negative steps) were declared one chain shallower
+   than they actually fire — `rms_x²` consumes a level before the inner
+   sum, and the Q-preprocess fires post-Wq-IRP rescale. Moved
+   `TARGET_RMS` from chain 16 to 17. The conjugation key (galois elt
+   `2N-1`) was at full-Q (chain 0) but actually fires only at chain
+   `first_idx + num_c2s = 4` (post-C2S, pre-EvalMod) — shifted to that
+   chain.
+
 Combined effect: total GPU memory drops from ~30.1 GiB (no dedup) to
-~22.2 GiB (-7.4 GiB / -24.6%) with no measurable wall-time impact and
+~21.3 GiB (-8.1 GiB / -27.6%) with no measurable wall-time impact and
 ~10% accuracy variance (bootstrap noise floor amplified by larger
 fallback KSKs at deep-chain uses, but well within tolerance).
+
+Step distribution after tightening: 19@chain 17, 7@chain 23, 43@chain 26
+(was: 12@16 + 4@17 + 9@21 + 2@23 + 42@26).
 
 Remaining diet target:
 

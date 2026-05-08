@@ -510,7 +510,10 @@ def main():
     #   mask+rescale); these steps overlap with Wq IRP preprocess → target=26.
 
     FRESHEST_CHAIN = 16    # invariant to NSL for our bootstrap pipeline
-    TARGET_RMS          = FRESHEST_CHAIN        # 16: rms (positive sum_reduce strides)
+    # rms inner-sum fires at chain 17 (after x^2 consumes one level), not at
+    # the freshest chain — confirmed by per-call rotation audit. Same for
+    # qkt_q_preprocess (post-Wq IRP rescale).
+    TARGET_RMS          = FRESHEST_CHAIN + 1    # 17: rms (positive sum_reduce strides)
     TARGET_FINALIZE     = FRESHEST_CHAIN + 1    # 17: finalize_softmax cyclic + sum_reduce
     TARGET_SCORE_V      = FRESHEST_CHAIN + 7    # 23: score_v broadcast (6 Goldschmidt + 1 mask)
     TARGET_IRP          = FRESHEST_CHAIN + USER_LEVEL_IRP_ATTN  # 26: all IRP ops (ul=10)

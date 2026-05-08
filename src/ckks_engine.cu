@@ -330,11 +330,14 @@ namespace phantom {
                 try_register(layer_map);
             }
 
-            // Conjugation: bootstrap fires it at C2S-layer depth (chain < freshest);
-            // must be full-Q so it covers all relevant chain indices.
+            // Conjugation: bootstrap fires it post-C2S, pre-EvalMod (chain
+            // first_idx + num_c2s = 4 in the standard pipeline). Per-call
+            // rotation audit confirms ALL conjugation invocations land at
+            // that one chain, so generate the KSK at exactly that depth
+            // instead of full-Q. Saves ~50-100 MiB without changing semantics.
             user_indices.push_back(
                 find_idx(static_cast<std::uint32_t>(2 * N - 1)));
-            user_target_levels.push_back(0);  // full-Q
+            user_target_levels.push_back(first_idx_local + num_c2s_local);
 
             // For each user rotation step: SKIP key generation if a bootstrap
             // KSK is available (record for fallback registration); else
