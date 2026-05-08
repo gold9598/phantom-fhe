@@ -43,7 +43,35 @@ Captured at 0.5 s sampling intervals across one full run on RTX 5090
 **Steady-state GPU residents (29.4 GiB):**
 
 - **CUDA runtime + libcuPhantom**: ~556 MiB (one-time library load, before any phantom call)
-- **Engine workspace + Galois + bootstrap keys**: ~28.1 GiB (allocated in `engine ctor`, dominated by the bootstrap evaluation key and 69 user-rotation Galois keys at chain indices 16–26)
+- **Engine workspace + Galois + bootstrap keys**: ~28.1 GiB (allocated in `engine ctor`)
+
+### Key-size breakdown
+
+Differential measurement via `probe_key_sizes.py` (constructs three engine
+variants — no-bootstrap+no-rotations, +bootstrap, +bootstrap+rotations —
+and reports GPU deltas):
+
+| Component | MiB | % of GPU | Notes |
+|---|---|---|---|
+| CUDA + libcuPhantom (post-import) | ~556 | 1.9% | one-time library load |
+| Engine workspace + relin key | ~226 | 0.8% | NTT precomp, RNS tables, relin keyswitch key (~250 MiB) |
+| **Bootstrap key** | **~15,936** | **54.2%** | C2S + EvalMod + S2C diagonals + bootstrap-internal Galois keys |
+| **69 user-rotation Galois keys** | **~13,408** | **45.6%** | distributed 12@chain16 + 4@17 + 9@21 + 2@23 + 42@26 |
+| ~Sum | ~30,126 | — | probe; production run ~29,358 (allocator variance ~770 MiB) |
+
+The bootstrap key (54%) and user-rotation Galois keys (46%) dominate.
+Diet targets, in priority order:
+
+1. **Bootstrap key** — depends on chain-prime sizes. The BootstrapTo17Levels
+   port (see `BOOTSTRAP_TO17_TODO.md`) replaces the standard
+   `[58 | 40×NSL | 58×3 | 58×9 | 29×3 | 58×NSP]` chain with
+   `[40×NSL | 29×1 | 54×12 | 42×1 | 60×NSP]`, using smaller primes for
+   the bootstrap segment. Expected ~25–30% reduction.
+2. **User-rotation Galois keys** — already heavily optimised: 42 of 69 sit
+   at chain 26 (smallest, ~38 MiB each via `target_chain_indices`). The
+   12 rms-stride-T_MODEL steps at chain 16 (~110 MiB each, ~1.3 GiB total)
+   are the main outlier — required at fresh chain because rms runs
+   immediately after bootstrap.
 
 **Host RAM:** ~2.8 GiB per layer for IRP-encoded weights (Wq, Wo, Wgate,
 Wup, Wdown) staged as `SingleChainPlaintext` on pinned host memory and
