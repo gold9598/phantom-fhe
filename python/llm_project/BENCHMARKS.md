@@ -151,12 +151,60 @@ the current config):
 
 **Status: infrastructure is committed and correct for same-chain pairs;
 ~zero MiB savings in this config.** Realizing the ~1.2 GiB potential
-needs:
+needs a fix to the cross-chain σ-derive path.
 
-1. A fix to the cross-chain σ-derive path (the source KSK has more
-   primes than the target use; the kernel/permutation needs to align).
-2. Or restructuring user_rotation_steps so eligible pairs don't cross
-   the bootstrap-fallback boundary.
+### Cross-chain bug — diagnosis (next-session starting point)
+
+When `apply_galois_inplace` lazily derives K(-a) from a bootstrap
+fallback K(+a) at a much shallower chain (e.g. C2S[2] @ chain 3 used
+for a user rotation at chain 23), the result corrupts to garbage
+(max\|err\| → 1e+02). Same-chain σ-derive works perfectly (Phase-A
+test).
+
+The likely cause is **KSK polynomial layout vs consumer-chain
+expected layout mismatch**: a chain-3 KSK polynomial has 34 prime
+slots `[chain_3, chain_4, …, chain_30, special_1..6]` laid out
+contiguously in GPU memory. When the keyswitch kernel runs at
+chain 23 (ct's modulus), it expects to consume KSK bytes
+corresponding to `[chain_23, …, chain_30, special_1..6]` — that
+needs an offset of `(23-3)*N` uint64 into the chain-3 KSK
+polynomial. The fallback path for a non-σ-applied bootstrap
+canonical works (existing dedup), so phantom's keyswitch handles
+the offset correctly via context lookup. But after σ-derive, the
+permuted KSK bytes are still at the chain-3 layout, and the
+permutation/offset combination silently produces wrong primes.
+
+**Recommended next-session approach: "truncate-then-σ" (path 1).**
+Before applying σ to the cloned KSK, mod-drop its polynomials to
+the consumer's chain. Steps:
+
+1. Add a `PhantomRelinKey::drop_primes_to_inplace(target_chain)`
+   helper that, for each partition's PhantomCiphertext, drops
+   primes `[source_chain..target_chain-1]` from c0 and c1 — i.e.
+   shifts the polynomial bytes down so byte-offset 0 corresponds
+   to the consumer's first-active-prime. (Different from
+   `mod_drop_to_inplace`, which drops dnum partitions but keeps
+   primes.)
+2. In `apply_galois_inplace`'s lazy derive: clone → drop primes
+   to ct's chain → apply σ → keyswitch.
+3. Verify with the same Phase-A pattern: overwrite an existing
+   K(-a) at chain 23 with `drop+σ` from a chain-3 K(+a) and
+   confirm rotations match.
+
+If the truncate-then-σ approach works, every user-side negative
+becomes eligible for skip (since they all have positive twins
+that are bootstrap fallbacks). Total realizable savings: ~635 MiB
+user-side (10 negatives × ~50–95 MiB at chains 17/23). Bootstrap-
+internal canonical negatives (~1 GiB at C2S layers 1–3) would
+require similar treatment in `register_canonical`.
+
+**Files where the truncate helper would live:**
+- `include/secretkey.h`: add `drop_primes_to_inplace` declaration.
+- `src/secretkey.cu`: implement, mirroring `mod_drop_to_inplace`'s
+  structure but operating on polynomial primes instead of dnum
+  partitions.
+- `src/evaluate.cu`: insert `drop_primes_to_inplace` call before
+  `apply_galois_to_polynomials_inplace` in the lazy-derive path.
 
 **Code currently committed**:
 - `include/secretkey.h` — extend `PhantomGaloisKey` slot to support
