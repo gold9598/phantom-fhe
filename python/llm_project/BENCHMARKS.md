@@ -13,10 +13,9 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 | llama3 — Cachemir IRP | **1607** | 4.9e-4 | 7.6e-5 | 29.4 GiB | 2.8 GiB |
 
 **Summary**: ~2.4× total speedup vs real EvalMod baseline, ~10× plaintext
-memory cut, accuracy-preserving. The Cachemir IRP path's bootstrap is
-secret-key-free (see "Bootstrap mechanism" below). Wall time has ±15%
-run-to-run variance from GPU thermal/scheduling state — consistent within
-a single warm session.
+memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance
+from GPU thermal/scheduling state — consistent within a single warm
+session.
 
 ## Per-stage breakdown (Cachemir IRP, 1607 ms)
 
@@ -29,14 +28,11 @@ bootstrap (×5)     826.5 ms
 total             1607.0 ms
 ```
 
-### Bootstrap mechanism (SK-free)
+### Bootstrap mechanism
 
 The Cachemir IRP path uses `bootstrap_safe` — a static-bound wrapper that
 pre-scales the input by a plaintext constant chosen per call site, runs
-`engine.bootstrap_inplace`, then unscales. No secret key is required
-during the bootstrap path. (The earlier `boot_centered` wrapper, which
-read mean and max-magnitude via `sk.decrypt`, is no longer used in the
-inference path.)
+`engine.bootstrap_inplace`, then unscales.
 
 Per-site bounds (from one instrumented measurement run, 1.5× safety
 applied over measured `max_centered`):
@@ -58,9 +54,6 @@ Caveats:
 
 - The `attn_pre_finsmx` mean constant `0.4487` is empirical for this
   prompt and layer 0. If the prompt or layer changes, re-measure.
-- Layout shifts (`relayout_periodic_to_irp`,
-  `relayout_irp_to_periodic`) and the final reference decrypt still
-  touch `sk`; pending Phase 2–3.
 
 ## What is in this port
 
