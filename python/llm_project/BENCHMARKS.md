@@ -87,44 +87,12 @@ changing the BSGS factorization in the IRP module).
 
 ## Investigated and rejected: negative-step KSK auto-derive
 
-The proposal: for a rotation step `+a` and its negation `-a`, store only
-one keyswitching key and **derive the other on the fly** by applying a
-Galois automorphism to its polynomials, eliminating ~10 user-side and
-~4 bootstrap-canonical negative KSKs (~1.2 GiB potential).
-
-**The math doesn't work out.** The defining property of `K(e)`:
-```
-k₀ + k₁ · sk ≡ σ_e(sk) · P    (mod q·P)
-```
-applies to specific polynomials k₀, k₁ holding sk as their "incoming"
-secret. Applying σ_b to both polynomials yields:
-```
-σ_b(k₀) + σ_b(k₁) · σ_b(sk) ≡ σ_{b·e}(sk) · P
-                ↑ note: σ_b(sk), NOT sk
-```
-This is a keyswitch key from `σ_{b·e}(sk) → σ_b(sk)`, not `σ_c(sk) → sk`
-for any c ≠ e. The "incoming" key has been σ-permuted away from sk, so
-the result is *not* a usable replacement for `K(c)` in a standard
-rotate-then-keyswitch flow. The only b that yields a key under sk is
-b = identity, in which case the trick is trivial (σ_1(K(e)) = K(e)).
-
-**Why earlier "validation" was misleading**: the strict same-chain skip
-condition (require both `+a` and `-a` to be user-owned, neither a
-bootstrap fallback) NEVER FIRED in this LLaMA-3 config — every user
-positive whose negation is also user-owned is itself a bootstrap
-fallback (e.g. `+1, +2, +4, +8, …, +16384` are all in C2S/S2C), so the
-overwrite path was a no-op. The relaxed condition fired and produced
-garbage (max\|err\| ≈ 1e+02), which was the math being wrong, not a
-chain-alignment issue as initially diagnosed.
-
-**Conclusion**: this optimization is not feasible via simple σ-on-key.
-Any savings on negative KSKs would require a different mechanism
-(e.g. eager derive at construction with per-step targeted regeneration,
-or a structurally different KSK layout — neither yields a memory win
-without other costs). Reverted infrastructure: commits `5589b02`
-(`CKKS keys: K(-a) = σ_{-a}(K(+a)) auto-derive infrastructure`) and
-`88c8258` (the misdiagnosed "cross-chain" follow-up). The reverts are
-`c15e65e` and `4b32ad5`.
+Idea: derive `K(-a)` from `K(+a)` via Galois automorphism on the key
+polynomials, eliminating ~10 user-side + ~4 bootstrap negative KSKs
+(~1.2 GiB potential). **Math doesn't work**: applying σ_b to K(e)'s
+polynomials gives a key with `σ_b(sk)` (not sk) as the incoming
+secret, so the result can never be `K(c)` for c ≠ e. Reverts:
+`c15e65e`, `4b32ad5`.
 
 ### KSK deduplication (canonical-owner principle)
 
