@@ -9,29 +9,16 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 | Headline | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
 |---|---|---|---|---|---|
 | llama3_simulation — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
-| llama3_simulation — Cachemir IRP | **1006–1851** | 1.5e-4 | 2.1e-5 | 26.3 GiB | 2.8 GiB |
 | llama3 — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
-| llama3 — Cachemir IRP | 1730 | 3.3e-4 | 7.8e-5 | 29.4 GiB | 2.8 GiB |
-| llama3 — Cachemir IRP + DAG | 1352 | 2.6e-4 | 4.7e-5 | 29.4 GiB | 2.8 GiB |
-| llama3 — Cachemir IRP + DAG + cleanup | **1137** | 2.6e-4 | 4.5e-5 | 29.4 GiB | 2.8 GiB |
-| llama3 — + SK-free bootstrap (`bootstrap_safe`) | 1607 | 4.9e-4 | 7.6e-5 | 29.4 GiB | 2.8 GiB |
+| llama3 — Cachemir IRP | **1607** | 4.9e-4 | 7.6e-5 | 29.4 GiB | 2.8 GiB |
 
-**Summary**: 2.8–3.4× total speedup, 2.9× bootstrap stage speedup, ~10× plaintext
-memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance from GPU
-thermal/scheduling state — consistent within a single warm session.
+**Summary**: ~2.4× total speedup vs real EvalMod baseline, ~10× plaintext
+memory cut, accuracy-preserving. The Cachemir IRP path's bootstrap is
+secret-key-free (see "Bootstrap mechanism" below). Wall time has ±15%
+run-to-run variance from GPU thermal/scheduling state — consistent within
+a single warm session.
 
-## Per-stage breakdown (IRP + DAG + cleanup, 1137 ms)
-
-```
-rms1                21.1 ms
-attention          483.1 ms
-rms2                20.5 ms
-mlp                612.1 ms
-bootstrap (×2)     346.4 ms
-total             1137.0 ms
-```
-
-## Per-stage breakdown (+ SK-free bootstrap, 1607 ms)
+## Per-stage breakdown (Cachemir IRP, 1607 ms)
 
 ```
 rms1                20.8 ms
@@ -42,14 +29,14 @@ bootstrap (×5)     826.5 ms
 total             1607.0 ms
 ```
 
-### SK-free bootstrap variant
+### Bootstrap mechanism (SK-free)
 
-The "+ SK-free bootstrap" row replaces `boot_centered` (which decrypts
-the ciphertext to read mean and max-magnitude before each bootstrap)
-with `bootstrap_safe` — a static-bound wrapper that pre-scales the input
-by a plaintext constant chosen per call site, runs
+The Cachemir IRP path uses `bootstrap_safe` — a static-bound wrapper that
+pre-scales the input by a plaintext constant chosen per call site, runs
 `engine.bootstrap_inplace`, then unscales. No secret key is required
-during the bootstrap path.
+during the bootstrap path. (The earlier `boot_centered` wrapper, which
+read mean and max-magnitude via `sk.decrypt`, is no longer used in the
+inference path.)
 
 Per-site bounds (from one instrumented measurement run, 1.5× safety
 applied over measured `max_centered`):
@@ -62,11 +49,10 @@ applied over measured `max_centered`):
 | `mlp_post_wup` | Wup IRP | 1.78 | measured 1.185 |
 | `mlp_post_swiglu` | `silu(gate) * up` | 1.26 | measured 0.839 |
 
-Cost: 2 extra levels per site that needs scaling, plus per-call
-plaintext encode + multiply + rescale overhead. Wall time grows
-1137 → 1607 ms (1.41×); accuracy degrades 4.5e-5 → 7.6e-5 max\|err\|
-(1.7×) — the post-bootstrap unscale amplifies the polynomial noise
-floor proportional to `max_abs / 0.49`.
+Cost: each scaling site consumes 2 extra levels (pre-scale rescale +
+post-bootstrap unscale rescale), plus per-call plaintext encode +
+multiply + rescale overhead. The post-bootstrap unscale amplifies the
+polynomial noise floor proportional to `max_abs / 0.49`.
 
 Caveats:
 
