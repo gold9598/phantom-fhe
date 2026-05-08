@@ -85,6 +85,63 @@ chain swap, which uses smaller primes throughout) and the IRP rotation step
 set (47 owned user steps at chains 17/23/26 — restructuring would mean
 changing the BSGS factorization in the IRP module).
 
+## Future: negative-step KSK auto-derive (~1.2 GiB potential)
+
+For any rotation step `+a`, the keyswitching key `K(-a)` can be **derived
+on the fly** from `K(+a)` by applying the Galois automorphism
+`σ_{-a}` to its polynomials:
+
+```
+K(+a) defining property:    k₀ + k₁ · sk      ≡ σ_a(sk) · P    (mod q·P)
+σ_{-a}(K(+a)):              σ_{-a}(k₀) + σ_{-a}(k₁) · σ_{-a}(sk) ≡ sk · P
+                              ↑ this is exactly K(-a)
+```
+
+So whichever sign we store, the other sign can be derived with one
+polynomial automorphism applied to each KSK polynomial — phantom's
+keyswitching kernel handles the rest unchanged. ~10 user-side negative
+KSKs (`{-1, -2, -4}` at chain 17, `{-8, -16, -32, -64, -128, -256, -512}`
+at chain 23) and ~4 bootstrap-canonical negatives (`{-1024}` at chain 1,
+`{-512, -1024}` at chain 2, `{-32, -16}` at chain 3) all have positive
+counterparts in the same step set, so all can be eliminated via the
+auto-derive trick.
+
+**Estimated savings: ~1.2 GiB** (635 MiB user-side + 1.0 GiB bootstrap-side).
+Bringing total GPU footprint to ~12.2 GiB / -58.5% from original.
+
+**Implementation pitfalls observed across two attempts** that any future
+session must guard against:
+1. `apply_galois_ntt` requires the KSK's **extended-modulus** `coeff_mod_size`
+   (base + special primes), NOT the consuming ciphertext's chain modulus.
+2. Apply `σ` to BOTH polynomials in EVERY dnum partition of the KSK —
+   missing one partition silently corrupts the keyswitch.
+3. The galois element of step `-a` is `inv(galois_elt(+a)) mod 2N`, NOT
+   `-galois_elt(+a)`. Always use `phantom::util::get_elt_from_step(-a, N)`
+   directly; do not compute manually.
+4. KSK polynomials are stored in NTT form; use `apply_galois_ntt` (not
+   `apply_galois`).
+5. The σ application must happen BEFORE the keyswitch loop's c1×K product,
+   not after — the order is fixed by the keyswitching algebra.
+
+**Recommended verification harness for the next attempt**: in C++ (or via
+exposed pyPhantom binding), generate `K(+a)` via standard
+`create_one_galois_key`, generate `K(-a)` the same way, and compare
+bit-for-bit against `derive_negative_galois_key(K(+a))`. Until that
+equality test passes, do not integrate into the engine ctor — inference
+noise will mask the kernel-level bug.
+
+**Code touched in failed attempts** (reverted, included for reference):
+- `include/secretkey.h` — extend `PhantomGaloisKey` slot to support
+  `DERIVE_NEGATIVE` mode.
+- `include/evaluate.cuh` — declare the derive helper.
+- `src/evaluate.cu` — implement `derive_negative_galois_ksk` using
+  `key_galois_tool->apply_galois_ntt` over each partition's PhantomPublicKey.
+- `src/ckks_engine.cu` — engine ctor's user-galois-keys override path
+  detects `(+a, -a)` pairs at the same target chain and registers the
+  negative as derive mode.
+- `src/bootstrap.cu` — `register_canonical` does the same for bootstrap
+  C2S/S2C canonical KSKs.
+
 ### KSK deduplication (canonical-owner principle)
 
 Every Galois element (rotation step) needed in the engine has exactly
