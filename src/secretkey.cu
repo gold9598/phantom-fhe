@@ -351,59 +351,6 @@ void PhantomRelinKey::mod_drop_to_inplace(const PhantomContext &context,
     cudaStreamSynchronize(stream);
 }
 
-void PhantomRelinKey::apply_galois_to_polynomials_inplace(
-        const PhantomContext &context, std::size_t galois_elt_idx)
-{
-    if (!gen_flag_) {
-        throw std::invalid_argument(
-                "apply_galois_to_polynomials_inplace: KSK not generated");
-    }
-
-    auto &key_galois_tool = context.key_galois_tool_;
-    const auto &stream = cudaStreamPerThread;
-
-    for (auto &pk : public_keys_) {
-        auto &cipher = pk.pk_;
-        const std::size_t coeff_modulus_size = cipher.coeff_modulus_size();
-        const std::size_t N = cipher.poly_modulus_degree();
-
-        auto temp = phantom::util::make_cuda_auto_ptr<uint64_t>(
-                coeff_modulus_size * N, stream);
-
-        // c0
-        uint64_t *c0 = cipher.data();
-        key_galois_tool->apply_galois_ntt(
-                c0, coeff_modulus_size, galois_elt_idx, temp.get(), stream);
-        cudaMemcpyAsync(c0, temp.get(),
-                        coeff_modulus_size * N * sizeof(uint64_t),
-                        cudaMemcpyDeviceToDevice, stream);
-
-        // c1 — same buffer, offset by one polynomial worth of limbs
-        uint64_t *c1 = cipher.data() + coeff_modulus_size * N;
-        key_galois_tool->apply_galois_ntt(
-                c1, coeff_modulus_size, galois_elt_idx, temp.get(), stream);
-        cudaMemcpyAsync(c1, temp.get(),
-                        coeff_modulus_size * N * sizeof(uint64_t),
-                        cudaMemcpyDeviceToDevice, stream);
-    }
-
-    cudaStreamSynchronize(stream);
-}
-
-void PhantomGaloisKey::overwrite_with_galois_derivation(
-        std::size_t target_idx, std::size_t source_idx,
-        std::size_t galois_elt_idx,
-        const PhantomContext &context)
-{
-    if (target_idx >= relin_keys_.size() || source_idx >= relin_keys_.size()) {
-        throw std::out_of_range(
-                "PhantomGaloisKey::overwrite_with_galois_derivation: idx oob");
-    }
-    relin_keys_[target_idx] = relin_keys_[source_idx].clone();
-    relin_keys_[target_idx].apply_galois_to_polynomials_inplace(
-            context, galois_elt_idx);
-}
-
 void PhantomSecretKey::generate_one_kswitch_key(const PhantomContext &context, uint64_t *new_key,
                                                 PhantomRelinKey &relin_keys, const cudaStream_t &stream) const {
     // Extract encryption parameters.

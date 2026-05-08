@@ -1668,45 +1668,10 @@ Returns (f, e1, e2) such that
         // ownership (e.g. CKKSEngine sharing C2S/S2C bootstrap KSKs for
         // overlapping user-rotation steps) work transparently.
         const PhantomRelinKey* ksk = galois_keys.resolve(galois_elt_index);
-        if (ksk != nullptr) {
-            apply_galois_with_ksk(context, encrypted, galois_elt, *ksk);
-            return;
+        if (ksk == nullptr) {
+            throw std::invalid_argument("Galois key not present (no owned key, no fallback)");
         }
-        // Lazy derive K(this) from K(inverse) using K(-a) = σ_{-a}(K(+a)).
-        // The inverse Galois element corresponds to the rotation by the
-        // opposite step. If K(inverse) is owned by this bundle (or its
-        // fallback), derive K(this) on-the-fly: clone K(inverse), apply
-        // σ_{galois_elt} to the polynomials, then use it for keyswitch.
-        auto &context_data = context.get_context_data(encrypted.chain_index());
-        size_t two_N = 2 * context_data.parms().poly_modulus_degree();
-        // Modular inverse of galois_elt mod 2N (galois_elt is always odd
-        // and coprime to 2N for a power-of-two cyclotomic).
-        auto inv_mod_2N = [](size_t a, size_t m) -> size_t {
-            // Extended Euclidean — m is small (~131072), a is in [1, m-1].
-            long long old_r = (long long)a, r = (long long)m;
-            long long old_s = 1, s = 0;
-            while (r != 0) {
-                long long q = old_r / r;
-                std::tie(old_r, r) = std::make_tuple(r, old_r - q * r);
-                std::tie(old_s, s) = std::make_tuple(s, old_s - q * s);
-            }
-            long long inv = old_s % (long long)m;
-            if (inv < 0) inv += m;
-            return (size_t)inv;
-        };
-        size_t inv_galois_elt = inv_mod_2N(galois_elt, two_N);
-        auto inv_iter = find(galois_elts.begin(), galois_elts.end(), inv_galois_elt);
-        if (inv_iter == galois_elts.end()) {
-            throw std::invalid_argument("Galois key not present (no owned key, no fallback, no inverse-derive source)");
-        }
-        auto inv_index = std::distance(galois_elts.begin(), inv_iter);
-        const PhantomRelinKey* inv_ksk = galois_keys.resolve(inv_index);
-        if (inv_ksk == nullptr) {
-            throw std::invalid_argument("Galois key not present (no owned key, no fallback, no inverse-derive source)");
-        }
-        PhantomRelinKey derived = inv_ksk->clone();
-        derived.apply_galois_to_polynomials_inplace(context, galois_elt_index);
-        apply_galois_with_ksk(context, encrypted, galois_elt, derived);
+        apply_galois_with_ksk(context, encrypted, galois_elt, *ksk);
     }
 
     void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt,
