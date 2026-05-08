@@ -14,6 +14,7 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 | llama3 — Cachemir IRP | 1730 | 3.3e-4 | 7.8e-5 | 29.4 GiB | 2.8 GiB |
 | llama3 — Cachemir IRP + DAG | 1352 | 2.6e-4 | 4.7e-5 | 29.4 GiB | 2.8 GiB |
 | llama3 — Cachemir IRP + DAG + cleanup | **1137** | 2.6e-4 | 4.5e-5 | 29.4 GiB | 2.8 GiB |
+| llama3 — + SK-free bootstrap (`bootstrap_safe`) | 1607 | 4.9e-4 | 7.6e-5 | 29.4 GiB | 2.8 GiB |
 
 **Summary**: 2.8–3.4× total speedup, 2.9× bootstrap stage speedup, ~10× plaintext
 memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance from GPU
@@ -29,6 +30,51 @@ mlp                612.1 ms
 bootstrap (×2)     346.4 ms
 total             1137.0 ms
 ```
+
+## Per-stage breakdown (+ SK-free bootstrap, 1607 ms)
+
+```
+rms1                20.8 ms
+attention          460.7 ms
+rms2                20.8 ms
+mlp               1104.7 ms
+bootstrap (×5)     826.5 ms
+total             1607.0 ms
+```
+
+### SK-free bootstrap variant
+
+The "+ SK-free bootstrap" row replaces `boot_centered` (which decrypts
+the ciphertext to read mean and max-magnitude before each bootstrap)
+with `bootstrap_safe` — a static-bound wrapper that pre-scales the input
+by a plaintext constant chosen per call site, runs
+`engine.bootstrap_inplace`, then unscales. No secret key is required
+during the bootstrap path.
+
+Per-site bounds (from one instrumented measurement run, 1.5× safety
+applied over measured `max_centered`):
+
+| Site | After | `max_abs` | Note |
+|---|---|---|---|
+| `attn_pre_psexp` | `mask*scale - sub(C[h])` | 45.1 | measured 30.07 |
+| `attn_pre_finsmx` | damped squarings | TARGET_MAG (0.45) | mean +0.449 subtracted as plaintext |
+| `mlp_post_wgate` | Wgate IRP | 1.66 | measured 1.108 |
+| `mlp_post_wup` | Wup IRP | 1.78 | measured 1.185 |
+| `mlp_post_swiglu` | `silu(gate) * up` | 1.26 | measured 0.839 |
+
+Cost: 2 extra levels per site that needs scaling, plus per-call
+plaintext encode + multiply + rescale overhead. Wall time grows
+1137 → 1607 ms (1.41×); accuracy degrades 4.5e-5 → 7.6e-5 max\|err\|
+(1.7×) — the post-bootstrap unscale amplifies the polynomial noise
+floor proportional to `max_abs / 0.49`.
+
+Caveats:
+
+- The `attn_pre_finsmx` mean constant `0.4487` is empirical for this
+  prompt and layer 0. If the prompt or layer changes, re-measure.
+- Layout shifts (`relayout_periodic_to_irp`,
+  `relayout_irp_to_periodic`) and the final reference decrypt still
+  touch `sk`; pending Phase 2–3.
 
 ## What is in this port
 

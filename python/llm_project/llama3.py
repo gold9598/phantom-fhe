@@ -1,7 +1,8 @@
 """
 LLaMA-3.1-8B layer-0 single decoder, Phase 1: homomorphic refresh in MLP block
-via boot_centered; layout shifts (relayout_periodic_to_irp / relayout_irp_to_periodic)
-still use decrypt+re-encrypt and are pending Phase 2-3 implementation.
+via bootstrap_safe (SK-free, static per-site input bound); layout shifts
+(relayout_periodic_to_irp / relayout_irp_to_periodic) still use decrypt+re-encrypt
+and are pending Phase 2-3 implementation.
 Cachemir IRP plaintext-encoding swap with per-step galois target chain indices
 to fit on a 32 GB GPU.
 
@@ -50,7 +51,7 @@ from blocks.attention import (
 from blocks.softmax import softmax_damping_schedule
 from blocks.silu import silu
 from blocks.linear import replicate_required_steps
-from blocks.bootstrap import boot_centered
+from blocks.bootstrap import bootstrap_safe
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
 )
@@ -108,9 +109,9 @@ RMS2_Z_MIN, RMS2_Z_MAX = 1.4e-4, 2.1e-4
 #   SDPA C:      ~4 levels  (finalize_softmax, score_v ct*ct+rescale, mask+replicate)  → bootstrap between B and C
 #   Wo IRP:      1 level
 #   rms2:        ~5 levels  → bootstrap before rms2
-#   MLP gate/up: 1 level each IRP → boot_centered refresh (fresh chain ~13 ul above msg)
+#   MLP gate/up: 1 level each IRP → bootstrap_safe refresh (fresh chain ~13 ul above msg)
 #   silu:        ~4 levels  (deg-8 poly)  ← fits within freshened budget
-#   swiglu:      1 level    (ct*ct)       → boot_centered refresh before Wdown
+#   swiglu:      1 level    (ct*ct)       → bootstrap_safe refresh before Wdown
 #   Wdown IRP:   1 level
 # Total per sub-stage ≤ 10; NSL=14 (13 usable) gives comfortable headroom.
 NUM_SCALE_LEVELS = 14
@@ -250,7 +251,8 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
 
     # ---- bootstrap before damped squarings. ----
     t0 = _t()
-    scores_ct = boot_centered(engine, ctx, encoder, sk, scores_ct)
+    scores_ct = bootstrap_safe(engine, ctx, encoder, scores_ct,
+                               max_abs=45.10, slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- ps_exp_init + damped squarings. ----
@@ -264,7 +266,22 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
 
     # ---- bootstrap before finalize_softmax. ----
     t0 = _t()
-    e_ct = boot_centered(engine, ctx, encoder, sk, e_ct)
+    # NOTE: empirical mean=+0.449, max_centered=0.449 (max|slot|≈0.898).
+    # raw bootstrap_safe(max_abs=TARGET_MAG) wraps because max|slot| > 0.5.
+    # raw bootstrap_safe(max_abs=0.9) tries to pre-scale, which is rejected
+    # at max_user_level. Solution: subtract empirical mean plaintext first
+    # (post-squarings mean is deterministic for this prompt/layer), bootstrap
+    # the centered ciphertext (max_centered ≤ TARGET_MAG → no scaling), then
+    # add the mean back. SK-free.
+    _PRE_FINSMX_MEAN = 0.4487
+    mean_pt_pre = encoder.encode_double_vector(
+        ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+    e_ct = phantom.sub_plain(ctx, e_ct, mean_pt_pre)
+    e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
+                          max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+    mean_pt_post = encoder.encode_double_vector(
+        ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+    e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
     _rec("bootstrap", t0)
 
     # ---- mask + finalize_softmax + score*V + mask + replicate. ----
@@ -357,7 +374,8 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
     gate_ct.set_scale(SCALE)
     # ---- Refresh gate_ct via homomorphic bootstrap. ----
     t0 = _t()
-    gate_ct = boot_centered(engine, ctx, encoder, sk, gate_ct)
+    gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
+                             max_abs=1.66, slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- silu(gate). ----
@@ -377,7 +395,8 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
     up_ct.set_scale(SCALE)
     # ---- Refresh up_ct via homomorphic bootstrap. ----
     t0 = _t()
-    up_ct = boot_centered(engine, ctx, encoder, sk, up_ct)
+    up_ct = bootstrap_safe(engine, ctx, encoder, up_ct,
+                           max_abs=1.78, slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- h = silu_gate * up. ----
@@ -396,7 +415,8 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
 
     # ---- Refresh h via homomorphic bootstrap (preserves permuted layout). ----
     t0 = _t()
-    h_fresh = boot_centered(engine, ctx, encoder, sk, h_ct)
+    h_fresh = bootstrap_safe(engine, ctx, encoder, h_ct,
+                             max_abs=1.26, slot_count=NUM_SLOTS)
     # Mod-switch to IRP_MLP chain so plaintext chain indices align and GPU
     # memory stays within budget (chain 16 has 30 primes; chain 26 has 5).
     irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
@@ -704,12 +724,20 @@ def main():
 
     stage_times.setdefault("bootstrap", 0.0)
 
+    _BOOT_MAX_ABS = {
+        "rms1": 1.0,        # residual stream pre-rms1
+        "attention": 1.0,   # post-rms1 (γ-scaled normalized)
+        "rms2": 1.0,        # residual stream post-attention
+        "mlp": 1.0,         # post-rms2 (γ-scaled normalized)
+    }
+
     def _maybe_boot(name, ct):
         """Insert a bootstrap before `name` iff the placement plan says so."""
         if not boot_before.get(name, False):
             return ct
         t0 = time.perf_counter()
-        ct = boot_centered(engine, ctx, encoder, sk, ct)
+        ct = bootstrap_safe(engine, ctx, encoder, ct,
+                            max_abs=_BOOT_MAX_ABS[name], slot_count=NUM_SLOTS)
         stage_times["bootstrap"] += (time.perf_counter() - t0) * 1000
         print(f"  [plan] bootstrap before {name}: chain={ct.chain_index()}")
         return ct

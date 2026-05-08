@@ -92,3 +92,44 @@ def boot_centered(engine, ctx, encoder, sk, ct):
     mean_pt2 = encoder.encode_double_vector(
         ctx, [mean_val] * n, ct_c.scale(), ct_c.chain_index())
     return phantom.add_plain(ctx, ct_c, mean_pt2)
+
+
+def bootstrap_safe(engine, ctx, encoder, ct, max_abs, slot_count, target_mag=0.49):
+    """SK-free bootstrap with static input range.
+
+    Pre-scales `ct` by `target_mag / max_abs` so post-scale slots fit inside
+    bootstrap's safe domain, runs `engine.bootstrap_inplace`, then unscales.
+    Caller-provided `max_abs` is the static upper bound on |slot value|;
+    the wrapper does not measure the input. If `max_abs <= target_mag`,
+    no scaling is applied and the bootstrap runs directly (zero extra levels).
+
+    Inputs are assumed approximately mean-zero. If a call site has a known
+    non-zero mean, subtract it as a plaintext before calling this and add
+    back after.
+    """
+    user_scale = engine.user_scale()
+    needs_scale = max_abs > target_mag
+    if needs_scale:
+        if engine.user_level(ct) >= engine.max_user_level():
+            raise ValueError(
+                f"bootstrap_safe: input at user_level {engine.user_level(ct)} "
+                f"(== max_user_level {engine.max_user_level()}) requires scaling "
+                f"(max_abs={max_abs} > target_mag={target_mag}); "
+                "bootstrap one level earlier in the pipeline.")
+        scale_down = target_mag / max_abs
+        scale_up = 1.0 / scale_down
+        scale_pt = encoder.encode_double_vector(
+            ctx, [scale_down] * slot_count, ct.scale(), ct.chain_index())
+        ct = phantom.multiply_plain(ctx, ct, scale_pt)
+        ct = phantom.rescale_to_next(ctx, ct)
+        ct.set_scale(user_scale)
+
+    engine.bootstrap_inplace(ct)
+
+    if needs_scale:
+        unscale_pt = encoder.encode_double_vector(
+            ctx, [scale_up] * slot_count, ct.scale(), ct.chain_index())
+        ct = phantom.multiply_plain(ctx, ct, unscale_pt)
+        ct = phantom.rescale_to_next(ctx, ct)
+        ct.set_scale(user_scale)
+    return ct

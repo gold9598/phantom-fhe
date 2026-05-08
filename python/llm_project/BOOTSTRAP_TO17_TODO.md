@@ -138,9 +138,12 @@ Plus a chain layout that uses the_lib's distinct prime pools:
       the new chain, prints avg/max bits, compares to the_lib reference
       (`/home/yongwoo-oh/the_lib/build/bin/examples/ckks_bootstrapping_cuda`
       avg = 6.64e-07 = ~20.5 bits)
-- [ ] `boot_centered`: lift the `TARGET_MAG = 0.49` ceiling — if
-      bootstrap precision is now ~20 bits absolute, scale-down for
-      large-magnitude inputs may not be needed for moderate ranges
+- [ ] `bootstrap_safe`: revisit per-site `max_abs` ceilings — at ~20
+      bits absolute precision, the pre-scale at `attn_pre_psexp`
+      (max_abs=45.1), `mlp_post_wgate`/`wup` (1.66/1.78), and
+      `mlp_post_swiglu` (1.26) may be unnecessary for moderate-range
+      inputs; `attn_pre_finsmx`'s plaintext mean-subtract should also
+      be re-evaluated
 - [ ] `llama3.py`: re-derive `freshest_chain_index = 14` (not 16),
       adjust per-step galois target chain indices, possibly swap
       `NUM_SCALE_LEVELS = 14` → `18` for more user-level headroom
