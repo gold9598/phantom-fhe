@@ -6,18 +6,14 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 
 ## Results
 
-| Headline | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
-|---|---|---|---|---|---|
-| llama3_simulation — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
-| llama3 — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
-| llama3 — Cachemir IRP | **1916** | 4.9e-4 | 1.7e-4 | 29.4 GiB | 2.8 GiB |
+| Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
+|---|---|---|---|---|
+| **1916** | 4.9e-4 | 1.7e-4 | 29.4 GiB | 2.8 GiB |
 
-**Summary**: ~2.4× total speedup vs real EvalMod baseline, ~10× plaintext
-memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance
-from GPU thermal/scheduling state — consistent within a single warm
-session.
+Wall time has ±15% run-to-run variance from GPU thermal/scheduling state
+— consistent within a single warm session.
 
-## Per-stage breakdown (Cachemir IRP, 1916 ms)
+## Per-stage breakdown (1916 ms)
 
 ```
 rms1                21.4 ms
@@ -28,6 +24,36 @@ bootstrap (×6)    1163.4 ms
 layout_shift         0.2 ms
 total             1916.4 ms
 ```
+
+## Memory breakdown (29.4 GiB GPU peak, single decoder layer)
+
+Captured at 0.5 s sampling intervals across one full run on RTX 5090
+(32 GiB):
+
+| Phase | GPU MiB | Δ MiB | What was allocated |
+|---|---|---|---|
+| Python startup | 18 | — | (no CUDA context yet) |
+| `import pyPhantom` | 556 | +538 | CUDA runtime + libcuPhantom load |
+| Mid-`engine ctor` | 1,422 | +866 | (partial) |
+| **Post-`engine ctor`** (4.3 s) | **29,358** | **+27,936** | engine + bootstrap key + 69 user-rotation Galois keys fully resident |
+| IRP encoding done (16.6 s) | 29,362 | +4 | IRP plaintexts go to host **pinned memory** (~2.8 GiB), not GPU |
+| Forward pass running | 29,364 | +2 | transient JIT-expanded plaintexts during `multiply_plain` |
+| Post-exit | 18 | -29,346 | freed |
+
+**Steady-state GPU residents (29.4 GiB):**
+
+- **CUDA runtime + libcuPhantom**: ~556 MiB (one-time library load, before any phantom call)
+- **Engine workspace + Galois + bootstrap keys**: ~28.1 GiB (allocated in `engine ctor`, dominated by the bootstrap evaluation key and 69 user-rotation Galois keys at chain indices 16–26)
+
+**Host RAM:** ~2.8 GiB per layer for IRP-encoded weights (Wq, Wo, Wgate,
+Wup, Wdown) staged as `SingleChainPlaintext` on pinned host memory and
+expanded JIT to GPU per `irp_matvec_host` call.
+
+The pre-IRP layout (BSGS Wq/Wo + complex BSGS Wgate/Wup/Wdown plaintexts
+all on GPU) peaked at ~30,580 MiB and OOMed during the first
+`engine.bootstrap_inplace`. Moving plaintexts to pinned host memory plus
+the per-step galois target chain assignment frees enough room for
+bootstrap to fit on a 32 GiB card.
 
 The decoder body is **secret-key-free**: rmsnorm, the residual stream,
 and the SDPA pipeline (Q·K^T, softmax, score·V) all operate in stride-t
