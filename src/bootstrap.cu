@@ -1022,13 +1022,20 @@ namespace phantom {
             }
         }
 
-        // User-step indices: everything NOT in the bootstrap set.
+        // User-step indices: ONLY conjugation (galois_elt = 2N - 1). The
+        // bootstrap pipeline reads bk.user_galois_keys exclusively for the
+        // post-C2S conjugation rotation (see apply_galois call further
+        // down). User-rotation steps are populated later by
+        // CKKSEngine::ctor's override path (create_galois_keys_per_level
+        // with per-step target chains). Direct callers that need user
+        // rotations from `bk.user_galois_keys` must build their own bundle.
+        //
+        // Building only conjugation here cuts ~8.6 GiB of full-Q transient
+        // peak during engine construction (47 non-overlap user-rotation
+        // KSKs × ~180 MiB each were allocated then immediately destroyed
+        // by the override).
         std::vector<size_t> user_indices;
-        for (size_t i = 0; i < galois_elts.size(); ++i) {
-            if (bootstrap_indices_set.find(i) == bootstrap_indices_set.end()) {
-                user_indices.push_back(i);
-            }
-        }
+        user_indices.push_back(find_elt_idx(static_cast<uint32_t>(2 * N - 1)));
 
         // Canonical-owner principle: for every step used anywhere in C2S/S2C,
         // generate exactly ONE physical KSK at the SHALLOWEST chain at which

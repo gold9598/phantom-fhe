@@ -8,7 +8,7 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 
 | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
 |---|---|---|---|---|
-| **1918** | 5.8e-4 | 1.8e-4 | 21.3 GiB | 2.8 GiB |
+| **1919** | 5.9e-4 | 1.9e-4 | 13.1 GiB | 2.8 GiB |
 
 Wall time has ±15% run-to-run variance from GPU thermal/scheduling state
 — consistent within a single warm session.
@@ -63,18 +63,22 @@ delta = the GPU memory committed by the corresponding allocation step.
 | 8 | S2C encoded diagonals (3 layers, chains 13–15) | +96 | 1,549 |
 | **9** | **C2S layer Galois KSKs (canonical, 52 keys)** | **+9,376** | **10,925** |
 | 10 | S2C layer Galois KSKs (all fallback to C2S) | +0 | 10,925 |
-| 11 | Transient full-Q `user_galois_keys` inside `create_bootstrap_key` | +8,640 | 19,565 |
-| 12 | Engine ctor override: per-level user keys (replaces #11) | +2,272 net | 21,837 |
-| | **Total** | | **21,837** |
+| 11 | `create_bootstrap_key` user_galois_keys (conjugation only) | +180 | 11,105 |
+| 12 | Engine ctor override: per-level user keys (replaces #11) | +2,289 net | 13,394 |
+| | **Total** | | **13,394** |
 
 Item 9 — the C2S canonical Galois KSKs — is the single largest contributor
-at ~91% of the bootstrap key. After canonical-owner dedup, every S2C step
+at ~70% of the GPU footprint. After canonical-owner dedup, every S2C step
 borrows from C2S (item 10 = 0 MiB).
 
-Item 11 is a temporary peak: `bootstrap.cu` builds a full-Q user_galois_keys
-for the 47 non-overlap user steps, then `engine.cu` immediately replaces it
-with a per-level override (item 12). The freed memory is partially reused
-by the override; net new growth is +2,272 MiB.
+Item 11 used to be 8,640 MiB — `bootstrap.cu` originally built a full-Q
+`user_galois_keys` covering all 47 non-overlap user-rotation steps, then
+`engine.cu` immediately replaced it with a per-level override. Pure
+construction-time waste: the cudaMallocAsync pool kept the 8.6 GiB at high
+water mark even after the transient bundle was destroyed. Fix: shrink the
+bootstrap.cu allocation to **just the conjugation key** (the only entry the
+bootstrap pipeline itself reads from `bk.user_galois_keys`). Engine override
+populates the rest. Saves ~8.4 GiB steady-state.
 
 The remaining diet targets are item 9 (only reducible via BootstrapTo17Levels
 chain swap, which uses smaller primes throughout) and the IRP rotation step
