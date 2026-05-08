@@ -189,6 +189,13 @@ public:
     // truncated to a shallower target is a no-op.
     void mod_drop_to_inplace(const PhantomContext& context, std::size_t target_chain_index);
 
+    // Apply Galois automorphism σ_e to every polynomial of this KSK in-place
+    // (NTT form, all dnum partitions, both c0 and c1). Used to derive K(-a)
+    // from K(+a) via the identity K(-a) = σ_{-a}(K(+a)). The argument is
+    // the position of e in the context's key_galois_tool->galois_elts() vector.
+    void apply_galois_to_polynomials_inplace(
+            const PhantomContext &context, std::size_t galois_elt_idx);
+
     void save(std::ostream& stream) const
     {
         if (!gen_flag_)
@@ -275,6 +282,18 @@ public:
             return fallback_relin_keys_[index];
         return nullptr;
     }
+
+    // Phase-A negative-step KSK derive: replace relin_keys_[target_idx]
+    // with `clone(relin_keys_[source_idx])` after applying σ_e (e specified
+    // by `galois_elt_idx`) to its polynomials. Used to verify the
+    // K(-a) = σ_{-a}(K(+a)) identity by overwriting an existing K(-a)
+    // with the derived version — if rotations stay correct, the helper
+    // is right and we can move to the memory-saving path (skip generation
+    // of K(-a) entirely).
+    void overwrite_with_galois_derivation(
+            std::size_t target_idx, std::size_t source_idx,
+            std::size_t galois_elt_idx,
+            const PhantomContext &context);
 
     // Register a non-owning fallback KSK at `index`. The pointer must
     // remain valid for the lifetime of this bundle.

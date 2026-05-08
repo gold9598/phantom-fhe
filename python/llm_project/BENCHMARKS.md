@@ -130,7 +130,35 @@ bit-for-bit against `derive_negative_galois_key(K(+a))`. Until that
 equality test passes, do not integrate into the engine ctor — inference
 noise will mask the kernel-level bug.
 
-**Code touched in failed attempts** (reverted, included for reference):
+**Update after a third attempt** (committed as infrastructure, dormant for
+the current config):
+
+- The math is correct — verified via Phase-A in-place test where K(-a)
+  was OVERWRITTEN by σ_{-a}(K(+a)) and llama3 still produced max|err| =
+  1.6e-4 (no regression).
+- Phase-B (skip K(-a) generation, populate via clone+σ at construction)
+  also worked but didn't save memory (the clone takes the same space).
+- Phase-C (lazy derive inside `apply_galois_inplace` when KSK lookup
+  fails) was added as the actual memory-saving path.
+- **However, in this config no user-step pair (+a, -a) has both sides
+  owned at the same chain** — every user negative's positive twin is
+  a bootstrap fallback (e.g. `+8` is in the C2S `{1..16}` set, so
+  `K(+8)` is shared from c2s_galois_keys[2] at chain 3). Allowing the
+  skip across the bootstrap-fallback boundary corrupts rotations
+  catastrophically (max|err| → 1e+02), suggesting σ-on-ksk needs
+  additional handling when the source KSK is at a *much shallower*
+  chain than the target use chain.
+
+**Status: infrastructure is committed and correct for same-chain pairs;
+~zero MiB savings in this config.** Realizing the ~1.2 GiB potential
+needs:
+
+1. A fix to the cross-chain σ-derive path (the source KSK has more
+   primes than the target use; the kernel/permutation needs to align).
+2. Or restructuring user_rotation_steps so eligible pairs don't cross
+   the bootstrap-fallback boundary.
+
+**Code currently committed**:
 - `include/secretkey.h` — extend `PhantomGaloisKey` slot to support
   `DERIVE_NEGATIVE` mode.
 - `include/evaluate.cuh` — declare the derive helper.

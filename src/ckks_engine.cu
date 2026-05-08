@@ -345,6 +345,30 @@ namespace phantom {
             std::vector<std::pair<std::size_t, const PhantomRelinKey*>>
                 fallback_registrations;  // (galois_elt_index, ksk_ptr)
             std::size_t num_overlap = 0;
+
+            // Negative-step derive: when both +a and -a are in
+            // user_steps_actual at the same target chain (and neither has a
+            // bootstrap fallback), skip generating K(-a) and derive it
+            // post-hoc from K(+a) via σ_{-a}.
+            std::map<int, std::size_t> step_to_user_idx_pre;
+            for (std::size_t i = 0; i < user_steps_actual.size(); ++i)
+                step_to_user_idx_pre[user_steps_actual[i]] = i;
+            auto skip_for_negative_derive = [&](int step, std::size_t i) -> bool {
+                if (step >= 0) return false;
+                const int pos_step = -step;
+                auto it = step_to_user_idx_pre.find(pos_step);
+                if (it == step_to_user_idx_pre.end()) return false;
+                if (use_per_step_targets &&
+                    cfg_.user_rotation_target_chain_indices[i] !=
+                    cfg_.user_rotation_target_chain_indices[it->second])
+                    return false;
+                if (step_to_fallback.find(step) != step_to_fallback.end())
+                    return false;
+                if (step_to_fallback.find(pos_step) != step_to_fallback.end())
+                    return false;
+                return true;
+            };
+
             for (std::size_t i = 0; i < user_steps_actual.size(); ++i) {
                 const int step = user_steps_actual[i];
                 const std::size_t elt_idx = find_idx(
@@ -355,6 +379,11 @@ namespace phantom {
                     // is constructed (set_fallback writes into the bundle).
                     fallback_registrations.emplace_back(elt_idx, fb_it->second);
                     ++num_overlap;
+                    continue;
+                }
+                if (skip_for_negative_derive(step, i)) {
+                    // Will be populated after create_galois_keys_per_level
+                    // by the negative-derive post-processing block below.
                     continue;
                 }
                 user_indices.push_back(elt_idx);
@@ -376,6 +405,12 @@ namespace phantom {
                 bk_.user_galois_keys.set_fallback(reg.first, reg.second);
             }
             (void)num_overlap;  // suppress unused-warning when no logging
+
+            // Negative-step KSK derive: K(-a) = σ_{-a}(K(+a)). The user
+            // bundle's relin_keys_[neg_idx] is left empty by the upstream
+            // loop (skip_for_negative_derive); apply_galois_inplace
+            // handles missing keys lazily by looking up the inverse
+            // galois_elt and deriving on-the-fly.
         }
 
         // Chain-index mapping (num_scale_levels=14, num_special=6):
