@@ -10,33 +10,39 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 |---|---|---|---|---|---|
 | llama3_simulation — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
 | llama3 — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
-| llama3 — Cachemir IRP | **1752** | 6.3e-4 | 1.7e-4 | 29.4 GiB | 2.8 GiB |
+| llama3 — Cachemir IRP | **1916** | 4.9e-4 | 1.7e-4 | 29.4 GiB | 2.8 GiB |
 
 **Summary**: ~2.4× total speedup vs real EvalMod baseline, ~10× plaintext
 memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance
 from GPU thermal/scheduling state — consistent within a single warm
 session.
 
-## Per-stage breakdown (Cachemir IRP, 1752 ms)
+## Per-stage breakdown (Cachemir IRP, 1916 ms)
 
 ```
-rms1                21.3 ms
-attention          448.8 ms
-rms2                21.3 ms
-mlp               1092.6 ms
-bootstrap (×6)     991.8 ms
-layout_shift        10.5 ms
-total             1752.2 ms
+rms1                21.4 ms
+attention          610.1 ms
+rms2                21.1 ms
+mlp               1095.5 ms
+bootstrap (×6)    1163.4 ms
+layout_shift         0.2 ms
+total             1916.4 ms
 ```
 
-The residual stream and rmsnorm now operate in stride-t (IRP-native) layout
-end-to-end, eliminating 4 of 6 sk-touching layout-shift call sites. The
-two remaining relayouts (Q→periodic for `compute_qkt`, head-stride
-attn_h→IRP for Wo) are kept until the C++ SDPA kernels (`compute_qkt`,
-`score_times_v`) accept a stride parameter. `rmsnorm_forward_stride_t`
-is a pure-Python port of `phantom.rmsnorm_forward` for stride-t input
-(see `blocks/rmsnorm.py`); the existing C++ kernel is no longer used in
-the inference path.
+The decoder body is **secret-key-free**: rmsnorm, the residual stream,
+and the SDPA pipeline (Q·K^T, softmax, score·V) all operate in stride-t
+/ interleaved-replicated layout end-to-end, matching the IRP module's
+native input/output convention. The C++ kernels `phantom.rmsnorm_forward`,
+`phantom.compute_qkt`, and `phantom.score_times_v` are replaced by
+pure-Python implementations (`rmsnorm_forward_stride_t` in
+`blocks/rmsnorm.py`; `compute_qkt_irp`, `finalize_softmax_irp_t`,
+`score_times_v_irp` in `blocks/attention.py`). K/V cache is interleaved
+across tokens per the Cachemir paper §5.1.
+
+Only `sk.encrypt_symmetric` (initial input encryption at the client
+boundary, `llama3.py:638-640`) and `sk.decrypt(y_ct)` (test-harness
+reference compare, `llama3.py:810`) touch the secret key — both at
+boundaries, not in the decoder body.
 
 ### Bootstrap mechanism
 

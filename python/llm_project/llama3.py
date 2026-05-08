@@ -1,8 +1,13 @@
 """
-LLaMA-3.1-8B layer-0 single decoder, Phase 1: homomorphic refresh in MLP block
-via bootstrap_safe (SK-free, static per-site input bound); layout shifts
-(relayout_periodic_to_irp / relayout_irp_to_periodic) still use decrypt+re-encrypt
-and are pending Phase 2-3 implementation.
+LLaMA-3.1-8B layer-0 single decoder, Stage 2: SK-free decoder body via
+Cachemir-native interleaved-replicated SDPA (compute_qkt_irp +
+finalize_softmax_irp_t + score_times_v_irp). The only sk-touching sites
+are now at boundaries: (1) client-side initial encryption of x/K/V, (2)
+test-harness decrypt of the final output. The relayout decrypt+re-encrypt
+shims used in Stage 1 (relayout_periodic_to_irp / relayout_irp_to_periodic)
+are gone — Q stays in stride-T_MODEL packing through the entire SDPA, and
+the K/V cache uses interleaved-across-tokens packing per Cachemir §5.1.
+
 Cachemir IRP plaintext-encoding swap with per-step galois target chain indices
 to fit on a 32 GB GPU.
 
@@ -45,12 +50,13 @@ from blocks.irp import (
     decode_irp_output_rect,
 )
 from blocks.attention import (
-    mask_scale_plaintext, score_mask_plaintext,
-    sdpa_required_steps,
+    compute_qkt_irp, score_times_v_irp, finalize_softmax_irp_t,
+    qkt_irp_mask_scale_plaintext, qkt_irp_per_head_sub_plaintext,
+    score_v_irp_output_mask_plaintext,
+    sdpa_irp_required_steps,
 )
 from blocks.softmax import softmax_damping_schedule
 from blocks.silu import silu
-from blocks.linear import replicate_required_steps
 from blocks.bootstrap import bootstrap_safe
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
@@ -170,47 +176,19 @@ def rope_matrix_np(cos_p, sin_p):
     return M
 
 
-# ============================ Layout shim helpers ============================
-# Decrypt + re-encrypt at a chosen user level (chain index = engine.user_level_chain_index(L)).
-# This reuses the same refresh mechanism used by llama3_simulation.py for
-# layout shifts between IRP-interleaved and periodic packings; the only
-# difference here is that we encrypt at a chain in the engine's user segment.
-def _re_encrypt_slots(engine, ctx, encoder, sk, slots, user_level, scale=SCALE):
-    chain_index = engine.user_level_chain_index(user_level)
-    return sk.encrypt_symmetric(
-        ctx, encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index))
-
-def relayout_periodic_to_irp(engine, ctx, encoder, sk, ct, d_periodic, d_irp,
-                              user_level, scale=SCALE):
-    dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
-                   dtype=np.float64)[:d_periodic]
-    t = NUM_SLOTS // d_irp
-    slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-    n = min(d_periodic, d_irp)
-    slots[::t][:n] = dec[:n]
-    return _re_encrypt_slots(engine, ctx, encoder, sk, slots, user_level, scale)
-
-def relayout_irp_to_periodic(engine, ctx, encoder, sk, ct, d_in, d_out, user_level, scale=SCALE):
-    dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
-                   dtype=np.float64)
-    t_in = NUM_SLOTS // d_in
-    valid = dec[::t_in][:d_in]
-    slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-    periods = NUM_SLOTS // d_out
-    n = min(d_in, d_out)
-    for k in range(periods):
-        slots[k*d_out : k*d_out + n] = valid[:n]
-    return _re_encrypt_slots(engine, ctx, encoder, sk, slots, user_level, scale)
-
-
 # ============================ Attention forward (IRP + bootstrap) ============================
-def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
+def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
                                  galois_key,
                                  x_norm,
                                  diag_wq_irp, diag_wo_irp,
                                  mask_attn_pt,
                                  k_ct, v_ct, c_per_head,
                                  stage_times=None):
+    """Stage-2 IRP-native attention. Q stays in stride-T_MODEL packing through
+    the entire SDPA. K/V cache packed interleaved across t tokens within a
+    single ciphertext (Cachemir §5.1). No sk-touching relayouts in the
+    decoder body.
+    """
     def _t(): return time.perf_counter()
     def _rec(name, t0):
         if stage_times is None: return
@@ -227,38 +205,44 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
         x_irp = x_norm
     _rec("layout_shift", t0)
 
-    # ---- Wq via IRP. ----
+    # ---- Wq via IRP. q_ct stays in stride-T_MODEL after IRP — this is the
+    # exact layout compute_qkt_irp expects. The IRP-internal mask multiplies
+    # at scale SCALE^2; one extra rescale brings the scale back to SCALE so
+    # the downstream ct·ct in compute_qkt_irp sees matching scales. ----
     t0 = _t()
     q_ct = irp_matvec_host(ctx, encoder, galois_key, x_irp, diag_wq_irp,
                       NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE,
                       mask_pt=mask_attn_pt)
+    q_ct = phantom.rescale_to_next(ctx, q_ct)
+    q_ct.set_scale(SCALE)
     _rec("wq_irp", t0)
 
-    # ---- shift interleaved -> periodic d_total at fresh chain (for SDPA). ----
+    # ---- bootstrap to refresh chain to 16 so Stage A has the full SDPA
+    # budget. Without this, q_ct at chain ~28 would push compute_qkt_irp +
+    # mask*scale past chain 29 (= NSL_MAX) and overflow. ----
     t0 = _t()
-    q_ct = relayout_irp_to_periodic(engine, ctx, encoder, sk, q_ct,
-                                     D_TOTAL, D_TOTAL,
-                                     user_level=USER_LEVEL_FRESH)
-    _rec("layout_shift", t0)
+    q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
+                          max_abs=2.5, slot_count=NUM_SLOTS)
+    _rec("bootstrap", t0)
 
-    # ---- compute_qkt + mask*scale + sub(C[h]). ----
+    # ---- compute_qkt_irp + mask*scale + sub(C[h]). ----
+    # Output: scores at slot[h*D_HEAD*T_MODEL + tok] = m[tok, h], with
+    # mid-head junk that the mask*scale step zeros out.
     t0 = _t()
     phantom.mod_switch_to_inplace(ctx, k_ct, q_ct.chain_index())
-    scores_ct = phantom.compute_qkt(ctx, relin_key, galois_key, q_ct, [k_ct], D_HEAD)[0]
+    scores_ct = compute_qkt_irp(ctx, encoder, relin_key, galois_key,
+                                 q_ct, k_ct, D_HEAD, D_TOTAL, T_MODEL)
     nominal = scores_ct.scale()
     inv_sqrt_d = 1.0 / math.sqrt(float(D_HEAD))
-    ms_pt = mask_scale_plaintext(
-        ctx, encoder, D_HEAD, D_TOTAL, NUM_TOKENS,
+    ms_pt = qkt_irp_mask_scale_plaintext(
+        ctx, encoder, D_HEAD, D_TOTAL, NUM_TOKENS, T_MODEL,
         inv_sqrt_d, scores_ct.chain_index(), SCALE)
     scores_ct = phantom.multiply_plain(ctx, scores_ct, ms_pt)
     scores_ct = phantom.rescale_to_next(ctx, scores_ct)
     scores_ct.set_scale(nominal)
-    sub_mask = np.zeros(NUM_SLOTS, dtype=np.float64)
-    for tt in range(NUM_TOKENS):
-        for h in range(N_HEADS):
-            sub_mask[tt * D_TOTAL + h * D_HEAD] = c_per_head[h]
-    sub_pt = encoder.encode_double_vector(
-        ctx, sub_mask.tolist(), scores_ct.scale(), scores_ct.chain_index())
+    sub_pt = qkt_irp_per_head_sub_plaintext(
+        ctx, encoder, D_HEAD, D_TOTAL, NUM_TOKENS, T_MODEL,
+        c_per_head, scores_ct.chain_index(), scores_ct.scale())
     scores_ct = phantom.sub_plain(ctx, scores_ct, sub_pt)
     _rec("attn_A", t0)
 
@@ -278,14 +262,14 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
     _rec("attn_B", t0)
 
     # ---- bootstrap before finalize_softmax. ----
+    # The IRP layout has very different fill-rate: only N_HEADS*NUM_TOKENS=128
+    # of NUM_SLOTS=32768 slots carry meaningful data after the upcoming
+    # pre-finalize mask, so the global slot mean is dominated by the polynomial
+    # constant evaluated at zero (poly(0) ~ 0.449 with the deg-4 Chebyshev fit
+    # used by ps_exp_init+damped squarings). Mean-subtract before bootstrap to
+    # keep |centered| <= TARGET_MAG and avoid the bootstrap_safe scale-down
+    # path (which is rejected at max_user_level).
     t0 = _t()
-    # NOTE: empirical mean=+0.449, max_centered=0.449 (max|slot|≈0.898).
-    # raw bootstrap_safe(max_abs=TARGET_MAG) wraps because max|slot| > 0.5.
-    # raw bootstrap_safe(max_abs=0.9) tries to pre-scale, which is rejected
-    # at max_user_level. Solution: subtract empirical mean plaintext first
-    # (post-squarings mean is deterministic for this prompt/layer), bootstrap
-    # the centered ciphertext (max_centered ≤ TARGET_MAG → no scaling), then
-    # add the mean back. SK-free.
     _PRE_FINSMX_MEAN = 0.4487
     mean_pt_pre = encoder.encode_double_vector(
         ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
@@ -297,49 +281,50 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
     e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
     _rec("bootstrap", t0)
 
-    # ---- mask + finalize_softmax + score*V + mask + replicate. ----
+    # ---- pre-finalize_softmax mask + finalize + score*V (all IRP-native). ----
     t0 = _t()
-    mask_arr = np.zeros(NUM_SLOTS, dtype=np.float64)
-    for tt in range(NUM_TOKENS):
-        for h in range(N_HEADS):
-            mask_arr[tt * D_TOTAL + h * D_HEAD] = 1.0
+    # Zero non-meaningful slots before finalize_softmax. Mask shape: keep
+    # slot[h*D_HEAD*T_MODEL + tok] for h<N_HEADS, tok<NUM_TOKENS.
     e_nominal = e_ct.scale()
-    mask_pt = encoder.encode_double_vector(
-        ctx, mask_arr.tolist(), SCALE, e_ct.chain_index())
+    mask_pt = qkt_irp_mask_scale_plaintext(
+        ctx, encoder, D_HEAD, D_TOTAL, NUM_TOKENS, T_MODEL,
+        1.0, e_ct.chain_index(), SCALE)
     e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
     e_ct = phantom.rescale_to_next(ctx, e_ct)
     e_ct.set_scale(e_nominal)
 
-    weights_ct = phantom.finalize_softmax(
-        ctx, encoder, relin_key, galois_key, e_ct,
-        NUM_SLOTS // D_TOTAL, D_TOTAL, ITERS)
+    # IRP-native softmax: cyclic-broadcast trick (rotate -NUM_TOKENS) makes
+    # sum_reduce_stride(stride=1, count=NUM_TOKENS) broadcast the full per-head
+    # sum to every valid token slot.
+    weights_ct = finalize_softmax_irp_t(
+        ctx, encoder, relin_key, galois_key, e_ct, NUM_TOKENS, ITERS)
 
+    # IRP-native score×V: weights_ct in cyclic-broadcast layout × interleaved
+    # V_cache → stride-T_MODEL output ready for Wo IRP.
     weights_ci = weights_ct.chain_index()
     phantom.mod_switch_to_inplace(ctx, v_ct, weights_ci)
-    sv_mask = score_mask_plaintext(
-        ctx, encoder, D_HEAD, D_TOTAL, NUM_TOKENS, weights_ci, SCALE)
-    attn_h = phantom.score_times_v(
-        ctx, relin_key, galois_key, [weights_ct], [v_ct],
-        sv_mask, D_HEAD, D_TOTAL, NUM_TOKENS)
-
-    b0 = np.zeros(NUM_SLOTS, dtype=np.float64)
-    b0[:D_TOTAL] = 1.0
-    b0_pt = encoder.encode_double_vector(
-        ctx, b0.tolist(), SCALE, attn_h.chain_index())
-    attn_h = phantom.multiply_plain(ctx, attn_h, b0_pt)
-    attn_h = phantom.rescale_to_next(ctx, attn_h)
-    attn_h = phantom.replicate(ctx, galois_key, attn_h, D_TOTAL, NUM_SLOTS)
+    # Score×V output mask consumes one chain level (multiply_plain + rescale).
+    # Output mask lives at the chain after the ct·ct + reduce in score_v_irp,
+    # which is weights_ci + 1 (one rescale inside score_times_v_irp).
+    sv_mask = score_v_irp_output_mask_plaintext(
+        ctx, encoder, D_HEAD, D_TOTAL, T_MODEL,
+        weights_ci + 1, SCALE)
+    attn_irp = score_times_v_irp(
+        ctx, encoder, relin_key, galois_key,
+        weights_ct, v_ct,
+        D_HEAD, D_TOTAL, NUM_TOKENS, T_MODEL,
+        sv_mask)
     _rec("attn_C", t0)
 
-    # ---- shift periodic d_total -> IRP-interleaved at d=d_total. ----
+    # ---- Wo via IRP. attn_irp is already stride-T_MODEL at d=D_TOTAL —
+    # exactly the layout Wo IRP expects, no relayout needed. The Wo IRP
+    # galois keys live at USER_LEVEL_IRP_ATTN (target chain 26); the
+    # incoming attn_irp may be at a shallower chain (smaller user level)
+    # depending on the SDPA depth. mod_switch_to to align if needed. ----
     t0 = _t()
-    attn_irp = relayout_periodic_to_irp(engine, ctx, encoder, sk, attn_h,
-                                          D_TOTAL, D_TOTAL,
-                                          user_level=USER_LEVEL_IRP_ATTN)
-    _rec("layout_shift", t0)
-
-    # ---- Wo via IRP. ----
-    t0 = _t()
+    irp_attn_ci = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
+    if attn_irp.chain_index() < irp_attn_ci:
+        attn_irp = phantom.mod_switch_to(ctx, attn_irp, irp_attn_ci)
     o_ct = irp_matvec_host(ctx, encoder, galois_key, attn_irp, diag_wo_irp,
                       NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE,
                       mask_pt=mask_attn_pt)
@@ -347,18 +332,16 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
 
     # ---- Wo IRP output is stride-t at d=D_TOTAL=D_MODEL: directly compatible
     # with the stride-t residual stream (same stride T_MODEL). No relayout
-    # needed; rescale once to bring the IRP-internal SCALE^2 back to SCALE
-    # (mirrors the gate/up_ct treatment in fhe_mlp_irp_bootstrap). ----
+    # needed; rescale once to bring the IRP-internal SCALE^2 back to SCALE. ----
     t0 = _t()
     o_ct = phantom.rescale_to_next(ctx, o_ct)
     o_ct.set_scale(SCALE)
-    o_periodic = o_ct
     _rec("layout_shift", t0)
-    return o_periodic
+    return o_ct
 
 
 # ============================ MLP forward (IRP + bootstrap) ============================
-def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
+def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             galois_key,
                             x_mid_norm,
                             diag_gate_irp, diag_up_irp, diag_down_irp,
@@ -487,8 +470,10 @@ def main():
     C_per_head = scores_np.max(0) + 0.5
 
     # ---- Step union (full rotation step inventory). ----
-    sdpa_steps = sdpa_required_steps(D_HEAD, D_TOTAL, NUM_TOKENS, NUM_SLOTS)
-    rep_steps  = replicate_required_steps(D_TOTAL, max(NUM_SLOTS, 1 << 15))
+    # Stage-2 IRP-native SDPA: stride-T_MODEL throughout. No periodic relayout
+    # in the decoder, so no replicate_required_steps and the SDPA step inventory
+    # is the IRP-native one (qkt_irp + softmax_irp_t + score_v_irp).
+    sdpa_steps = sdpa_irp_required_steps(D_HEAD, D_TOTAL, NUM_TOKENS, T_MODEL)
     # Stride-t rmsnorm uses {T_MODEL, 2*T_MODEL, ..., (D_MODEL/2)*T_MODEL}
     # instead of {1, 2, ..., D_MODEL/2}.
     rms_steps  = rmsnorm_required_steps_stride_t(D_MODEL, T_MODEL)
@@ -498,7 +483,7 @@ def main():
                                                 baby_steps=BABY_STEPS_IRP_MLP)
     irp_mlp_t_steps = irp_required_steps_rect(NUM_SLOTS, D_PAD_MLP, D_MODEL,
                                                 baby_steps=BABY_STEPS_IRP_MLP)
-    user_steps = sorted(set(list(rms_steps) + list(sdpa_steps) + list(rep_steps)
+    user_steps = sorted(set(list(rms_steps) + list(sdpa_steps)
                             + list(irp_attn_steps) + list(irp_mlp_w_steps)
                             + list(irp_mlp_t_steps)))
 
@@ -514,60 +499,58 @@ def main():
     # Pipeline chain trace (between bootstraps each stage restarts at 16):
     #
     # rms1/rms2 (right after bootstrap at chain 16):
-    #   sum_reduce {1,2,4,...,2048} fire at chain 16 → target=16
-    #   (compute_qkt inner_sum {1,..,64} also fires at 16 → same keys, no extra cost)
+    #   sum_reduce stride-T_MODEL {8,16,...,8192} fire at chain 16 → target=16
+    #   (compute_qkt_irp reduce {8..512} also overlap with rms steps; reduce
+    #    fires at chain ~28 inside Stage A. Min target wins → 16.)
     #
-    # finalize_softmax sum_reduce {4096,8192,16384} (stage C, after bootstrap B→C):
+    # finalize_softmax_irp_t (stage C, after bootstrap B→C):
     #   mask+rescale (1 level) → chain 17; finalize_softmax receives e_ct at chain 17
-    #   sum_reduce fires inside finalize_softmax at chain 17 → target=17
+    #   - rotate(-NUM_TOKENS) cyclic-replica fill at chain 17  → target=17
+    #   - sum_reduce stride=1 {1, 2} at chain 17               → target=17
+    #     ({1, 2} also fire later in score_v reduce at chain 24 — min wins → 17.)
     #
-    # score_times_v in-block broadcast {-1,-2,-4,-8,-16,-32,-64} (stage C):
-    #   finalize_softmax output at chain 17+4=21 (4 Goldschmidt levels) → target=21
-    #
-    # replicate {-4096,-8192,-16384} (stage C, after score_v mask+rescale):
-    #   score_v output chain ~21, mask+rescale(1) → chain 22, replicate fires → target=22
-    #   Use 23 conservatively (one extra level for rounding).
+    # score_times_v_irp broadcast {-T_MODEL*2^s : s<log2(D_HEAD)} (stage C):
+    #   finalize_softmax output at chain 17+6=23 (6 Goldschmidt levels) → target=23
     #
     # IRP-only steps (all 44, both attn and MLP):
-    #   Input re-encrypted at USER_LEVEL_IRP_ATTN=8 → chain 16+8=24 → target=24
+    #   IRP plaintexts encoded for ct at USER_LEVEL_IRP_ATTN=10 → chain 26 → target=26
     #   (All IRP variants — preprocess, babies, giants, reduce — fire at this chain.)
-    #
-    # Memory estimate (size_QP=36, poly=37.7 MB/partition):
-    #   12 × beta_k=3 × 37.7 = 1359 MB   (rms/qkt, target=16)
-    #    3 × beta_k=3 × 37.7 =  340 MB   (finalize, target=17)
-    #    7 × beta_k=2 × 37.7 =  528 MB   (score_v, target=21)
-    #    3 × beta_k=2 × 37.7 =  226 MB   (replicate, target=23)
-    #   44 × beta_k=2 × 37.7 = 3322 MB   (irp-only, target=24)
-    #   Total keys ≈ 5.8 GB + EVK ≈ 19.4 GB → ~25 GB projected.
+    #   compute_qkt_irp Q preprocess {(D_TOTAL-1)*2^s} fires at chain 27 (post-Wq IRP
+    #   mask+rescale); these steps overlap with Wq IRP preprocess → target=26.
 
     FRESHEST_CHAIN = 16    # invariant to NSL for our bootstrap pipeline
-    TARGET_RMS          = FRESHEST_CHAIN        # 16: rms + qkt inner_sum
-    TARGET_FINALIZE     = FRESHEST_CHAIN + 1    # 17: finalize_softmax sum_reduce
-    TARGET_SCORE_V      = FRESHEST_CHAIN + 5    # 21: score_v broadcast (4 Goldschmidt + 1 mask)
-    TARGET_REPLICATE    = FRESHEST_CHAIN + 7    # 23: replicate (score_v out + mask+rescale)
+    TARGET_RMS          = FRESHEST_CHAIN        # 16: rms (positive sum_reduce strides)
+    TARGET_FINALIZE     = FRESHEST_CHAIN + 1    # 17: finalize_softmax cyclic + sum_reduce
+    TARGET_SCORE_V      = FRESHEST_CHAIN + 7    # 23: score_v broadcast (6 Goldschmidt + 1 mask)
     TARGET_IRP          = FRESHEST_CHAIN + USER_LEVEL_IRP_ATTN  # 26: all IRP ops (ul=10)
 
     rms_set      = set(rms_steps)
     sdpa_set     = set(sdpa_steps)
-    rep_set      = set(rep_steps)
     irp_all_set  = set(irp_attn_steps) | set(irp_mlp_w_steps) | set(irp_mlp_t_steps)
-    irp_only_set = irp_all_set - rms_set - sdpa_set - rep_set
+    irp_only_set = irp_all_set - rms_set - sdpa_set
 
-    # Positive SDPA steps: {1,2,...,64} shared with rms (target=16) + {4096,8192,16384} finalize
-    sdpa_finalize_steps = {4096, 8192, 16384}
-    # Negative SDPA steps: {-1,...,-64} score_v broadcast
-    sdpa_score_v_steps  = {-1,-2,-4,-8,-16,-32,-64}
+    # New-pipeline SDPA-only steps:
+    #   {-2^s : s<log2(T_MODEL)} = {-1, -2, -4} : compute_qkt_irp Q preprocess
+    #     fires at chain 16 (post-bootstrap right after Wq IRP) → target 16.
+    #   {-NUM_TOKENS} = {-4}  : finalize_softmax cyclic-replica fires at chain 17.
+    #     Step -4 is shared with Q preprocess; min target wins → 16.
+    #   {1, 2}                : finalize sum_reduce + score_v reduce  (also in
+    #     IRP @ 26); finalize fires at chain 17 → target 17.
+    #   {-T_MODEL*2^s}        : score_v broadcast  (target 23)
+    qkt_q_preprocess_steps = {-int(1 << s) for s in range(int(round(math.log2(T_MODEL))))}
+    sdpa_finalize_steps    = {1, 2}
+    sdpa_score_v_steps     = {-int(T_MODEL * (1 << s)) for s in range(int(round(math.log2(D_HEAD))))}
 
     target_chain_indices = []
     for s in user_steps:
         if s in rms_set:
             target_chain_indices.append(TARGET_RMS)           # 16
+        elif s in qkt_q_preprocess_steps:
+            target_chain_indices.append(TARGET_RMS)           # 16 (post-bootstrap qkt)
         elif s in sdpa_finalize_steps:
             target_chain_indices.append(TARGET_FINALIZE)      # 17
         elif s in sdpa_score_v_steps:
-            target_chain_indices.append(TARGET_SCORE_V)       # 21
-        elif s in rep_set:
-            target_chain_indices.append(TARGET_REPLICATE)     # 23
+            target_chain_indices.append(TARGET_SCORE_V)       # 23
         elif s in irp_only_set:
             target_chain_indices.append(TARGET_IRP)           # 26
         else:
@@ -637,14 +620,21 @@ def main():
     print(f"freshest chain_index={fresh_ci}")
 
     # ---- Encode + encrypt initial vectors at fresh user level. ----
-    # x is in stride-t layout (data at slots 0, T_MODEL, 2*T_MODEL, ...);
-    # k/v stay in periodic d_total layout for the C++ SDPA kernels.
+    # All three ciphertexts share the same interleaved layout:
+    #   x is stride-T_MODEL: x_slot[i*T_MODEL] = embed[P, i]    (i in [0, D_MODEL))
+    #   K/V cache is interleaved across NUM_TOKENS within one ct:
+    #     k_slot[(h*D_HEAD + j)*T_MODEL + tok] = K_full[tok, h, j]
+    #   Tokens beyond NUM_TOKENS in each (h, j) "t-slot" group are zero.
     x_slots = np.zeros(NUM_SLOTS); k_slots = np.zeros(NUM_SLOTS); v_slots = np.zeros(NUM_SLOTS)
     x_slots[::T_MODEL][:D_MODEL] = embed[P]
-    for tt in range(NUM_TOKENS):
-        base = tt*D_TOTAL
-        k_slots[base:base+D_TOTAL] = K_full[tt]
-        v_slots[base:base+D_TOTAL] = V_full[tt]
+    K_full_h = K_full.reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    V_full_h = V_full.reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    for h in range(N_HEADS):
+        for j in range(D_HEAD):
+            base = (h * D_HEAD + j) * T_MODEL
+            for tok in range(NUM_TOKENS):
+                k_slots[base + tok] = K_full_h[tok, h, j]
+                v_slots[base + tok] = V_full_h[tok, h, j]
     x_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, fresh_ci))
     k_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, k_slots.tolist(), SCALE, fresh_ci))
     v_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, v_slots.tolist(), SCALE, fresh_ci))
@@ -777,7 +767,7 @@ def main():
     x_norm = _maybe_boot("attention", x_norm)
     t0 = time.perf_counter()
     attn_out = fhe_attention_irp_bootstrap(
-        engine, ctx, encoder, sk, relin_key, galois_key,
+        engine, ctx, encoder, relin_key, galois_key,
         x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
         k_ct, v_ct, C_per_head, stage_times=stage_times)
     stage_times["attention"] = (time.perf_counter() - t0) * 1000
@@ -801,7 +791,7 @@ def main():
     # MLP: IRP Wgate / Wup / Wdown via host plaintexts.
     t0 = time.perf_counter()
     mlp_out = fhe_mlp_irp_bootstrap(
-        engine, ctx, encoder, sk, relin_key, galois_key,
+        engine, ctx, encoder, relin_key, galois_key,
         x_mid_norm,
         diag_gate_irp, diag_up_irp, diag_down_irp,
         sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,

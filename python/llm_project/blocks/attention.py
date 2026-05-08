@@ -94,6 +94,350 @@ def sdpa_required_steps(d_head: int, d_total: int, num_tokens: int, slot_count: 
     return steps
 
 
+# ---------------------------------------------------------------------------
+# Cachemir interleaved-replicated SDPA (Section 5.1)
+# ---------------------------------------------------------------------------
+#
+# Layout convention (used by compute_qkt_irp / score_times_v_irp /
+# finalize_softmax_irp_t):
+#
+#   Q ciphertext (post-Wq IRP, stride-t = stride-(N/d_total)):
+#     q_slot[(h*d_head + j) * t] = Q[h, j]                 for h<n_heads, j<d_head
+#     all other slots = 0
+#
+#   K cache ciphertext (interleaved across t tokens within one ct, all
+#   n_heads expanded post-GQA):
+#     k_slot[(h*d_head + j) * t + tok] = K_full[tok, h, j] for tok<num_tokens
+#     k_slot[..., tok>=num_tokens] = 0
+#
+#   V cache ciphertext: same layout as K cache.
+#
+#   Attention map ciphertext (after compute_qkt_irp + scale + sub(C)):
+#     scores_slot[h * d_head * t + tok] = m[tok, h]        for h<n_heads, tok<num_tokens
+#     all other slots = 0
+#
+#   Pre-softmax interleaved ct (after exp+squarings+pre-mask, before
+#   finalize_softmax_irp_t): same layout as attention map but with e[tok,h]
+#   in the same valid slots, replicated to slots tok in [0, t) by a single
+#   `-num_tokens` rotate-add so the cyclic sum_reduce broadcasts the full
+#   per-head sum to every valid token slot.
+#
+#   Score×V output (post-mask): stride-t at d=d_total, directly consumable
+#   by Wo IRP (no relayout needed):
+#     attn_slot[(h*d_head + j) * t] = Σ_tok weights[tok,h] * V[tok,h,j]
+#
+# All step builders below assume these conventions.
+
+
+def qkt_irp_required_steps(d_head: int, d_total: int, t: int):
+    """Galois steps for compute_qkt_irp.
+
+    - Q preprocess (PURE replicate Q across t-slots within each t-stride
+      block, i.e. q[i*t + r] = Q[i] for all r in [0, t)):  -2^s for s in
+      [0, log2(t)).  This differs from the IRP preprocess used by Wq IRP,
+      which intermixes diagonals via step (d_total-1)*2^s.
+    - Reduce over j-axis at stride t * 2^s for s in [0, log2(d_head))
+    """
+    if not _is_pow2(d_head) or not _is_pow2(d_total) or not _is_pow2(t):
+        raise ValueError("qkt_irp_required_steps: d_head, d_total, t must be powers of 2")
+    log_t = int(round(math.log2(t)))
+    log_d_head = int(round(math.log2(d_head)))
+    steps = set()
+    for s in range(log_t):
+        steps.add(-int(1 << s))
+    for s in range(log_d_head):
+        steps.add(int(t * (1 << s)))
+    return sorted(steps)
+
+
+def softmax_irp_t_required_steps(num_tokens: int):
+    """Galois steps for finalize_softmax_irp_t.
+
+    - sum_reduce over t-axis at stride 1, count num_tokens: {1, 2, ..., num_tokens/2}
+    - cyclic-replica fill via -num_tokens (one rotation; data lives in 0..num_tokens-1
+      and is replicated to num_tokens..2*num_tokens-1 to make the count=num_tokens
+      cyclic sum broadcast the full sum to every valid token slot).
+    """
+    if not _is_pow2(num_tokens) or num_tokens < 2:
+        raise ValueError("softmax_irp_t_required_steps: num_tokens must be a power of 2 >= 2")
+    steps = set()
+    steps.add(-int(num_tokens))
+    stride = 1
+    while stride < num_tokens:
+        steps.add(int(stride))
+        stride <<= 1
+    return sorted(steps)
+
+
+def score_v_irp_required_steps(d_head: int, num_tokens: int, t: int):
+    """Galois steps for score_times_v_irp.
+
+    - Broadcast weights over j-axis: -t * 2^s for s in [0, log2(d_head))
+    - Cross-token sum over tok-axis: 2^s for s in [0, log2(num_tokens))
+    """
+    if not _is_pow2(d_head) or not _is_pow2(num_tokens) or not _is_pow2(t):
+        raise ValueError("score_v_irp_required_steps: d_head, num_tokens, t must be powers of 2")
+    log_d_head = int(round(math.log2(d_head)))
+    log_num_tokens = int(round(math.log2(num_tokens)))
+    steps = set()
+    for s in range(log_d_head):
+        steps.add(-int(t * (1 << s)))
+    for s in range(log_num_tokens):
+        steps.add(int(1 << s))
+    return sorted(steps)
+
+
+def sdpa_irp_required_steps(d_head: int, d_total: int, num_tokens: int, t: int):
+    """Combined Galois steps for full IRP-native SDPA: QK^T | softmax | score*V."""
+    steps = set()
+    steps.update(qkt_irp_required_steps(d_head, d_total, t))
+    steps.update(softmax_irp_t_required_steps(num_tokens))
+    steps.update(score_v_irp_required_steps(d_head, num_tokens, t))
+    return sorted(steps)
+
+
+# ---------------------------------------------------------------------------
+# IRP-native plaintext mask builders (Cachemir Section 5.1)
+# ---------------------------------------------------------------------------
+
+def _qkt_irp_head_mask_slots(num_slots, d_head, d_total, t, num_tokens, value=1.0):
+    """Slot vector with `value` at slot[h*d_head*t + tok] for h<n_heads, tok<num_tokens."""
+    n_heads = d_total // d_head
+    slots = np.zeros(num_slots, dtype=np.float64)
+    head_block = d_head * t
+    for h in range(n_heads):
+        base = h * head_block
+        for tok in range(num_tokens):
+            idx = base + tok
+            if idx < num_slots:
+                slots[idx] = value
+    return slots
+
+
+def qkt_irp_mask_scale_plaintext(
+    ctx, encoder, d_head: int, d_total: int, num_tokens: int, t: int,
+    scale_value: float, chain_index: int, encode_scale: float,
+):
+    """Mask×scale plaintext for IRP attention map: keep `scale_value` at
+    slot[h*d_head*t + tok] for h<n_heads, tok<num_tokens; zero elsewhere."""
+    num_slots = encoder.slot_count()
+    slots = _qkt_irp_head_mask_slots(num_slots, d_head, d_total, t, num_tokens, scale_value)
+    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+
+
+def qkt_irp_per_head_sub_plaintext(
+    ctx, encoder, d_head: int, d_total: int, num_tokens: int, t: int,
+    c_per_head, chain_index: int, encode_scale: float,
+):
+    """Per-head subtraction plaintext (centering): place c_per_head[h] at
+    slot[h*d_head*t + tok] for h<n_heads, tok<num_tokens."""
+    n_heads = d_total // d_head
+    if len(c_per_head) != n_heads:
+        raise ValueError("qkt_irp_per_head_sub_plaintext: c_per_head length != n_heads")
+    num_slots = encoder.slot_count()
+    slots = np.zeros(num_slots, dtype=np.float64)
+    head_block = d_head * t
+    for h in range(n_heads):
+        base = h * head_block
+        for tok in range(num_tokens):
+            idx = base + tok
+            if idx < num_slots:
+                slots[idx] = c_per_head[h]
+    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+
+
+def score_v_irp_output_mask_plaintext(
+    ctx, encoder, d_head: int, d_total: int, t: int,
+    chain_index: int, encode_scale: float,
+):
+    """Output mask for score_times_v_irp: keep slot[(h*d_head + j)*t] = 1,
+    zero elsewhere. The mask covers the full d_total = n_heads*d_head dims at
+    stride t."""
+    if d_total % d_head != 0:
+        raise ValueError("score_v_irp_output_mask_plaintext: d_total must be a multiple of d_head")
+    num_slots = encoder.slot_count()
+    slots = np.zeros(num_slots, dtype=np.float64)
+    # Stride-t at every i in [0, d_total).
+    for i in range(d_total):
+        idx = i * t
+        if idx < num_slots:
+            slots[idx] = 1.0
+    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+
+
+# ---------------------------------------------------------------------------
+# IRP-native compute_qkt
+# ---------------------------------------------------------------------------
+
+def compute_qkt_irp(
+    ctx, encoder, relin_key, galois_key,
+    q_ct, k_ct,
+    d_head: int, d_total: int, t: int,
+):
+    """QK^T over interleaved-packed Q (stride-t) and K cache (interleaved
+    across t tokens within one ct).
+
+    Returns: ciphertext with attention map at slot[h*d_head*t + tok] = m[tok, h];
+    other slots within each head's d_head*t block hold partial-junk that the
+    caller must mask out (typically fused with the mask*scale step).
+
+    Algorithm (Cachemir §5.1, single K-cache ct case):
+      1. Preprocess Q: log2(t) rotate-adds with step -2^s replicate Q purely
+         across all t-slots within each t-stride block (q[i*t + r] = Q[i] for
+         all r). Note: this is PURE replication, NOT the diagonals-interleave
+         preprocess used inside Wq IRP (which uses step (d-1)*2^s).
+      2. ct·ct multiply Q_pp × K_cache.
+      3. Reduce over j-axis: log2(d_head) rotate-adds with step t*2^s.
+
+    Caller is responsible for: (a) ensuring q_ct and k_ct are at compatible
+    chain levels, (b) applying a head-stride mask + 1/sqrt(d_head) scale
+    after this function (mask is fused with rescale to save a level).
+    """
+    if not _is_pow2(d_head):
+        raise ValueError("compute_qkt_irp: d_head must be a power of 2")
+    if not _is_pow2(d_total):
+        raise ValueError("compute_qkt_irp: d_total must be a power of 2")
+    if not _is_pow2(t):
+        raise ValueError("compute_qkt_irp: t must be a power of 2")
+    log_t = int(round(math.log2(t)))
+    log_d_head = int(round(math.log2(d_head)))
+
+    # 1. Preprocess Q: pure replicate across t-slots via -2^s rotations.
+    q_pp = q_ct
+    for s in range(log_t):
+        rot_amt = -(1 << s)
+        rot_ct = phantom.rotate(ctx, q_pp, int(rot_amt), galois_key)
+        q_pp = phantom.add(ctx, q_pp, rot_ct)
+
+    # 2. ct·ct multiply.
+    nominal = q_pp.scale()
+    prod = phantom.multiply_and_relin(ctx, q_pp, k_ct, relin_key)
+    prod = phantom.rescale_to_next(ctx, prod)
+    prod.set_scale(nominal)
+
+    # 3. Reduce over j-axis.
+    acc = prod
+    for s in range(log_d_head):
+        rot_amt = t * (1 << s)
+        rot_ct = phantom.rotate(ctx, acc, int(rot_amt), galois_key)
+        acc = phantom.add(ctx, acc, rot_ct)
+
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# IRP-native finalize_softmax (replaces phantom.finalize_softmax for stride-t)
+# ---------------------------------------------------------------------------
+
+def finalize_softmax_irp_t(
+    ctx, encoder, relin_key, galois_key,
+    e_ct, num_tokens: int, iters: int,
+):
+    """Cyclic-broadcast softmax for the IRP layout.
+
+    Input layout (post-mask): valid e[tok, h] at slot[h*head_stride + tok]
+    for tok in [0, num_tokens), where head_stride = d_head*t. Slots
+    [num_tokens, t) within each head's first-t-slots are zero.
+
+    Trick: rotate-add by -num_tokens to copy [e0, e1, e2, e3, 0, 0, 0, 0] into
+    [e0, e1, e2, e3, e0, e1, e2, e3]; sum_reduce_stride(stride=1, count=num_tokens)
+    then broadcasts the full per-head sum to every valid token slot via the
+    cyclic shift property. Apply softmax_correct (Goldschmidt) with the
+    broadcast sum.
+
+    Cost: 1 extra negative rotation (step -num_tokens), log2(num_tokens)
+    standard sum-reduce rotations, then `iters` Goldschmidt iterations
+    (2 levels each).
+    """
+    if not _is_pow2(num_tokens) or num_tokens < 2:
+        raise ValueError("finalize_softmax_irp_t: num_tokens must be power of 2 >= 2")
+
+    # Cyclic-replica fill: [e0,...,e_{n-1}, 0,...,0] -> [e0,...,e_{n-1}, e0,...,e_{n-1}].
+    e_replica = phantom.rotate(ctx, e_ct, -int(num_tokens), galois_key)
+    e_cyclic = phantom.add(ctx, e_ct, e_replica)
+
+    # Sum-reduce stride=1, count=num_tokens. Cyclic block of size num_tokens:
+    # every slot in [0, 2*num_tokens) holds the full per-head sum.
+    a = e_cyclic
+    step = 1
+    reach = 1
+    while reach < num_tokens:
+        rot = phantom.rotate(ctx, a, int(step), galois_key)
+        a = phantom.add(ctx, a, rot)
+        step <<= 1
+        reach <<= 1
+
+    # Goldschmidt 1/a iterations via softmax_correct (consumes 2 levels per iter).
+    return phantom.softmax_correct(ctx, encoder, relin_key, e_cyclic, a, iters)
+
+
+# ---------------------------------------------------------------------------
+# IRP-native score_times_v
+# ---------------------------------------------------------------------------
+
+def score_times_v_irp(
+    ctx, encoder, relin_key, galois_key,
+    weights_ct, v_ct,
+    d_head: int, d_total: int, num_tokens: int, t: int,
+    output_mask_pt,
+):
+    """Compute Σ_tok weights[tok, h] * V[tok, h, j] in IRP layout.
+
+    Inputs:
+      weights_ct: post-softmax-cyclic ct with weights[tok, h] at slot
+        [h*d_head*t + tok] AND its cyclic replica at slot [h*d_head*t + (tok+num_tokens)]
+        (this is the natural output of finalize_softmax_irp_t).
+      v_ct: V cache in same interleaved-tokens layout as K cache.
+      output_mask_pt: stride-t mask (1 at slot i*t for i in [0, d_total), else 0)
+        encoded at the chain level resulting after the ct·ct + reduce steps.
+
+    Algorithm (dual of compute_qkt_irp):
+      1. Broadcast weights over j-axis: log2(d_head) rotate-adds with step -t*2^s.
+      2. ct·ct multiply weights_b × V_cache.
+      3. Reduce over tok-axis: log2(num_tokens) rotate-adds with step 2^s.
+      4. Mask at stride t to keep one copy per (h, j); rescale + snap scale.
+
+    Returns: stride-t ciphertext consumable by Wo IRP (slot[(h*d_head+j)*t] = attn[h,j]).
+    """
+    if not _is_pow2(d_head):
+        raise ValueError("score_times_v_irp: d_head must be a power of 2")
+    if not _is_pow2(d_total):
+        raise ValueError("score_times_v_irp: d_total must be a power of 2")
+    if not _is_pow2(num_tokens) or num_tokens < 2:
+        raise ValueError("score_times_v_irp: num_tokens must be power of 2 >= 2")
+    if not _is_pow2(t):
+        raise ValueError("score_times_v_irp: t must be a power of 2")
+    log_d_head = int(round(math.log2(d_head)))
+    log_num_tokens = int(round(math.log2(num_tokens)))
+
+    # 1. Broadcast weights over j-axis (negative-stride add tree).
+    wb = weights_ct
+    for s in range(log_d_head):
+        rot_amt = -int(t * (1 << s))
+        rot_ct = phantom.rotate(ctx, wb, int(rot_amt), galois_key)
+        wb = phantom.add(ctx, wb, rot_ct)
+
+    # 2. ct·ct: wb × V.
+    nominal = wb.scale()
+    prod = phantom.multiply_and_relin(ctx, wb, v_ct, relin_key)
+    prod = phantom.rescale_to_next(ctx, prod)
+    prod.set_scale(nominal)
+
+    # 3. Reduce over tok-axis.
+    acc = prod
+    for s in range(log_num_tokens):
+        rot_amt = 1 << s
+        rot_ct = phantom.rotate(ctx, acc, int(rot_amt), galois_key)
+        acc = phantom.add(ctx, acc, rot_ct)
+
+    # 4. Mask at stride t: keep tok=0 slot per (h, j).
+    nominal = acc.scale()
+    out = phantom.multiply_plain(ctx, acc, output_mask_pt)
+    out = phantom.rescale_to_next(ctx, out)
+    out.set_scale(nominal)
+    return out
+
+
 def attention_forward_required_steps(
     baby_steps: int,
     d_head: int,
