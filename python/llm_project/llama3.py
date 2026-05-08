@@ -1,36 +1,27 @@
 """
-LLaMA-3.1-8B layer-0 single decoder, Stage 2: SK-free decoder body via
-Cachemir-native interleaved-replicated SDPA (compute_qkt_irp +
-finalize_softmax_irp_t + score_times_v_irp). The only sk-touching sites
-are now at boundaries: (1) client-side initial encryption of x/K/V, (2)
-test-harness decrypt of the final output. The relayout decrypt+re-encrypt
-shims used in Stage 1 (relayout_periodic_to_irp / relayout_irp_to_periodic)
-are gone — Q stays in stride-T_MODEL packing through the entire SDPA, and
-the K/V cache uses interleaved-across-tokens packing per Cachemir §5.1.
+LLaMA-3.1-8B layer-0 single decoder. SK-free decoder body: rmsnorm, the
+residual stream, and SDPA all run in stride-T_MODEL / interleaved-replicated
+layout end-to-end, matching the IRP module's native input/output convention.
+The only sk-touching sites are at boundaries — client-side initial
+encryption of x/K/V (`sk.encrypt_symmetric` on the input slot vectors)
+and the test-harness decrypt of the final output.
 
-Cachemir IRP plaintext-encoding swap with per-step galois target chain indices
-to fit on a 32 GB GPU.
-
-The pre-IRP version of this file (BSGS Wq/Wo + complex BSGS Wgate/Wup/Wdown)
-peaked at ~30,580 MiB and OOMed during the first `engine.bootstrap_inplace`.
-This version mirrors `llama3_simulation.py`'s host-stored IRP plaintext
-encoding (Wq, Wo, Wgate, Wup, Wdown) and uses the new
+Cachemir IRP plaintext-encoding swap with per-step galois target chain
+indices to fit on a 32 GB GPU. The pre-IRP attention/MLP plaintext bulk
+(~30 GiB, with BSGS Wq/Wo + complex BSGS Wgate/Wup/Wdown) collapses to
+~3 GiB via host-stored IRP plaintexts. The per-step galois bundle uses
 `CKKSEngineConfig.user_rotation_target_chain_indices` to assign each user
-rotation step the smallest galois key (deepest chain target) compatible with
-its actual call depth. The pre-IRP attention/MLP plaintext bulk (~30 GiB)
-collapses to ~3 GiB; the per-step galois bundle shrinks the engine's static
-GPU footprint by another several GiB.
+rotation step the smallest galois key (deepest chain target) compatible
+with its actual call depth, shrinking the engine's static GPU footprint
+by another several GiB.
 
 Pipeline:
-  rms1 -> bootstrap -> [shift to IRP] -> Wq IRP -> [shift to periodic d_total]
-       -> compute_qkt -> mask*scale -> sub(C[h]) -> bootstrap -> ps_exp + damped sq
-       -> bootstrap -> mask -> finalize_softmax -> score_times_v -> mask + replicate
-       -> [shift to IRP] -> Wo IRP -> [shift to periodic d_model] -> +x_ct (residual1)
-       -> bootstrap -> rms2 -> bootstrap -> [shift to IRP] -> Wgate IRP (wide) -> silu
-                                                          -> Wup IRP (wide) -> ct*ct
-                                                          -> [refresh] -> Wdown IRP (tall)
-                                                          -> [shift to periodic d_model]
-       -> +x_mid (residual2) -> decrypt y_ct
+  rms1 -> bootstrap -> Wq IRP -> compute_qkt_irp -> mask*scale -> sub(C[h])
+       -> bootstrap -> ps_exp + damped sq -> bootstrap -> mask
+       -> finalize_softmax_irp_t -> score_times_v_irp -> Wo IRP
+       -> +x_ct (residual1) -> bootstrap -> rms2 -> bootstrap
+       -> Wgate IRP (wide) -> silu -> Wup IRP (wide) -> ct*ct
+       -> [refresh] -> Wdown IRP (tall) -> +x_mid (residual2) -> decrypt y_ct
 """
 import math
 import sys
