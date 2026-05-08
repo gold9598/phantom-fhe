@@ -92,6 +92,31 @@ namespace phantom {
         int n2 = 4;                            // giant-step count (placeholder)
     };
 
+    // Per-layer KSK slot: either OWNS a generated KSK or DELEGATES to a
+    // canonical owner elsewhere in the BootstrapKey. The fallback pointer is
+    // a non-owning view into another slot's `owned` field; the canonical
+    // owner's lifetime is tied to the same BootstrapKey, so the raw pointer
+    // is safe.
+    //
+    // Canonical-owner principle: for every Galois element used anywhere in
+    // the engine, exactly ONE physical KSK is generated — at the shallowest
+    // chain at which it is needed. Deeper-chain uses register a fallback to
+    // that single canonical KSK. Phantom's keyswitching kernel drops unused
+    // primes at runtime, so a shallower-chain KSK is a superset that serves
+    // all deeper uses (matching the relin-key pattern: relin keys live at
+    // chain 0 and are consumed at every chain).
+    struct PerLayerKSKSlot {
+        PhantomRelinKey owned;              // valid iff fallback == nullptr
+        const PhantomRelinKey* fallback = nullptr; // non-null => use this instead
+
+        // Returns the effective KSK: the fallback if registered, else owned.
+        // The `owned` member is valid even when default-constructed; callers
+        // must only invoke `get()` after the canonical builder has run.
+        const PhantomRelinKey& get() const {
+            return fallback ? *fallback : owned;
+        }
+    };
+
     // BootstrapKey: full key bundle for the four-stage CKKS bootstrap pipeline
     // (ModRaise → C2S → EvalMod → S2C). C2S is filled in this phase; S2C and
     // EvalMod live in later phases.
@@ -101,14 +126,16 @@ namespace phantom {
     //
     //   * `user_galois_keys`: full-Q KSKs for arbitrary user rotations
     //     (called from any user level via `CKKSEngine::rotate_inplace`).
-    //   * `c2s_galois_keys[layer][step]`: KSK for the rotation `step` used
-    //     by C2S layer `layer`, truncated to the chain_index where that
-    //     layer evaluates. C2S layers consume chain indices [first_idx,
-    //     first_idx + num_c2s_layers); the KSK stored here has its
-    //     unused-at-that-level dnum entries dropped.
+    //   * `c2s_galois_keys[layer][step]`: KSK slot for the rotation `step`
+    //     used by C2S layer `layer`. The slot either owns a KSK truncated
+    //     to the chain_index where that layer evaluates, or holds a
+    //     fallback pointer to a canonical owner elsewhere in the bundle
+    //     (see `PerLayerKSKSlot` for the canonical-owner principle).
     //   * `s2c_galois_keys[layer][step]`: same idea for S2C layers, which
     //     evaluate at deeper chain indices and therefore see much larger
     //     dnum savings (size_Ql shrinks → beta_k drops more entries).
+    //     A step that also appears in C2S delegates to the C2S owner
+    //     (shallower chain, superset of primes).
     //
     // The conjugation KSK (Galois elt 2N-1, used between C2S and EvalMod)
     // is kept full-Q under `user_galois_keys` because it's invoked at
@@ -116,8 +143,8 @@ namespace phantom {
     struct BootstrapKey {
         SmallBootstrapKey small;
         PhantomGaloisKey  user_galois_keys;   // full-Q KSKs (user rotations + conjugation)
-        std::vector<std::map<int, PhantomRelinKey>> c2s_galois_keys; // per-layer step → truncated KSK
-        std::vector<std::map<int, PhantomRelinKey>> s2c_galois_keys; // per-layer step → truncated KSK
+        std::vector<std::map<int, PerLayerKSKSlot>> c2s_galois_keys; // per-layer step → owned-or-fallback slot
+        std::vector<std::map<int, PerLayerKSKSlot>> s2c_galois_keys; // per-layer step → owned-or-fallback slot
         PhantomRelinKey   relin_key;          // for EvalMod (Phase 4)
         LinearTransformParams c2s;
         LinearTransformParams s2c;            // empty in Phase 2

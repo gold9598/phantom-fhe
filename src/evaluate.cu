@@ -1664,8 +1664,14 @@ Returns (f, e1, e2) such that
             throw std::invalid_argument("Galois elt not present");
         }
         auto galois_elt_index = std::distance(galois_elts.begin(), iter);
-        apply_galois_with_ksk(context, encrypted, galois_elt,
-                              galois_keys.get_relin_keys(galois_elt_index));
+        // Resolve owned-or-fallback KSK so that bundles built with sparse
+        // ownership (e.g. CKKSEngine sharing C2S/S2C bootstrap KSKs for
+        // overlapping user-rotation steps) work transparently.
+        const PhantomRelinKey* ksk = galois_keys.resolve(galois_elt_index);
+        if (ksk == nullptr) {
+            throw std::invalid_argument("Galois key not present (no owned key, no fallback)");
+        }
+        apply_galois_with_ksk(context, encrypted, galois_elt, *ksk);
     }
 
     void apply_galois_inplace(const PhantomContext &context, PhantomCiphertext &encrypted, size_t galois_elt,

@@ -1030,37 +1030,125 @@ namespace phantom {
             }
         }
 
-        // For each (layer, step) needed by C2S or S2C: generate one full-Q KSK,
-        // truncate it immediately, store in the per-layer map, and free the
-        // full-Q copy. At most one full-Q KSK lives in memory at a time.
+        // Canonical-owner principle: for every step used anywhere in C2S/S2C,
+        // generate exactly ONE physical KSK at the SHALLOWEST chain at which
+        // it is needed. Deeper-chain uses borrow that KSK via a fallback
+        // pointer. Phantom's keyswitch kernel drops unused primes at runtime,
+        // so a shallower-chain KSK is a superset.
         //
-        // A step may appear in multiple layers (same galois_elt, different
-        // chain_index) — each layer gets its own independently truncated copy.
-        auto fill_layer_ksks =
-            [&](const std::vector<std::vector<int>> &per_layer_steps,
-                size_t start_chain_index,
-                std::vector<std::map<int, PhantomRelinKey>> &out) {
-                out.resize(per_layer_steps.size());
+        // Iteration order for canonical assignment:
+        //   1. C2S layers, in order (chain = first_idx + li). C2S layers
+        //      live at the shallowest bootstrap chains.
+        //   2. S2C layers, in order (chain = s2c_start + li). These chains
+        //      are deeper than every C2S chain, so any S2C step that
+        //      collides with a C2S step inherits the C2S owner.
+        // Within each kind we also dedup *across layers of the same kind*:
+        // if step S appears in C2S layer 0 and again in C2S layer 1, layer
+        // 1's slot delegates to layer 0's owner.
+        enum class LayerKind : uint8_t { C2S = 0, S2C = 1 };
+        struct CanonicalLoc {
+            LayerKind kind;
+            size_t layer_idx;
+            int step;
+        };
+        // step (galois_elt_index in fact, but step is unique here) → canonical location.
+        std::map<int, CanonicalLoc> canonical;
+
+        auto register_canonical =
+            [&](LayerKind kind,
+                const std::vector<std::vector<int>> &per_layer_steps) {
                 for (size_t li = 0; li < per_layer_steps.size(); ++li) {
-                    const size_t target_chain = start_chain_index + li;
                     for (int step : per_layer_steps[li]) {
-                        const size_t idx = find_elt_idx(
-                            phantom::util::get_elt_from_step(step, N));
-                        // Generate a KSK directly at this layer's chain_index:
-                        // only `beta_k = ceil(size_Ql / size_P)` partitions
-                        // are emitted (matched to the smaller modulus). This
-                        // replaces the previous "generate full-Q + truncate"
-                        // pattern and produces a per-level fresh KSK whose
-                        // dnum is sized to the consuming level — eliminating
-                        // the residual KSK truncation noise lever.
-                        PhantomRelinKey ksk =
-                            dense_sk.create_one_galois_key(ctx, idx, target_chain);
-                        out[li].emplace(step, std::move(ksk));
+                        if (canonical.find(step) == canonical.end()) {
+                            canonical.emplace(step,
+                                              CanonicalLoc{kind, li, step});
+                        }
                     }
                 }
             };
-        fill_layer_ksks(per_layer_c2s_steps, /*start*/ first_idx, bk.c2s_galois_keys);
-        fill_layer_ksks(per_layer_s2c_steps, /*start*/ s2c_start, bk.s2c_galois_keys);
+        register_canonical(LayerKind::C2S, per_layer_c2s_steps); // shallower first
+        register_canonical(LayerKind::S2C, per_layer_s2c_steps);
+
+        // Two-pass fill:
+        //   Pass 1: walk all (kind, layer, step). At canonical (kind, layer):
+        //           generate the KSK and store as `owned`. Otherwise leave
+        //           the slot empty for now (fallback will be wired in pass 2).
+        //   Pass 2: walk all non-canonical entries and set `fallback` to
+        //           point at the canonical owner's `owned`.
+        // Two passes are required because pass 1 must complete before any
+        // raw pointer into a slot's `owned` is taken — otherwise std::map
+        // rehash/insertion could move existing nodes (it doesn't for
+        // std::map, but treating slots as stable only after pass 1 is the
+        // safer convention).
+        // Use resize (not assign) because the map's value type contains a
+        // non-copyable PhantomRelinKey; assign(size_t, const T&) would
+        // require copy-construction of the empty map.
+        bk.c2s_galois_keys.clear();
+        bk.c2s_galois_keys.resize(per_layer_c2s_steps.size());
+        bk.s2c_galois_keys.clear();
+        bk.s2c_galois_keys.resize(per_layer_s2c_steps.size());
+
+        auto layer_chain = [&](LayerKind kind, size_t li) -> size_t {
+            return (kind == LayerKind::C2S) ? (first_idx + li)
+                                            : (s2c_start + li);
+        };
+        auto layer_map_ptr = [&](LayerKind kind, size_t li)
+            -> std::map<int, PerLayerKSKSlot>* {
+            return (kind == LayerKind::C2S) ? &bk.c2s_galois_keys[li]
+                                            : &bk.s2c_galois_keys[li];
+        };
+
+        // Pass 1: generate exactly one KSK per canonical entry; non-canonical
+        // entries get default-constructed slots (empty `owned`, null fallback).
+        auto fill_layer_pass1 =
+            [&](LayerKind kind,
+                const std::vector<std::vector<int>> &per_layer_steps) {
+                for (size_t li = 0; li < per_layer_steps.size(); ++li) {
+                    auto &out_map = *layer_map_ptr(kind, li);
+                    const size_t target_chain = layer_chain(kind, li);
+                    for (int step : per_layer_steps[li]) {
+                        auto &slot = out_map[step]; // default-construct
+                        const auto &loc = canonical.at(step);
+                        if (loc.kind == kind && loc.layer_idx == li) {
+                            const size_t idx = find_elt_idx(
+                                phantom::util::get_elt_from_step(step, N));
+                            // Generate a KSK directly at this canonical layer's
+                            // chain_index: only `beta_k = ceil(size_Ql/size_P)`
+                            // partitions are emitted, matched to the smaller
+                            // modulus. Deeper-chain layers borrow this same
+                            // KSK at runtime (phantom's keyswitch drops the
+                            // unused primes for them).
+                            slot.owned =
+                                dense_sk.create_one_galois_key(ctx, idx, target_chain);
+                        }
+                        // else: leave slot empty for now; pass 2 wires fallback.
+                    }
+                }
+            };
+        fill_layer_pass1(LayerKind::C2S, per_layer_c2s_steps);
+        fill_layer_pass1(LayerKind::S2C, per_layer_s2c_steps);
+
+        // Pass 2: wire fallback pointers from non-canonical slots → canonical
+        // slot's `owned`. Now safe because pass 1 has populated all canonical
+        // owners.
+        auto fill_layer_pass2 =
+            [&](LayerKind kind,
+                const std::vector<std::vector<int>> &per_layer_steps) {
+                for (size_t li = 0; li < per_layer_steps.size(); ++li) {
+                    auto &out_map = *layer_map_ptr(kind, li);
+                    for (int step : per_layer_steps[li]) {
+                        const auto &loc = canonical.at(step);
+                        if (loc.kind == kind && loc.layer_idx == li) {
+                            continue; // canonical entry — already owns
+                        }
+                        auto &slot = out_map.at(step);
+                        const auto *canon_map = layer_map_ptr(loc.kind, loc.layer_idx);
+                        slot.fallback = &canon_map->at(loc.step).owned;
+                    }
+                }
+            };
+        fill_layer_pass2(LayerKind::C2S, per_layer_c2s_steps);
+        fill_layer_pass2(LayerKind::S2C, per_layer_s2c_steps);
 
         // Build the minimal user bundle (conjugation + user rotation steps only).
         bk.user_galois_keys =
@@ -1106,7 +1194,7 @@ namespace phantom {
     static void apply_linear_transform_inplace(const PhantomContext &ctx,
                                                PhantomCiphertext &ct,
                                                const LinearTransformParams &params,
-                                               const std::vector<std::map<int, PhantomRelinKey>> &per_layer_galois,
+                                               const std::vector<std::map<int, PerLayerKSKSlot>> &per_layer_galois,
                                                const char *who,
                                                bool single_stage = false) {
         const int num_layers = static_cast<int>(params.layers.size());
@@ -1138,7 +1226,10 @@ namespace phantom {
                     throw std::logic_error(
                         std::string(who) + ": missing KSK for step in layer's per-layer map");
                 }
-                return it->second;
+                // Resolve owned-or-fallback: a non-canonical slot delegates
+                // to the canonical owner elsewhere in the BootstrapKey
+                // (shallower-chain superset KSK shared across all uses).
+                return it->second.get();
             };
 
             // Strategy B: expand ALL LightPlaintexts in this layer to full

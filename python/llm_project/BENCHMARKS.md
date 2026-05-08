@@ -8,7 +8,7 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 
 | Total (ms) | rel-RMS | max\|err\| | Peak GPU | Per-layer pt host RAM |
 |---|---|---|---|---|
-| **1916** | 4.9e-4 | 1.7e-4 | 29.4 GiB | 2.8 GiB |
+| **1922** | 5.7e-4 | 1.8e-4 | 22.2 GiB | 2.8 GiB |
 
 Wall time has ±15% run-to-run variance from GPU thermal/scheduling state
 — consistent within a single warm session.
@@ -53,25 +53,40 @@ and reports GPU deltas):
 
 | Component | MiB | % of GPU | Notes |
 |---|---|---|---|
-| CUDA + libcuPhantom (post-import) | ~556 | 1.9% | one-time library load |
-| Engine workspace + relin key | ~226 | 0.8% | NTT precomp, RNS tables, relin keyswitch key (~250 MiB) |
-| **Bootstrap key** | **~15,936** | **54.2%** | C2S + EvalMod + S2C diagonals + bootstrap-internal Galois keys |
-| **69 user-rotation Galois keys** | **~13,408** | **45.6%** | distributed 12@chain16 + 4@17 + 9@21 + 2@23 + 42@26 |
-| ~Sum | ~30,126 | — | probe; production run ~29,358 (allocator variance ~770 MiB) |
+| CUDA + libcuPhantom (post-import) | ~556 | 2.4% | one-time library load |
+| Engine workspace + relin key | ~226 | 1.0% | NTT precomp, RNS tables, relin keyswitch key (~250 MiB) |
+| Bootstrap key | ~10,336 | 45.5% | C2S + EvalMod + S2C diagonals + bootstrap-internal Galois keys |
+| 69 user-rotation Galois keys | ~11,584 | 51.0% | distributed 12@chain16 + 4@17 + 9@21 + 2@23 + 42@26 |
+| **Sum** | **~22,702** | — | post canonical-owner dedup |
 
-The bootstrap key (54%) and user-rotation Galois keys (46%) dominate.
-Diet targets, in priority order:
+### KSK deduplication (canonical-owner principle)
 
-1. **Bootstrap key** — depends on chain-prime sizes. The BootstrapTo17Levels
-   port (see `BOOTSTRAP_TO17_TODO.md`) replaces the standard
-   `[58 | 40×NSL | 58×3 | 58×9 | 29×3 | 58×NSP]` chain with
-   `[40×NSL | 29×1 | 54×12 | 42×1 | 60×NSP]`, using smaller primes for
-   the bootstrap segment. Expected ~25–30% reduction.
-2. **User-rotation Galois keys** — already heavily optimised: 42 of 69 sit
-   at chain 26 (smallest, ~38 MiB each via `target_chain_indices`). The
-   12 rms-stride-T_MODEL steps at chain 16 (~110 MiB each, ~1.3 GiB total)
-   are the main outlier — required at fresh chain because rms runs
-   immediately after bootstrap.
+Every Galois element (rotation step) needed in the engine has exactly
+**one physical KSK**, generated at the shallowest chain that requires it.
+Deeper-chain uses register a non-owning fallback pointer to the canonical
+KSK; phantom's keyswitching kernel drops unused primes at use time. Two
+deduplication passes are layered:
+
+1. **User ↔ bootstrap** (commit `c10d0d2..b35ca2d` and after): 22 of 69
+   user-rotation steps overlap with bootstrap C2S/S2C step sets. The user
+   bundle uses `PhantomGaloisKey::set_fallback`/`resolve` to delegate
+   those slots to the corresponding bootstrap-internal KSK.
+2. **C2S ↔ S2C mirror pairs** (canonical-owner generalization): the C2S
+   and S2C step sets are mirrored at mirrored chains
+   (`C2S[layer i] ↔ S2C[2-i]`, same step values). Each mirror pair shares
+   one KSK at the shallower (C2S) chain via a `PerLayerKSKSlot`'s
+   `fallback` pointer.
+
+Combined effect: total GPU memory drops from ~30.1 GiB (no dedup) to
+~22.2 GiB (-7.4 GiB / -24.6%) with no measurable wall-time impact and
+~10% accuracy variance (bootstrap noise floor amplified by larger
+fallback KSKs at deep-chain uses, but well within tolerance).
+
+Remaining diet target:
+
+- **BootstrapTo17Levels port** (`BOOTSTRAP_TO17_TODO.md`) — replaces the
+  standard chain with a smaller-prime layout for the bootstrap segment.
+  Expected another ~25-30% bootstrap-key reduction.
 
 **Host RAM:** ~2.8 GiB per layer for IRP-encoded weights (Wq, Wo, Wgate,
 Wup, Wdown) staged as `SingleChainPlaintext` on pinned host memory and

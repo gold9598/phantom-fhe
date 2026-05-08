@@ -35,7 +35,9 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <cuComplex.h>
+#include <map>
 #include <stdexcept>
+#include <utility>
 
 namespace phantom {
 
@@ -224,8 +226,29 @@ namespace phantom {
         // a C2S layer AND user rms inner_sum) get classified as bootstrap-only
         // and are MISSING from bk_.user_galois_keys. User-code rotations
         // (e.g. phantom::rotate with bk_.user_galois_keys) then look up an
-        // empty key and produce garbage. Override the user bundle with a
-        // complete one covering conjugation + every configured user step.
+        // empty key and produce garbage.
+        //
+        // Deduplication strategy (saves ~1 GiB at NSL=14, 69-step llama3):
+        //   - For each user step, if a C2S/S2C per-layer map already holds a
+        //     KSK for that step, register a non-owning *fallback pointer*
+        //     into bk_.user_galois_keys instead of generating a fresh KSK.
+        //     The selected fallback is the DEEPEST available (largest
+        //     start_chain_index, smallest beta_k) so the shared key is the
+        //     smallest valid candidate. PhantomGaloisKey::resolve() consults
+        //     fallback_relin_keys_ when the owned slot is empty, keeping
+        //     `phantom::rotate(bk_.user_galois_keys, ...)` transparent for
+        //     external callers.
+        //   - The conjugation key (galois_elt 2N-1, used by bootstrap's
+        //     post-C2S split and by no C2S/S2C layer) stays owned by
+        //     user_galois_keys at full-Q.
+        //
+        // Chain compatibility: keyswitch_inplace derives beta_k from the
+        // ciphertext's chain. A KSK at chain T_ksk has beta_k(T_ksk)
+        // partitions; for a CT at chain T_ct it must have at least
+        // beta_k(T_ct) partitions. Since beta_k is monotone-decreasing in
+        // chain (deeper = fewer primes), choosing the deepest fallback
+        // satisfies T_ksk <= T_user (always true here: bootstrap KSKs live
+        // at chains < freshest_local; user KSKs target chain >= 16).
         std::vector<int> user_steps_actual;
         if (!cfg_.user_rotation_steps.empty()) {
             user_steps_actual = cfg_.user_rotation_steps;
@@ -273,16 +296,65 @@ namespace phantom {
                 throw std::runtime_error(
                     "CKKSEngine: configured galois elt not in registered set");
             };
+
+            // Build a step → canonical-owner map by walking bootstrap C2S/S2C
+            // per-layer slots and resolving each slot via `PerLayerKSKSlot::get()`.
+            // After the canonical-owner dedup in create_bootstrap_key, every
+            // step's KSK is owned at exactly ONE (kind, layer); all other
+            // slots delegate to it via fallback. So whichever slot we observe
+            // first for a given step, `slot.get()` already resolves to the
+            // canonical owner (shallowest-chain KSK = superset of primes).
+            //
+            // Layer chain mapping mirrors create_bootstrap_key:
+            //   c2s[i] at chain = first_idx + i
+            //   s2c[i] at chain = first_idx + num_c2s + kEvalMod_local + i
+            // Iteration order is irrelevant for correctness because all paths
+            // resolve to the same canonical KSK — we still walk c2s-first so
+            // the user fallback registration emits a stable pointer.
+            std::map<int, const PhantomRelinKey*> step_to_fallback;
+            auto try_register =
+                [&](const std::map<int, PerLayerKSKSlot> &layer_map) {
+                    for (const auto &kv : layer_map) {
+                        int step = kv.first;
+                        if (step_to_fallback.find(step) == step_to_fallback.end()) {
+                            // Resolve slot → canonical owner (shallowest-chain
+                            // KSK that covers all uses of this step).
+                            step_to_fallback[step] = &kv.second.get();
+                        }
+                    }
+                };
+            for (const auto &layer_map : bk_.c2s_galois_keys) {
+                try_register(layer_map);
+            }
+            for (const auto &layer_map : bk_.s2c_galois_keys) {
+                try_register(layer_map);
+            }
+
             // Conjugation: bootstrap fires it at C2S-layer depth (chain < freshest);
             // must be full-Q so it covers all relevant chain indices.
             user_indices.push_back(
                 find_idx(static_cast<std::uint32_t>(2 * N - 1)));
             user_target_levels.push_back(0);  // full-Q
-            // Each user rotation step: per-step target if provided, else fresh_local.
+
+            // For each user rotation step: SKIP key generation if a bootstrap
+            // KSK is available (record for fallback registration); else
+            // request a per-level KSK at the configured target.
+            std::vector<std::pair<std::size_t, const PhantomRelinKey*>>
+                fallback_registrations;  // (galois_elt_index, ksk_ptr)
+            std::size_t num_overlap = 0;
             for (std::size_t i = 0; i < user_steps_actual.size(); ++i) {
                 const int step = user_steps_actual[i];
-                user_indices.push_back(find_idx(
-                    phantom::util::get_elt_from_step(step, N)));
+                const std::size_t elt_idx = find_idx(
+                    phantom::util::get_elt_from_step(step, N));
+                auto fb_it = step_to_fallback.find(step);
+                if (fb_it != step_to_fallback.end()) {
+                    // Defer fallback registration until after user_galois_keys
+                    // is constructed (set_fallback writes into the bundle).
+                    fallback_registrations.emplace_back(elt_idx, fb_it->second);
+                    ++num_overlap;
+                    continue;
+                }
+                user_indices.push_back(elt_idx);
                 if (use_per_step_targets) {
                     user_target_levels.push_back(
                         cfg_.user_rotation_target_chain_indices[i]);
@@ -290,8 +362,17 @@ namespace phantom {
                     user_target_levels.push_back(fresh_local);
                 }
             }
+
             bk_.user_galois_keys =
                 sk_->create_galois_keys_per_level(*ctx_, user_indices, user_target_levels);
+
+            // Register non-owning fallback pointers into the bundle so that
+            // `phantom::rotate(bundle, ...)` paths transparently route to
+            // the bootstrap KSK for these steps.
+            for (const auto &reg : fallback_registrations) {
+                bk_.user_galois_keys.set_fallback(reg.first, reg.second);
+            }
+            (void)num_overlap;  // suppress unused-warning when no logging
         }
 
         // Chain-index mapping (num_scale_levels=14, num_special=6):

@@ -235,6 +235,15 @@ class PhantomGaloisKey
 private:
     bool gen_flag_ = false;
     std::vector<PhantomRelinKey> relin_keys_;
+    // Optional non-owning fallback pointers, indexed identically to
+    // `relin_keys_`. If `relin_keys_[idx]` is empty (dnum()==0) but
+    // `fallback_relin_keys_[idx]` is non-null, callers should consume the
+    // fallback KSK instead. Populated by `set_fallback` (used by the CKKS
+    // engine to deduplicate Galois keys whose rotation step also lives in
+    // the bootstrap C2S/S2C per-layer maps). The pointed-to KSK must
+    // outlive this PhantomGaloisKey; the engine ensures this because both
+    // live inside `bk_` for the engine's lifetime.
+    std::vector<const PhantomRelinKey*> fallback_relin_keys_;
 
 public:
     PhantomGaloisKey() = default;
@@ -252,6 +261,30 @@ public:
     [[nodiscard]] auto& get_relin_keys(size_t index) const
     {
         return relin_keys_.at(index);
+    }
+
+    // Resolve KSK for `index`: returns the owned key when populated,
+    // else the registered fallback. Returns nullptr if neither is set.
+    // The fallback path is used by the CKKS engine to share bootstrap
+    // C2S/S2C per-layer KSKs with overlapping user-rotation steps.
+    [[nodiscard]] const PhantomRelinKey* resolve(size_t index) const
+    {
+        if (index < relin_keys_.size() && relin_keys_[index].dnum() > 0)
+            return &relin_keys_[index];
+        if (index < fallback_relin_keys_.size() && fallback_relin_keys_[index])
+            return fallback_relin_keys_[index];
+        return nullptr;
+    }
+
+    // Register a non-owning fallback KSK at `index`. The pointer must
+    // remain valid for the lifetime of this bundle.
+    void set_fallback(size_t index, const PhantomRelinKey* ksk)
+    {
+        if (fallback_relin_keys_.size() < relin_keys_.size())
+            fallback_relin_keys_.resize(relin_keys_.size(), nullptr);
+        if (index >= fallback_relin_keys_.size())
+            throw std::out_of_range("PhantomGaloisKey::set_fallback: index out of range");
+        fallback_relin_keys_[index] = ksk;
     }
 
     void save(std::ostream& stream) const
