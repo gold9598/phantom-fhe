@@ -10,23 +10,33 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 |---|---|---|---|---|---|
 | llama3_simulation — plaintext-shim baseline | 3158 | 9.0e-5 | 1.4e-5 | — | ~30 GiB |
 | llama3 — real EvalMod baseline | 3825 | 2.5e-4 | 6.5e-5 | 30.6 GiB (OOM-edge) | ~30 GiB |
-| llama3 — Cachemir IRP | **1607** | 4.9e-4 | 7.6e-5 | 29.4 GiB | 2.8 GiB |
+| llama3 — Cachemir IRP | **1752** | 6.3e-4 | 1.7e-4 | 29.4 GiB | 2.8 GiB |
 
 **Summary**: ~2.4× total speedup vs real EvalMod baseline, ~10× plaintext
 memory cut, accuracy-preserving. Wall time has ±15% run-to-run variance
 from GPU thermal/scheduling state — consistent within a single warm
 session.
 
-## Per-stage breakdown (Cachemir IRP, 1607 ms)
+## Per-stage breakdown (Cachemir IRP, 1752 ms)
 
 ```
-rms1                20.8 ms
-attention          460.7 ms
-rms2                20.8 ms
-mlp               1104.7 ms
-bootstrap (×5)     826.5 ms
-total             1607.0 ms
+rms1                21.3 ms
+attention          448.8 ms
+rms2                21.3 ms
+mlp               1092.6 ms
+bootstrap (×6)     991.8 ms
+layout_shift        10.5 ms
+total             1752.2 ms
 ```
+
+The residual stream and rmsnorm now operate in stride-t (IRP-native) layout
+end-to-end, eliminating 4 of 6 sk-touching layout-shift call sites. The
+two remaining relayouts (Q→periodic for `compute_qkt`, head-stride
+attn_h→IRP for Wo) are kept until the C++ SDPA kernels (`compute_qkt`,
+`score_times_v`) accept a stride parameter. `rmsnorm_forward_stride_t`
+is a pure-Python port of `phantom.rmsnorm_forward` for stride-t input
+(see `blocks/rmsnorm.py`); the existing C++ kernel is no longer used in
+the inference path.
 
 ### Bootstrap mechanism
 

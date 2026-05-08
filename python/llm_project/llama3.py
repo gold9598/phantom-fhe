@@ -56,7 +56,11 @@ from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
 )
 from blocks.residual import residual
-from blocks.rmsnorm import rmsnorm_forward, rmsnorm_required_steps, setup_rmsnorm_weights
+from blocks.rmsnorm import (
+    rmsnorm_forward, rmsnorm_forward_stride_t,
+    rmsnorm_required_steps, rmsnorm_required_steps_stride_t,
+    setup_rmsnorm_weights,
+)
 
 
 # ============================ Constants ============================
@@ -73,6 +77,12 @@ N_KV_HEADS = 8
 N_KV_GROUPS = N_HEADS // N_KV_HEADS
 D_TOTAL = N_HEADS * D_HEAD
 NUM_TOKENS = 4
+
+# Stride-t residual stream layout (IRP-native): rmsnorm and the residual
+# stream operate on stride-t-packed ciphertexts (data at slots 0, t, 2t, ...
+# and zeros elsewhere) so the IRP input/output sites no longer require sk
+# round-trips. T_MODEL = NUM_SLOTS // D_MODEL = 32768 // 4096 = 8.
+T_MODEL = (1 << (LOG_N - 1)) // D_MODEL  # NUM_SLOTS // D_MODEL = 8
 
 # IRP setup: square IRP for Wq, Wo (d = D_TOTAL = D_MODEL = 4096 here).
 BABY_STEPS_IRP_SQUARE = 16    # K = 512; M*G = 512 -> M=16, G=32
@@ -207,11 +217,14 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
         stage_times.setdefault(name, 0.0)
         stage_times[name] += (time.perf_counter() - t0) * 1000.0
 
-    # ---- shift periodic d_model -> IRP-interleaved at d=d_total. ----
+    # ---- x_norm is already stride-t (rmsnorm_forward_stride_t output);
+    # mod-switch to USER_LEVEL_IRP_ATTN so plaintext masks line up. ----
     t0 = _t()
-    x_irp = relayout_periodic_to_irp(engine, ctx, encoder, sk, x_norm,
-                                       D_MODEL, D_TOTAL,
-                                       user_level=USER_LEVEL_IRP_ATTN)
+    irp_attn_ci = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
+    if x_norm.chain_index() < irp_attn_ci:
+        x_irp = phantom.mod_switch_to(ctx, x_norm, irp_attn_ci)
+    else:
+        x_irp = x_norm
     _rec("layout_shift", t0)
 
     # ---- Wq via IRP. ----
@@ -332,11 +345,14 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
                       mask_pt=mask_attn_pt)
     _rec("wo_irp", t0)
 
-    # ---- shift IRP -> periodic d_model (fresh user-segment chain for residual). ----
+    # ---- Wo IRP output is stride-t at d=D_TOTAL=D_MODEL: directly compatible
+    # with the stride-t residual stream (same stride T_MODEL). No relayout
+    # needed; rescale once to bring the IRP-internal SCALE^2 back to SCALE
+    # (mirrors the gate/up_ct treatment in fhe_mlp_irp_bootstrap). ----
     t0 = _t()
-    o_periodic = relayout_irp_to_periodic(engine, ctx, encoder, sk, o_ct,
-                                            D_TOTAL, D_MODEL,
-                                            user_level=USER_LEVEL_FRESH)
+    o_ct = phantom.rescale_to_next(ctx, o_ct)
+    o_ct.set_scale(SCALE)
+    o_periodic = o_ct
     _rec("layout_shift", t0)
     return o_periodic
 
@@ -354,11 +370,14 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
         stage_times.setdefault(name, 0.0)
         stage_times[name] += (time.perf_counter() - t0) * 1000.0
 
-    # ---- shift periodic d_model -> IRP-interleaved at d=d_model. ----
+    # ---- x_mid_norm is already stride-t (rmsnorm_forward_stride_t output);
+    # mod-switch to USER_LEVEL_IRP_MLP so plaintext masks line up. ----
     t0 = _t()
-    x_irp = relayout_periodic_to_irp(engine, ctx, encoder, sk, x_mid_norm,
-                                       D_MODEL, D_MODEL,
-                                       user_level=USER_LEVEL_IRP_MLP)
+    irp_mlp_ci = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
+    if x_mid_norm.chain_index() < irp_mlp_ci:
+        x_irp = phantom.mod_switch_to(ctx, x_mid_norm, irp_mlp_ci)
+    else:
+        x_irp = x_mid_norm
     _rec("layout_shift", t0)
 
     # ---- gate = Wgate @ x  (rect wide; output in PERMUTED stride-t' layout). ----
@@ -432,11 +451,12 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, sk, relin_key,
                                input_mask_pt=input_mask_pt)
     _rec("mlp_down", t0)
 
-    # ---- shift IRP -> periodic d_model (fresh chain for residual). ----
+    # ---- Wdown IRP output is stride-t at d=D_MODEL: directly compatible with
+    # the stride-t residual stream. Rescale once to bring SCALE^2 -> SCALE. ----
     t0 = _t()
-    out_periodic = relayout_irp_to_periodic(engine, ctx, encoder, sk, out_ct,
-                                              D_MODEL, D_MODEL,
-                                              user_level=USER_LEVEL_FRESH)
+    out_ct = phantom.rescale_to_next(ctx, out_ct)
+    out_ct.set_scale(SCALE)
+    out_periodic = out_ct
     _rec("layout_shift", t0)
     return out_periodic
 
@@ -469,7 +489,9 @@ def main():
     # ---- Step union (full rotation step inventory). ----
     sdpa_steps = sdpa_required_steps(D_HEAD, D_TOTAL, NUM_TOKENS, NUM_SLOTS)
     rep_steps  = replicate_required_steps(D_TOTAL, max(NUM_SLOTS, 1 << 15))
-    rms_steps  = rmsnorm_required_steps(D_MODEL)
+    # Stride-t rmsnorm uses {T_MODEL, 2*T_MODEL, ..., (D_MODEL/2)*T_MODEL}
+    # instead of {1, 2, ..., D_MODEL/2}.
+    rms_steps  = rmsnorm_required_steps_stride_t(D_MODEL, T_MODEL)
     irp_attn_steps = irp_required_steps(NUM_SLOTS, D_TOTAL,
                                           baby_steps=BABY_STEPS_IRP_SQUARE)
     irp_mlp_w_steps = irp_required_steps_rect(NUM_SLOTS, D_MODEL, D_PAD_MLP,
@@ -615,9 +637,10 @@ def main():
     print(f"freshest chain_index={fresh_ci}")
 
     # ---- Encode + encrypt initial vectors at fresh user level. ----
+    # x is in stride-t layout (data at slots 0, T_MODEL, 2*T_MODEL, ...);
+    # k/v stay in periodic d_total layout for the C++ SDPA kernels.
     x_slots = np.zeros(NUM_SLOTS); k_slots = np.zeros(NUM_SLOTS); v_slots = np.zeros(NUM_SLOTS)
-    for k in range(NUM_SLOTS // D_MODEL):
-        x_slots[k*D_MODEL : k*D_MODEL + D_MODEL] = embed[P]
+    x_slots[::T_MODEL][:D_MODEL] = embed[P]
     for tt in range(NUM_TOKENS):
         base = tt*D_TOTAL
         k_slots[base:base+D_TOTAL] = K_full[tt]
@@ -672,8 +695,8 @@ def main():
         return p
     rms1_p = _make_rms_params(RMS1_Z_MIN, RMS1_Z_MAX)
     rms2_p = _make_rms_params(RMS2_Z_MIN, RMS2_Z_MAX)
-    rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, g1.tolist())
-    rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, g2.tolist())
+    rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, g1.tolist(), stride=T_MODEL)
+    rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, g2.tolist(), stride=T_MODEL)
     # ---- Run + measure ----
     print(f"\nLLaMA-3.1-8B layer-0 IRP+bootstrap, prompt='The quick brown fox', query position {P}")
     print(f"FHE config: scale=2^{int(math.log2(SCALE))}  galois_steps={len(user_steps)}")
@@ -699,18 +722,18 @@ def main():
     NSL_MAX = NUM_SCALE_LEVELS - 1   # = 13
     # T_BOOT calibrated from the baseline run (910 ms / 5 calls ≈ 182 ms each).
     T_BOOT_MS = 182.0
+    # With stride-t residual stream the attention/mlp output relayouts to
+    # USER_LEVEL_FRESH are gone; the blocks now end at chain after Wo/Wdown IRP
+    # plus one extra rescale (to bring SCALE^2 back to SCALE). That is
+    # user_level = USER_LEVEL_IRP_*+2 = 12 = NSL_MAX-1. Internal bootstraps
+    # within attention/mlp are still accounted for in their runtime_ms.
+    OUTPUT_LEVEL_AFTER_IRP = USER_LEVEL_IRP_ATTN + 2  # = 12
     placement_table = [
         ("rms1",      7,  29.4, True,  None, True),
-        # attention block ends with relayout_irp_to_periodic(USER_LEVEL_FRESH)
-        # → fresh chain, so output_level = NSL_MAX. Internal bootstraps are
-        # accounted for in the runtime (~ 521 ms incl. 2 internal boot calls).
-        ("attention", 0, 521.0, True,  NSL_MAX, False),
+        ("attention", 0, 521.0, True,  OUTPUT_LEVEL_AFTER_IRP, False),
         ("residual1", 0,   1.0, True,  None, False),
         ("rms2",      7,  27.4, True,  None, True),
-        # mlp block also ends with a free decrypt+re-encrypt to fresh; further,
-        # it starts with one too (so input_level doesn't matter for correctness
-        # — we set requires_fresh_input=False even though tiles touch x_irp).
-        ("mlp",       0, 624.1, True,  NSL_MAX, False),
+        ("mlp",       0, 624.1, True,  OUTPUT_LEVEL_AFTER_IRP, False),
         ("residual2", 0,   1.0, True,  None, False),
     ]
     layers_for_dag = build_layers_from_table(placement_table)
@@ -745,7 +768,8 @@ def main():
     # ---- rms1 ----
     x_ct = _maybe_boot("rms1", x_ct)
     t0 = time.perf_counter()
-    x_norm = rmsnorm_forward(ctx, encoder, relin_key, galois_key, x_ct, rms1_w, rms1_p)
+    x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
+                                       x_ct, rms1_w, rms1_p, t=T_MODEL)
     stage_times["rms1"] = (time.perf_counter() - t0) * 1000
     print(f"  rms1 done. chain={x_norm.chain_index()}")
 
@@ -766,7 +790,8 @@ def main():
     # ---- rms2 ----
     x_mid_ct = _maybe_boot("rms2", x_mid_ct)
     t0 = time.perf_counter()
-    x_mid_norm = rmsnorm_forward(ctx, encoder, relin_key, galois_key, x_mid_ct, rms2_w, rms2_p)
+    x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
+                                           x_mid_ct, rms2_w, rms2_p, t=T_MODEL)
     stage_times["rms2"] = (time.perf_counter() - t0) * 1000
     print(f"  rms2 done. chain={x_mid_norm.chain_index()}")
 
@@ -787,10 +812,15 @@ def main():
     y_ct = residual(ctx, x_mid_ct, mlp_out)
     total_ms = (time.perf_counter() - t_total0) * 1000
 
-    msg_chain = ctx.total_parm_size() - 1
-    phantom.mod_switch_to_inplace(ctx, y_ct, msg_chain)
-    y = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
-                 dtype=np.float64)[:D_MODEL]
+    # In the periodic-relayout pipeline this used to mod_switch_to(msg_chain =
+    # total_parm_size-1, the single q_msg prime sized for post-bootstrap
+    # decoding); without the FRESH relayout we land at chain ~28 which still
+    # has a normal-sized prime and decodes directly with scale=SCALE.
+    print(f"  decrypt y_ct at chain={y_ct.chain_index()} scale={y_ct.scale():.3e}")
+    y_full = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
+                       dtype=np.float64)
+    # y_ct is in stride-T_MODEL layout (data at slots 0, T_MODEL, 2*T_MODEL, ...).
+    y = y_full[::T_MODEL][:D_MODEL]
     err = y - ref_out[P]
     max_err = float(np.abs(err).max())
     rel_rms = float(np.linalg.norm(err) / np.linalg.norm(ref_out[P]))
