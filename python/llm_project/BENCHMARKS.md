@@ -45,19 +45,41 @@ Captured at 0.5 s sampling intervals across one full run on RTX 5090
 - **CUDA runtime + libcuPhantom**: ~556 MiB (one-time library load, before any phantom call)
 - **Engine workspace + Galois + bootstrap keys**: ~28.1 GiB (allocated in `engine ctor`)
 
-### Key-size breakdown
+### Element-by-element breakdown
 
-Differential measurement via `probe_key_sizes.py` (constructs three engine
-variants — no-bootstrap+no-rotations, +bootstrap, +bootstrap+rotations —
-and reports GPU deltas):
+Captured via `cudaMemGetInfo` checkpoints inside the engine ctor and
+`create_bootstrap_key` (instrumentation removed after measurement). Each
+delta = the GPU memory committed by the corresponding allocation step.
 
-| Component | MiB | % of GPU | Notes |
-|---|---|---|---|
-| CUDA + libcuPhantom (post-import) | ~556 | 2.4% | one-time library load |
-| Engine workspace + relin key | ~226 | 1.0% | NTT precomp, RNS tables, relin keyswitch key (~250 MiB) |
-| Bootstrap key | ~10,336 | 45.5% | C2S + EvalMod + S2C diagonals + bootstrap-internal Galois keys |
-| 69 user-rotation Galois keys | ~11,584 | 51.0% | distributed 12@chain16 + 4@17 + 9@21 + 2@23 + 42@26 |
-| **Sum** | **~22,702** | — | post canonical-owner dedup |
+| # | Component | Δ MiB | Cumulative MiB |
+|---|---|---:|---:|
+| 1 | CUDA + libcuPhantom (post-import) | 523 | 523 |
+| 2 | `PhantomContext` (poly tables, NTT precomp, RNS) | +128 | 651 |
+| 3 | `PhantomSecretKey` (dense form on GPU) | +130 | 781 |
+| 4 | `PhantomCKKSEncoder` | +0 | 781 |
+| 5 | `SmallBootstrapKey` (sparse KSKs for ModRaise) | +416 | 1,197 |
+| 6 | EvalMod relin key (K=28 R=3) | +224 | 1,421 |
+| 7 | C2S encoded diagonals (3 layers, chains 1–3) | +32 | 1,453 |
+| 8 | S2C encoded diagonals (3 layers, chains 13–15) | +96 | 1,549 |
+| **9** | **C2S layer Galois KSKs (canonical, 52 keys)** | **+9,376** | **10,925** |
+| 10 | S2C layer Galois KSKs (all fallback to C2S) | +0 | 10,925 |
+| 11 | Transient full-Q `user_galois_keys` inside `create_bootstrap_key` | +8,640 | 19,565 |
+| 12 | Engine ctor override: per-level user keys (replaces #11) | +2,272 net | 21,837 |
+| | **Total** | | **21,837** |
+
+Item 9 — the C2S canonical Galois KSKs — is the single largest contributor
+at ~91% of the bootstrap key. After canonical-owner dedup, every S2C step
+borrows from C2S (item 10 = 0 MiB).
+
+Item 11 is a temporary peak: `bootstrap.cu` builds a full-Q user_galois_keys
+for the 47 non-overlap user steps, then `engine.cu` immediately replaces it
+with a per-level override (item 12). The freed memory is partially reused
+by the override; net new growth is +2,272 MiB.
+
+The remaining diet targets are item 9 (only reducible via BootstrapTo17Levels
+chain swap, which uses smaller primes throughout) and the IRP rotation step
+set (47 owned user steps at chains 17/23/26 — restructuring would mean
+changing the BSGS factorization in the IRP module).
 
 ### KSK deduplication (canonical-owner principle)
 
