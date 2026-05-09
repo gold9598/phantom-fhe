@@ -71,6 +71,77 @@ def _make_rms_params_local(zmin, zmax):
     return p
 
 
+def compute_layer_z_n(x_btd, w, num_tokens, query_position):
+    """num_tokens-aware version of llama3.compute_layer_z (which hardcodes
+    NUM_TOKENS=4). Returns (z_rms1, z_rms2)."""
+    z1 = float((x_btd[query_position] ** 2).mean() + EPSILON)
+    xn = rmsnorm_np(x_btd, w["g1"])
+    Q_full = (xn @ w["Wq"].T).reshape(num_tokens, N_HEADS, D_HEAD)
+    K_full = (xn @ w["Wk"].T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+    V_full = (xn @ w["Wv"].T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+    return z1, None  # rms2 z computed below
+
+
+def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position,
+                            margin=BOOT_CALIB_MARGIN):
+    """num_tokens-aware version of compute_layer_z + compute_layer_max_abs.
+
+    Returns:
+      z1, z2: rmsnorm input variance estimates for rms1 / rms2.
+      max_abs: dict of bootstrap_safe max_abs values for the in-block sites.
+    """
+    g1, g2 = w["g1"], w["g2"]
+    Wq, Wk, Wv, Wo = w["Wq"], w["Wk"], w["Wv"], w["Wo"]
+    Wgate, Wup, Wdown = w["Wgate"], w["Wup"], w["Wdown"]
+    P_q = query_position
+
+    # rms1 input variance
+    z1 = float((x_btd[P_q] ** 2).mean() + EPSILON)
+
+    xn = rmsnorm_np(x_btd, g1)
+    Q_full = (xn @ Wq.T).reshape(num_tokens, N_HEADS, D_HEAD)
+    K_full = (xn @ Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+    V_full = (xn @ Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+    Q_full = apply_rope_np(Q_full, cos_all, sin_all)
+    K_full = apply_rope_np(K_full, cos_all, sin_all)
+    K_full = np.repeat(K_full, N_KV_GROUPS, axis=1)
+    V_full = np.repeat(V_full, N_KV_GROUPS, axis=1)
+    q_max = float(np.abs(Q_full[P_q]).max())
+    scores = np.einsum('hd,thd->ht', Q_full[P_q], K_full) / math.sqrt(D_HEAD)
+    c_per_head = scores.max(0) + 0.5
+    scores_post_C = scores - c_per_head[None, :]
+    scores_max = float(np.abs(scores_post_C).max())
+    weights = np.exp(scores_post_C - scores_post_C.max(-1, keepdims=True))
+    weights = weights / weights.sum(-1, keepdims=True)
+    attn_p = np.einsum('ht,thd->hd', weights, V_full).reshape(N_HEADS * D_HEAD)
+    o_p = attn_p @ Wo.T
+    x_mid_full = x_btd.copy(); x_mid_full[P_q] = x_btd[P_q] + o_p
+    z2 = float((x_mid_full[P_q] ** 2).mean() + EPSILON)
+    x_mid_max = float(np.abs(x_mid_full[P_q]).max())
+    x_mid_n = rmsnorm_np(x_mid_full, g2)
+    rms2_out_max = float(np.abs(x_mid_n[P_q]).max())
+    gate_pre = x_mid_n[P_q] @ Wgate.T
+    gate_max = float(np.abs(gate_pre).max())
+    gate_silu = silu_np(gate_pre)
+    up = x_mid_n[P_q] @ Wup.T
+    up_max = float(np.abs(up).max())
+    h = gate_silu * up
+    h_max = float(np.abs(h).max())
+
+    max_abs = {
+        "x_in":     float(np.abs(x_btd[P_q]).max()) * margin,
+        "rms1_out": float(np.abs(xn[P_q]).max()) * margin,
+        "x_mid":    x_mid_max * margin,
+        "rms2_out": rms2_out_max * margin,
+        "q":        q_max * margin,
+        "scores":   scores_max * margin,
+        "gate":     gate_max * margin,
+        "up":       up_max * margin,
+        "h":        h_max * margin,
+    }
+    return z1, z2, max_abs
+
+
 def build_user_steps_mrpc():
     """Galois rotation steps needed for the multi-ct MRPC pipeline at
     NUM_TOKENS_PER_BLOCK=T_MODEL=8."""
@@ -119,7 +190,7 @@ def setup_engine(user_steps, target_chain_default):
 
 
 def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
-                                 num_tokens, cos_all, sin_all):
+                                 num_tokens, cos_all, sin_all, query_position):
     """Compute K, V at all NUM_TOKENS positions, RoPE, pack into n_blocks
     slot vectors, encrypt. Also encrypt x at query position P.
 
@@ -143,7 +214,7 @@ def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
     K_full_h = np.repeat(K, N_KV_GROUPS, axis=1)  # (num_tokens, N_HEADS, D_HEAD)
     V_full_h = np.repeat(V, N_KV_GROUPS, axis=1)
 
-    Q_np = (xn[P] @ Wq_baked.T).reshape(N_HEADS, D_HEAD)
+    Q_np = (xn[query_position] @ Wq_baked.T).reshape(N_HEADS, D_HEAD)
     scores_np = np.einsum('hd,thd->th', Q_np, K_full_h) / math.sqrt(D_HEAD)
     c_per_head = scores_np.max(0) + 0.5
 
@@ -157,7 +228,7 @@ def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
         for vb in v_blocks_slots]
 
     x_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-    x_slots[::T_MODEL][:D_MODEL] = x_btd[P]
+    x_slots[::T_MODEL][:D_MODEL] = x_btd[query_position]
     x_ct = sk.encrypt_symmetric(ctx,
         encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, fresh_ci))
 
@@ -311,27 +382,27 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     return o_ct
 
 
-def main():
-    """Stage 3b-f-1 sanity: NUM_TOKENS=4 (single block, n_blocks=1).
-    Same prompt as the existing llama3.py: [BOS, "The", " quick", " brown"].
+def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
+                         cos_all_full, sin_all_full, label="prompt"):
+    """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
+
+    Args:
+      num_tokens: actual number of tokens in the prompt (NUM_TOKENS).
+      query_position: position to query for next-token logit (typically num_tokens-1).
+      pytorch_ref: (33, num_tokens, D_MODEL) per-layer hidden states from PyTorch.
+      pytorch_pre_norm: (num_tokens, D_MODEL) pre-final-norm last hidden state.
+      cos_all_full / sin_all_full: RoPE tables of shape (>=num_tokens, D_HEAD).
+      label: short string for printing.
     """
-    print("=== Stage 3b-f-1: end-to-end MRPC FHE on 4-token sanity prompt ===")
-    NUM_TOKENS = 4
+    print(f"=== run_classifier_fhe: {label}, NUM_TOKENS={num_tokens}, P={query_position} ===")
+    P_local = query_position
+    cos_all = cos_all_full[:num_tokens]
+    sin_all = sin_all_full[:num_tokens]
+    R_P = rope_matrix_np(cos_all[P_local], sin_all[P_local])
 
-    # ---- Probe v1: 4-token embed + RoPE
-    L = lambda n: np.load(f"{PROBE}/{n}.npy")
-    cos_all = L("rope_cos")
-    sin_all = L("rope_sin")
-    R_P = rope_matrix_np(cos_all[P], sin_all[P])
-
-    # ---- PyTorch reference activations + LM head data
-    pytorch_pre_norm = np.load(f"{PROBE_FULL}/ref_acts/qbrown4_bos_prenorm.npy").astype(np.float64)  # (4, D_MODEL)
-    pytorch_ref = np.load(f"{PROBE_FULL}/ref_acts/qbrown4_bos.npy").astype(np.float64)  # (33, 4, D_MODEL)
     final_norm_g = np.load(f"{PROBE_FULL}/final_norm_g.npy").astype(np.float64)
     lm_head_yesno = np.load(f"{PROBE_FULL}/lm_head_yesno.npy").astype(np.float64)
     meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
-    yes_id = meta["yes_token_id"]
-    no_id = meta["no_token_id"]
 
     # ---- Engine
     user_steps = build_user_steps_mrpc()
@@ -393,10 +464,9 @@ def main():
         Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
             encode_layer_irps(ctx, encoder, w, R_P)
 
-        # Per-layer rmsnorm calibration
-        z1_l, z2_l = compute_layer_z(x_btd, w["g1"], w["g2"],
-                                       w["Wq"], w["Wk"], w["Wv"], w["Wo"],
-                                       cos_all, sin_all, P)
+        # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware)
+        z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
+            x_btd, w, cos_all, sin_all, num_tokens, P_local)
         z1_min, z1_max = rms_z_window(z1_l)
         z2_min, z2_max = rms_z_window(z2_l)
         rms1_p = _make_rms_params_local(z1_min, z1_max)
@@ -404,15 +474,13 @@ def main():
         rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, w["g1"].tolist(), stride=T_MODEL)
         rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, w["g2"].tolist(), stride=T_MODEL)
 
-        # Per-layer bootstrap_safe + silu calibration
-        max_abs_calib = compute_layer_max_abs(x_btd, w, cos_all, sin_all, P)
         silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN
         silu_coeffs = fit_silu_coeffs((-silu_max * 1.2, silu_max * 1.2), deg=14)
 
         # Encrypt inputs (multi-ct K, V)
         x_ct, k_cts, v_cts, c_per_head, _ = encrypt_layer_inputs_multi(
             ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
-            NUM_TOKENS, cos_all, sin_all)
+            num_tokens, cos_all, sin_all, P_local)
 
         # ---- FHE forward through one decoder layer ----
         # rms1
@@ -431,7 +499,7 @@ def main():
             engine, ctx, encoder, relin_key, galois_key, sk,
             x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
             k_cts, v_cts, c_per_head,
-            NUM_TOKENS, max_abs_calib, hf_mask_slots)
+            num_tokens, max_abs_calib, hf_mask_slots)
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
         # rms2
@@ -462,9 +530,9 @@ def main():
                            dtype=np.float64)
         y_p = y_full[::T_MODEL][:D_MODEL]
         if layer_idx < NUM_DECODERS - 1:
-            ref = pytorch_ref[layer_idx + 1, P]
+            ref = pytorch_ref[layer_idx + 1, P_local]
         else:
-            ref = pytorch_pre_norm[P]  # pre-final-norm for L=31
+            ref = pytorch_pre_norm[P_local]  # pre-final-norm for L=31
         max_err = float(np.abs(y_p - ref).max())
         rel_rms = float(np.linalg.norm(y_p - ref) / np.linalg.norm(ref))
         print(f"  Layer {layer_idx:2d}: ‖y_fhe‖={np.linalg.norm(y_p):.4f}  "
@@ -473,23 +541,119 @@ def main():
         y_p_fhe = y_p
 
     # ---- LM head (host-side)
-    print("\n--- LM head (host-side) ---")
     yes_logit, no_logit = yes_no_logits_np(y_p_fhe, final_norm_g, lm_head_yesno,
                                               eps=meta["rms_norm_eps"])
-    print(f"  FHE yes_logit = {yes_logit:.4f}")
-    print(f"  FHE no_logit  = {no_logit:.4f}")
-
-    # PyTorch reference (computed once in test_lm_head)
-    yes_pt_ref, no_pt_ref = 0.9551, 3.2324
-    print(f"  PT  yes_logit = {yes_pt_ref:.4f}")
-    print(f"  PT  no_logit  = {no_pt_ref:.4f}")
-    print(f"  diff yes={abs(yes_logit-yes_pt_ref):.3e}  no={abs(no_logit-no_pt_ref):.3e}")
-    print(f"  pred FHE: {'Yes' if yes_logit > no_logit else 'No'}  "
-          f"PT: {'Yes' if yes_pt_ref > no_pt_ref else 'No'}")
-
-    print(f"\n--- Total layer time: {sum(layer_times)/1000:.1f}s "
+    print(f"\n--- LM head: FHE yes_logit={yes_logit:.4f}  no_logit={no_logit:.4f} ---")
+    print(f"--- Total layer time: {sum(layer_times)/1000:.1f}s "
           f"(avg {sum(layer_times)/len(layer_times):.0f}ms/layer) ---")
+    return yes_logit, no_logit
+
+
+def capture_pytorch_ref(token_ids):
+    """Run PyTorch LLaMA-3.1-8B forward on token_ids and capture all hidden
+    states + the pre-final-norm last hidden state. Returns:
+      pytorch_ref:      (n_layers+1, num_tokens, D_MODEL) post-final-norm at idx -1
+      pytorch_pre_norm: (num_tokens, D_MODEL) — pre-final-norm last hidden state
+      yes_logit, no_logit: PyTorch reference logits at the last token position
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+    print(f"  Loading PyTorch model (fp16)...")
+    t0 = time.perf_counter()
+    model = AutoModelForCausalLM.from_pretrained("NousResearch/Meta-Llama-3.1-8B",
+                                                  dtype=torch.float16, device_map="cuda:0")
+    model.eval()
+    print(f"  loaded in {time.perf_counter()-t0:.1f}s")
+    input_ids = torch.tensor([token_ids], device="cuda:0")
+    pre_norm_capture = {}
+    h = model.model.norm.register_forward_pre_hook(
+        lambda m, i: (pre_norm_capture.update(x=i[0].clone()), None)[1])
+    with torch.no_grad():
+        out = model(input_ids=input_ids, output_hidden_states=True)
+    h.remove()
+    pytorch_ref = np.stack([
+        h_.squeeze(0).detach().cpu().to(torch.float32).numpy().astype(np.float64)
+        for h_ in out.hidden_states
+    ], axis=0)
+    pytorch_pre_norm = pre_norm_capture['x'].squeeze(0).detach().cpu().to(torch.float32).numpy().astype(np.float64)
+    last_logits = out.logits[0, -1].to(torch.float32).cpu().numpy()
+    meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
+    yes_pt = float(last_logits[meta["yes_token_id"]])
+    no_pt = float(last_logits[meta["no_token_id"]])
+    del model
+    torch.cuda.empty_cache()
+    return pytorch_ref, pytorch_pre_norm, yes_pt, no_pt
+
+
+def run_mrpc_example(idx):
+    """Tokenize MRPC dev example #idx, run FHE pipeline, compare to PyTorch."""
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    print(f"--- run_mrpc_example idx={idx} ---")
+    tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
+    ds = load_dataset("nyu-mll/glue", "mrpc")["validation"]
+    row = ds[idx]
+    PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
+                  "Sentence 1: {s1}\nSentence 2: {s2}\n"
+                  "Answer (Yes or No):")
+    prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
+    token_ids = tok(prompt).input_ids
+    num_tokens = len(token_ids)
+    P_local = num_tokens - 1
+    print(f"  num_tokens={num_tokens}  label={row['label']}")
+    print(f"  s1={row['sentence1']!r}")
+    print(f"  s2={row['sentence2']!r}")
+
+    # PyTorch reference
+    pytorch_ref, pytorch_pre_norm, yes_pt, no_pt = capture_pytorch_ref(token_ids)
+    print(f"  PT  yes_logit={yes_pt:.4f}  no_logit={no_pt:.4f}")
+    pt_pred = "Yes" if yes_pt > no_pt else "No"
+
+    # RoPE tables for the prompt's positions
+    cos_all_full = np.load(f"{PROBE_FULL}/rope_cos.npy").astype(np.float64)
+    sin_all_full = np.load(f"{PROBE_FULL}/rope_sin.npy").astype(np.float64)
+
+    yes_logit, no_logit = run_classifier_fhe(
+        num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
+        cos_all_full, sin_all_full, label=f"mrpc_{idx}")
+    fhe_pred = "Yes" if yes_logit > no_logit else "No"
+    print(f"\n=== Stage 3b-f-2 result ===")
+    print(f"  FHE yes={yes_logit:.4f}  no={no_logit:.4f}  pred={fhe_pred}")
+    print(f"  PT  yes={yes_pt:.4f}  no={no_pt:.4f}  pred={pt_pred}")
+    print(f"  diff yes={abs(yes_logit-yes_pt):.3e}  no={abs(no_logit-no_pt):.3e}")
+    print(f"  prediction agrees: {fhe_pred == pt_pred}")
+
+
+def main_4tok():
+    """Stage 3b-f-1 sanity: 4-token "[BOS] The quick brown" via the same
+    pipeline. Loads the precomputed pytorch_ref / pre_norm from probe v2
+    rather than re-running PyTorch."""
+    print("=== main_4tok: 4-token sanity ===")
+    cos_all_full = np.load(f"{PROBE}/rope_cos.npy").astype(np.float64)
+    sin_all_full = np.load(f"{PROBE}/rope_sin.npy").astype(np.float64)
+    pytorch_ref = np.load(f"{PROBE_FULL}/ref_acts/qbrown4_bos.npy").astype(np.float64)
+    pytorch_pre_norm = np.load(f"{PROBE_FULL}/ref_acts/qbrown4_bos_prenorm.npy").astype(np.float64)
+    yes_logit, no_logit = run_classifier_fhe(
+        num_tokens=4, query_position=3,
+        pytorch_ref=pytorch_ref, pytorch_pre_norm=pytorch_pre_norm,
+        cos_all_full=cos_all_full, sin_all_full=sin_all_full,
+        label="qbrown4")
+    print(f"\n=== main_4tok result ===")
+    print(f"  FHE yes={yes_logit:.4f}  no={no_logit:.4f}  "
+          f"pred={'Yes' if yes_logit > no_logit else 'No'}")
+    yes_pt_ref, no_pt_ref = 0.9551, 3.2324
+    print(f"  PT  yes={yes_pt_ref:.4f}  no={no_pt_ref:.4f}  "
+          f"pred={'Yes' if yes_pt_ref > no_pt_ref else 'No'}")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="mrpc", choices=["mrpc", "qbrown4"])
+    ap.add_argument("--idx", type=int, default=359,
+                    help="MRPC dev example index (default: 359 — 44-token shortest)")
+    args = ap.parse_args()
+    if args.mode == "qbrown4":
+        main_4tok()
+    else:
+        run_mrpc_example(args.idx)
