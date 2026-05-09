@@ -102,8 +102,7 @@ ITERS = 6
 TARGET_MAG = 0.45
 
 RMS_POLY_DEG = 4
-RMS1_Z_MIN, RMS1_Z_MAX = 8e-5, 1.3e-4
-RMS2_Z_MIN, RMS2_Z_MAX = 1.4e-4, 2.1e-4
+RMS_Z_MARGIN = 0.30  # ±30% multiplicative window for per-layer z calibration
 
 # CKKSEngine layout.
 # num_scale_levels=14 → size_Q = 1+14+3+9+3 = 30, 30/6=5 chunks ✓
@@ -165,6 +164,181 @@ def rope_matrix_np(cos_p, sin_p):
         M[h + i, h + i] = cos_p[h + i]
         M[h + i, i]     = sin_p[h + i]
     return M
+
+def silu_np(x): return x * (1.0 / (1.0 + np.exp(-x)))
+
+def rms_z_window(z):
+    """Symmetric multiplicative window around z."""
+    return (z * (1.0 - RMS_Z_MARGIN), z * (1.0 + RMS_Z_MARGIN))
+
+def compute_layer_z(x_btd, g1, g2, Wq, Wk, Wv, Wo, cos_all, sin_all, P):
+    """Return (z_rms1, z_rms2) — the mean(x²)+EPSILON values that the rms1
+    and rms2 polynomials must cover for this layer's query position P."""
+    z1 = float((x_btd[P]**2).mean() + EPSILON)
+    xn = rmsnorm_np(x_btd, g1)
+    Q_full = (xn @ Wq.T).reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    K_full = (xn @ Wk.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    V_full = (xn @ Wv.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    Q_full = apply_rope_np(Q_full, cos_all, sin_all)
+    K_full = apply_rope_np(K_full, cos_all, sin_all)
+    K_full = np.repeat(K_full, N_KV_GROUPS, axis=1)
+    V_full = np.repeat(V_full, N_KV_GROUPS, axis=1)
+    Q_p = Q_full[P]
+    scores_p = np.einsum('hd,thd->ht', Q_p, K_full) / math.sqrt(D_HEAD)
+    w_p = np.exp(scores_p - scores_p.max(-1, keepdims=True))
+    w_p = w_p / w_p.sum(-1, keepdims=True)
+    attn_p = np.einsum('ht,thd->hd', w_p, V_full).reshape(N_HEADS * D_HEAD)
+    o_p = attn_p @ Wo.T
+    x_mid_P = x_btd[P] + o_p
+    z2 = float((x_mid_P**2).mean() + EPSILON)
+    return z1, z2
+
+def forward_decoder_np(x_btd, g1, g2, Wq, Wk, Wv, Wo, Wgate, Wup, Wdown,
+                        cos_all, sin_all, P):
+    """Exact numpy decoder forward. Returns y_btd [NUM_TOKENS, D_MODEL].
+    Only y_btd[P] is the full decoded output; other rows are passthroughs."""
+    xn = rmsnorm_np(x_btd, g1)
+    Q_full = (xn @ Wq.T).reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    K_full = (xn @ Wk.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    V_full = (xn @ Wv.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    Q_full = apply_rope_np(Q_full, cos_all, sin_all)
+    K_full = apply_rope_np(K_full, cos_all, sin_all)
+    K_full = np.repeat(K_full, N_KV_GROUPS, axis=1)  # [NUM_TOKENS, N_HEADS, D_HEAD]
+    V_full = np.repeat(V_full, N_KV_GROUPS, axis=1)
+    Q_p = Q_full[P]  # [N_HEADS, D_HEAD]
+    scores_p = np.einsum('hd,thd->ht', Q_p, K_full) / math.sqrt(D_HEAD)
+    w_p = np.exp(scores_p - scores_p.max(-1, keepdims=True))
+    w_p = w_p / w_p.sum(-1, keepdims=True)  # [N_HEADS, NUM_TOKENS]
+    attn_p = np.einsum('ht,thd->hd', w_p, V_full).reshape(N_HEADS * D_HEAD)
+    o_p = attn_p @ Wo.T  # [D_MODEL]
+    x_mid = x_btd.copy(); x_mid[P] = x_btd[P] + o_p
+    x_mid_n = rmsnorm_np(x_mid, g2)
+    gate = silu_np(x_mid_n @ Wgate.T)
+    up = x_mid_n @ Wup.T
+    h = gate * up
+    out = h @ Wdown.T  # [NUM_TOKENS, D_MODEL]
+    y = x_mid.copy(); y[P] = x_mid[P] + out[P]
+    return y
+
+def encrypt_layer_inputs(ctx, encoder, sk, fresh_ci, x_btd, g1, Wq_baked, Wk, Wv,
+                          cos_all, sin_all, P):
+    """Build and encrypt x_ct/k_ct/v_ct and compute c_per_head for a decoder layer."""
+    xn = rmsnorm_np(x_btd, g1)
+    K = (xn @ Wk.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    V = (xn @ Wv.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    K = apply_rope_np(K, cos_all, sin_all)
+    K_full = np.repeat(K, N_KV_GROUPS, axis=1).reshape(NUM_TOKENS, D_TOTAL)
+    V_full = np.repeat(V, N_KV_GROUPS, axis=1).reshape(NUM_TOKENS, D_TOTAL)
+    Q_np = (xn[P] @ Wq_baked.T).reshape(N_HEADS, D_HEAD)
+    K_full_h = K_full.reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    scores_np = (Q_np[None, :, :] * K_full_h).sum(-1) / math.sqrt(D_HEAD)
+    c_per_head = scores_np.max(0) + 0.5
+    x_slots = np.zeros(NUM_SLOTS); k_slots = np.zeros(NUM_SLOTS); v_slots = np.zeros(NUM_SLOTS)
+    x_slots[::T_MODEL][:D_MODEL] = x_btd[P]
+    K_full_h2 = K_full.reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    V_full_h2 = V_full.reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    for h_idx in range(N_HEADS):
+        for j in range(D_HEAD):
+            base = (h_idx * D_HEAD + j) * T_MODEL
+            for tok in range(NUM_TOKENS):
+                k_slots[base + tok] = K_full_h2[tok, h_idx, j]
+                v_slots[base + tok] = V_full_h2[tok, h_idx, j]
+    x_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, fresh_ci))
+    k_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, k_slots.tolist(), SCALE, fresh_ci))
+    v_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, v_slots.tolist(), SCALE, fresh_ci))
+    return x_ct, k_ct, v_ct, c_per_head
+
+def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
+                    x_ct, k_ct, v_ct, c_per_head,
+                    diag_wq_irp, diag_wo_irp, mask_attn_pt,
+                    diag_gate_irp, diag_up_irp, diag_down_irp,
+                    sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+                    rms1_w, rms2_w, rms1_p, rms2_p,
+                    boot_before, label="layer"):
+    """Run one decoder layer in FHE. Returns (y_full_np, total_ms, stage_times).
+    y_full_np is the decrypted output in stride-T_MODEL layout."""
+    stage_times = {}
+    stage_times.setdefault("bootstrap", 0.0)
+
+    _BOOT_MAX_ABS = {
+        "rms1": 1.0,
+        "attention": 1.0,
+        "rms2": 1.0,
+        "mlp": 1.0,
+    }
+
+    def _maybe_boot(name, ct):
+        if not boot_before.get(name, False):
+            return ct
+        t0 = time.perf_counter()
+        ct = bootstrap_safe(engine, ctx, encoder, ct,
+                            max_abs=_BOOT_MAX_ABS[name], slot_count=NUM_SLOTS)
+        stage_times["bootstrap"] += (time.perf_counter() - t0) * 1000
+        print(f"  [plan] bootstrap before {name}: chain={ct.chain_index()}")
+        return ct
+
+    t_total0 = time.perf_counter()
+
+    # rms1
+    x_ct = _maybe_boot("rms1", x_ct)
+    t0 = time.perf_counter()
+    x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
+                                       x_ct, rms1_w, rms1_p, t=T_MODEL)
+    stage_times["rms1"] = (time.perf_counter() - t0) * 1000
+    print(f"  rms1 done. chain={x_norm.chain_index()}")
+
+    # attention
+    x_norm = _maybe_boot("attention", x_norm)
+    t0 = time.perf_counter()
+    attn_out = fhe_attention_irp_bootstrap(
+        engine, ctx, encoder, relin_key, galois_key,
+        x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
+        k_ct, v_ct, c_per_head, stage_times=stage_times)
+    stage_times["attention"] = (time.perf_counter() - t0) * 1000
+    print(f"  attention done. chain={attn_out.chain_index()}")
+
+    # residual1
+    x_mid_ct = residual(ctx, x_ct, attn_out)
+    print(f"  residual1 done. chain={x_mid_ct.chain_index()}")
+
+    # rms2
+    x_mid_ct = _maybe_boot("rms2", x_mid_ct)
+    t0 = time.perf_counter()
+    x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
+                                           x_mid_ct, rms2_w, rms2_p, t=T_MODEL)
+    stage_times["rms2"] = (time.perf_counter() - t0) * 1000
+    print(f"  rms2 done. chain={x_mid_norm.chain_index()}")
+
+    # mlp
+    x_mid_norm = _maybe_boot("mlp", x_mid_norm)
+    t0 = time.perf_counter()
+    mlp_out = fhe_mlp_irp_bootstrap(
+        engine, ctx, encoder, relin_key, galois_key,
+        x_mid_norm,
+        diag_gate_irp, diag_up_irp, diag_down_irp,
+        sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+        stage_times=stage_times)
+    stage_times["mlp"] = (time.perf_counter() - t0) * 1000
+    print(f"  mlp done. chain={mlp_out.chain_index()}")
+
+    y_ct = residual(ctx, x_mid_ct, mlp_out)
+    total_ms = (time.perf_counter() - t_total0) * 1000
+
+    print(f"  decrypt y_ct at chain={y_ct.chain_index()} scale={y_ct.scale():.3e}")
+    y_full = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
+                       dtype=np.float64)
+
+    main_keys = ["rms1", "attention", "rms2", "mlp", "bootstrap"]
+    print(f"Per-stage runtime (ms) [{label}]:")
+    for k in main_keys:
+        if k in stage_times:
+            print(f"  {k:30s} {stage_times[k]:8.1f}")
+    sub_keys = sorted(k for k in stage_times if k not in main_keys)
+    for k in sub_keys:
+        print(f"    {k:30s} {stage_times[k]:8.1f}")
+    print(f"  {'total':30s} {total_ms:8.1f}")
+
+    return y_full, total_ms, stage_times
 
 
 # ============================ Attention forward (IRP + bootstrap) ============================
@@ -677,10 +851,6 @@ def main():
         p.z_max      = zmax
         p.poly_degree = RMS_POLY_DEG
         return p
-    rms1_p = _make_rms_params(RMS1_Z_MIN, RMS1_Z_MAX)
-    rms2_p = _make_rms_params(RMS2_Z_MIN, RMS2_Z_MAX)
-    rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, g1.tolist(), stride=T_MODEL)
-    rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, g2.tolist(), stride=T_MODEL)
     # ---- Run + measure ----
     print(f"\nLLaMA-3.1-8B layer-0 IRP+bootstrap, prompt='The quick brown fox', query position {P}")
     print(f"FHE config: scale=2^{int(math.log2(SCALE))}  galois_steps={len(user_steps)}")
@@ -726,104 +896,52 @@ def main():
     print(render_plan_table(plan))
     boot_before = {plan.layers[s.layer_idx].name: s.bootstrap_before for s in plan.steps}
 
-    stage_times = {}
-    t_total0 = time.perf_counter()
-
-    stage_times.setdefault("bootstrap", 0.0)
-
-    _BOOT_MAX_ABS = {
-        "rms1": 1.0,        # residual stream pre-rms1
-        "attention": 1.0,   # post-rms1 (γ-scaled normalized)
-        "rms2": 1.0,        # residual stream post-attention
-        "mlp": 1.0,         # post-rms2 (γ-scaled normalized)
-    }
-
-    def _maybe_boot(name, ct):
-        """Insert a bootstrap before `name` iff the placement plan says so."""
-        if not boot_before.get(name, False):
-            return ct
-        t0 = time.perf_counter()
-        ct = bootstrap_safe(engine, ctx, encoder, ct,
-                            max_abs=_BOOT_MAX_ABS[name], slot_count=NUM_SLOTS)
-        stage_times["bootstrap"] += (time.perf_counter() - t0) * 1000
-        print(f"  [plan] bootstrap before {name}: chain={ct.chain_index()}")
-        return ct
-
-    # ---- rms1 ----
-    x_ct = _maybe_boot("rms1", x_ct)
-    t0 = time.perf_counter()
-    x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
-                                       x_ct, rms1_w, rms1_p, t=T_MODEL)
-    stage_times["rms1"] = (time.perf_counter() - t0) * 1000
-    print(f"  rms1 done. chain={x_norm.chain_index()}")
-
-    # ---- attention (IRP Wq -> SDPA with 2 internal bootstraps -> IRP Wo). ----
-    x_norm = _maybe_boot("attention", x_norm)
-    t0 = time.perf_counter()
-    attn_out = fhe_attention_irp_bootstrap(
-        engine, ctx, encoder, relin_key, galois_key,
-        x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
-        k_ct, v_ct, C_per_head, stage_times=stage_times)
-    stage_times["attention"] = (time.perf_counter() - t0) * 1000
-    print(f"  attention done. chain={attn_out.chain_index()}")
-
-    # ---- residual1 ----
-    x_mid_ct = residual(ctx, x_ct, attn_out)
-    print(f"  residual1 done. chain={x_mid_ct.chain_index()}")
-
-    # ---- rms2 ----
-    x_mid_ct = _maybe_boot("rms2", x_mid_ct)
-    t0 = time.perf_counter()
-    x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
-                                           x_mid_ct, rms2_w, rms2_p, t=T_MODEL)
-    stage_times["rms2"] = (time.perf_counter() - t0) * 1000
-    print(f"  rms2 done. chain={x_mid_norm.chain_index()}")
-
-    # ---- mlp ----
-    x_mid_norm = _maybe_boot("mlp", x_mid_norm)
-
-    # MLP: IRP Wgate / Wup / Wdown via host plaintexts.
-    t0 = time.perf_counter()
-    mlp_out = fhe_mlp_irp_bootstrap(
-        engine, ctx, encoder, relin_key, galois_key,
-        x_mid_norm,
-        diag_gate_irp, diag_up_irp, diag_down_irp,
-        sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-        stage_times=stage_times)
-    stage_times["mlp"] = (time.perf_counter() - t0) * 1000
-    print(f"  mlp done. chain={mlp_out.chain_index()}")
-
-    y_ct = residual(ctx, x_mid_ct, mlp_out)
-    total_ms = (time.perf_counter() - t_total0) * 1000
-
-    # In the periodic-relayout pipeline this used to mod_switch_to(msg_chain =
-    # total_parm_size-1, the single q_msg prime sized for post-bootstrap
-    # decoding); without the FRESH relayout we land at chain ~28 which still
-    # has a normal-sized prime and decodes directly with scale=SCALE.
-    print(f"  decrypt y_ct at chain={y_ct.chain_index()} scale={y_ct.scale():.3e}")
-    y_full = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
-                       dtype=np.float64)
-    # y_ct is in stride-T_MODEL layout (data at slots 0, T_MODEL, 2*T_MODEL, ...).
-    y = y_full[::T_MODEL][:D_MODEL]
-    err = y - ref_out[P]
-    max_err = float(np.abs(err).max())
-    rel_rms = float(np.linalg.norm(err) / np.linalg.norm(ref_out[P]))
-
-    print("\n=== Bootstrap-aware LLaMA-3.1-8B layer-0 (IRP, per-step galois) ===")
-    print("Per-stage runtime (ms):")
-    main_keys = ["rms1", "attention", "rms2", "mlp", "bootstrap"]
-    for k in main_keys:
-        if k in stage_times:
-            print(f"  {k:30s} {stage_times[k]:8.1f}")
-    sub_keys = sorted(k for k in stage_times if k not in main_keys)
-    for k in sub_keys:
-        print(f"    {k:30s} {stage_times[k]:8.1f}")
-    print(f"  {'total':30s} {total_ms:8.1f}")
-    print(f"\nAccuracy of full decoder y vs HuggingFace fp32 ref_out[{P}]:")
-    print(f"  ‖y_fhe‖     = {np.linalg.norm(y):.4f}")
-    print(f"  ‖ref_out‖   = {np.linalg.norm(ref_out[P]):.4f}")
-    print(f"  max|err|    = {max_err:.3e}")
-    print(f"  rel-RMS     = {rel_rms:.3e}")
+    NUM_DECODERS = 32
+    x_btd = embed.copy()  # [NUM_TOKENS, D_MODEL]
+    for layer_idx in range(NUM_DECODERS):
+        print(f"\n=========== Decoder {layer_idx} ===========")
+        # numpy reference for this layer
+        y_btd_np = forward_decoder_np(x_btd, g1, g2, Wq, Wk, Wv, Wo, Wgate, Wup, Wdown,
+                                       cos_all, sin_all, P)
+        # per-layer rmsnorm calibration
+        z1_l, z2_l = compute_layer_z(x_btd, g1, g2, Wq, Wk, Wv, Wo, cos_all, sin_all, P)
+        z1_min, z1_max = rms_z_window(z1_l)
+        z2_min, z2_max = rms_z_window(z2_l)
+        print(f"  [calib] layer {layer_idx}: z1={z1_l:.3e} window=[{z1_min:.3e},{z1_max:.3e}]; "
+              f"z2={z2_l:.3e} window=[{z2_min:.3e},{z2_max:.3e}]")
+        rms1_p = _make_rms_params(z1_min, z1_max)
+        rms2_p = _make_rms_params(z2_min, z2_max)
+        rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, g1.tolist(), stride=T_MODEL)
+        rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, g2.tolist(), stride=T_MODEL)
+        # encrypt this layer's inputs
+        x_ct, k_ct, v_ct, c_per_head = encrypt_layer_inputs(
+            ctx, encoder, sk, fresh_ci, x_btd, g1, Wq_baked, Wk, Wv, cos_all, sin_all, P)
+        # FHE forward
+        y_full_fhe, total_ms, stage_times = run_decoder_fhe(
+            engine, ctx, encoder, sk, relin_key, galois_key,
+            x_ct, k_ct, v_ct, c_per_head,
+            diag_wq_irp, diag_wo_irp, mask_attn_pt,
+            diag_gate_irp, diag_up_irp, diag_down_irp,
+            sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+            rms1_w, rms2_w, rms1_p, rms2_p, boot_before, label=f"decoder{layer_idx}")
+        y_p_fhe = y_full_fhe[::T_MODEL][:D_MODEL]
+        # accuracy vs numpy reference at P
+        err_np = y_p_fhe - y_btd_np[P]
+        print(f"Decoder {layer_idx} — vs numpy ref at P={P}:")
+        print(f"  ‖y_fhe‖     = {np.linalg.norm(y_p_fhe):.4f}")
+        print(f"  ‖y_np‖      = {np.linalg.norm(y_btd_np[P]):.4f}")
+        print(f"  max|err|    = {float(np.abs(err_np).max()):.3e}")
+        print(f"  rel-RMS     = {float(np.linalg.norm(err_np)/np.linalg.norm(y_btd_np[P])):.3e}")
+        print(f"  total       = {total_ms:.1f} ms")
+        if layer_idx == 0:
+            # legacy HF comparison for layer 0
+            err_hf = y_p_fhe - ref_out[P]
+            print(f"Decoder 0 — vs HuggingFace ref_out[P]:")
+            print(f"  max|err|    = {float(np.abs(err_hf).max()):.3e}")
+            print(f"  rel-RMS     = {float(np.linalg.norm(err_hf)/np.linalg.norm(ref_out[P])):.3e}")
+        # mix FHE result at P into next layer's input; non-P rows come from numpy
+        x_btd = y_btd_np.copy()
+        x_btd[P] = y_p_fhe
 
 
 if __name__ == "__main__":
