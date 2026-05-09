@@ -338,7 +338,7 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         print(f"    {k:30s} {stage_times[k]:8.1f}")
     print(f"  {'total':30s} {total_ms:8.1f}")
 
-    return y_full, total_ms, stage_times
+    return y_full, total_ms, stage_times, y_ct
 
 
 # ============================ Attention forward (IRP + bootstrap) ============================
@@ -898,6 +898,7 @@ def main():
 
     NUM_DECODERS = 32
     x_btd = embed.copy()  # [NUM_TOKENS, D_MODEL]
+    y_ct_carry = None  # bootstrapped y_ct from previous layer feeds next x_ct
     for layer_idx in range(NUM_DECODERS):
         print(f"\n=========== Decoder {layer_idx} ===========")
         # numpy reference for this layer
@@ -913,17 +914,33 @@ def main():
         rms2_p = _make_rms_params(z2_min, z2_max)
         rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, g1.tolist(), stride=T_MODEL)
         rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, g2.tolist(), stride=T_MODEL)
-        # encrypt this layer's inputs
-        x_ct, k_ct, v_ct, c_per_head = encrypt_layer_inputs(
-            ctx, encoder, sk, fresh_ci, x_btd, g1, Wq_baked, Wk, Wv, cos_all, sin_all, P)
+        # K/V come from clean numpy x_btd; for layer 0 we also encrypt x_ct
+        # from numpy. For layer >= 1 we bootstrap the previous y_ct forward as
+        # x_ct so the residual stream stays encrypted across decoder boundaries.
+        if layer_idx == 0:
+            x_ct, k_ct, v_ct, c_per_head = encrypt_layer_inputs(
+                ctx, encoder, sk, fresh_ci, x_btd, g1, Wq_baked, Wk, Wv, cos_all, sin_all, P)
+        else:
+            _x_ct_unused, k_ct, v_ct, c_per_head = encrypt_layer_inputs(
+                ctx, encoder, sk, fresh_ci, x_btd, g1, Wq_baked, Wk, Wv, cos_all, sin_all, P)
+            x_max_abs = float(np.abs(x_btd[P]).max())
+            t_bs0 = time.perf_counter()
+            # y_ct sits at max_user_level=13, where bootstrap_safe can't
+            # pre-scale. Call engine.bootstrap_inplace directly and accept
+            # that values > target_mag pick up some bootstrap noise.
+            engine.bootstrap_inplace(y_ct_carry)
+            x_ct = y_ct_carry
+            print(f"  [boundary] bootstrap y_ct -> x_ct: chain={x_ct.chain_index()} "
+                  f"max_abs={x_max_abs:.3f} t={ (time.perf_counter()-t_bs0)*1000:.1f}ms")
         # FHE forward
-        y_full_fhe, total_ms, stage_times = run_decoder_fhe(
+        y_full_fhe, total_ms, stage_times, y_ct_out = run_decoder_fhe(
             engine, ctx, encoder, sk, relin_key, galois_key,
             x_ct, k_ct, v_ct, c_per_head,
             diag_wq_irp, diag_wo_irp, mask_attn_pt,
             diag_gate_irp, diag_up_irp, diag_down_irp,
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             rms1_w, rms2_w, rms1_p, rms2_p, boot_before, label=f"decoder{layer_idx}")
+        y_ct_carry = y_ct_out
         y_p_fhe = y_full_fhe[::T_MODEL][:D_MODEL]
         # accuracy vs numpy reference at P
         err_np = y_p_fhe - y_btd_np[P]
@@ -939,9 +956,10 @@ def main():
             print(f"Decoder 0 — vs HuggingFace ref_out[P]:")
             print(f"  max|err|    = {float(np.abs(err_hf).max()):.3e}")
             print(f"  rel-RMS     = {float(np.linalg.norm(err_hf)/np.linalg.norm(ref_out[P])):.3e}")
-        # mix FHE result at P into next layer's input; non-P rows come from numpy
+        # K/V calibration for next layer comes from clean numpy y_l_np across
+        # all tokens (no FHE-derived values mixed in — the decrypt above is
+        # for accuracy reporting only, not part of the FHE pipeline).
         x_btd = y_btd_np.copy()
-        x_btd[P] = y_p_fhe
 
 
 if __name__ == "__main__":
