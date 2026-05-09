@@ -325,6 +325,99 @@ def compute_qkt_irp(
     return acc
 
 
+def multi_ct_softmax_finalize(
+    ctx, encoder, relin_key, galois_key,
+    e_blocks, head_first_slot_mask_pt,
+    n_heads: int, d_head: int, t: int, iters: int,
+    user_scale: float,
+):
+    """Cross-block softmax aggregation for multi-ct e (Stage 3b-c).
+
+    Each e_block_k holds scaled exp values for tokens in block k:
+        slot[h*d_head*t + tok_local] = e[h, k*t + tok_local]   for tok_local in [0, t)
+    Slots beyond block_sizes[k] in the last (partial) block are zero (caller
+    must mask them).
+
+    Computes weights_block_k = e_block_k / global_sum_per_head, where
+        global_sum_per_head[h] = Σ_k Σ_tok_local e[h, k*t + tok_local]
+                              = Σ_t (over all token positions) e[h, t]
+
+    Algorithm:
+      1. Cross-block sum: e_sum = Σ_k e_block_k.
+      2. Within-block sum_reduce stride=1 count=t. The stock sum_reduce only
+         puts the correct per-head sum at slot[h*d_head*t + 0]; slots
+         tok_local in [1, t) hold sliding-window partial sums and are wrong
+         for our non-cyclic layout (the multi-block case has all t slots
+         populated with distinct values per block, so the existing single-ct
+         cyclic-replica trick doesn't apply).
+      3. Mask + broadcast: a_broadcast = (a * head_first_slot_mask) then
+         doubling rotate-adds to populate slots [h*d_head*t + 0..t) with the
+         per-head sum. Costs 1 level for the mask multiply + rescale.
+      4. Per-block Goldschmidt: weights_block_k = phantom.softmax_correct(
+         e_block_k, a_broadcast, iters) -> e_block_k / a_broadcast.
+
+    Args:
+      head_first_slot_mask_pt: precomputed plaintext with 1.0 at slot
+        [h*d_head*t + 0] for h in [0, n_heads) and 0.0 elsewhere, encoded at
+        the chain matching `a` after step 2.
+      user_scale: engine.user_scale() — used to snap a's scale after the
+        mask multiply + rescale.
+
+    Required Galois rotation steps:
+      step 2: {1, 2, ..., t/2} (positive)
+      step 3: {-1, -2, ..., -t/2} (negative, for the broadcast doubling)
+
+    Returns: list of n_blocks weights ciphertexts.
+    """
+    n_blocks = len(e_blocks)
+    if n_blocks == 0:
+        raise ValueError("multi_ct_softmax_finalize: e_blocks is empty")
+    if not _is_pow2(t):
+        raise ValueError("multi_ct_softmax_finalize: t must be a power of 2")
+
+    # 1. Cross-block sum.
+    e_sum = e_blocks[0]
+    for k in range(1, n_blocks):
+        e_sum = phantom.add(ctx, e_sum, e_blocks[k])
+
+    # 2. Within-block sum_reduce: stride=1, count=t. After log2(t) iterations,
+    # acc[h*d_head*t + 0] holds the global per-head sum; slots 1..t-1 hold
+    # sliding-window partial sums (wrong for our layout).
+    a = e_sum
+    step = 1
+    reach = 1
+    while reach < t:
+        rot = phantom.rotate(ctx, a, int(step), galois_key)
+        a = phantom.add(ctx, a, rot)
+        step <<= 1
+        reach <<= 1
+
+    # 3. Mask + broadcast. Mask zeroes everything except slot[h*d_head*t + 0]
+    # for each h, leaving the correct per-head sum at slot 0 only. Then
+    # doubling rotate-adds spread that value to slots [0..t).
+    a_masked = phantom.multiply_plain(ctx, a, head_first_slot_mask_pt)
+    a_masked = phantom.rescale_to_next(ctx, a_masked)
+    a_masked.set_scale(user_scale)
+    a_bc = a_masked
+    s = 1
+    while s < t:
+        rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
+        a_bc = phantom.add(ctx, a_bc, rot)
+        s <<= 1
+
+    # 4. Per-block Goldschmidt. The e_blocks are still at the pre-mask-rescale
+    # chain; mod_switch them down to a_bc's chain so softmax_correct accepts
+    # both at the same level.
+    a_chain = a_bc.chain_index()
+    weights_blocks = []
+    for e_block in e_blocks:
+        if e_block.chain_index() != a_chain:
+            e_block = phantom.mod_switch_to(ctx, e_block, a_chain)
+        wb = phantom.softmax_correct(ctx, encoder, relin_key, e_block, a_bc, iters)
+        weights_blocks.append(wb)
+    return weights_blocks
+
+
 def compute_qkt_irp_multi(
     ctx, encoder, relin_key, galois_key,
     q_ct, k_blocks_cts,
