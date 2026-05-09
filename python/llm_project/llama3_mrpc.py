@@ -522,7 +522,39 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, w["g2"].tolist(), stride=T_MODEL)
 
         silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN
-        silu_coeffs = fit_silu_coeffs((-silu_max * 1.2, silu_max * 1.2), deg=14)
+        silu_domain = (-silu_max * 1.2, silu_max * 1.2)
+        # Cap polynomial degree so all coefficients stay above CKKS encoding
+        # precision (~2^-40). Heuristic: c_N ~ D^(1-N); need D^(N-1) < 2^40,
+        # i.e. N < 1 + 40·ln2/ln(D). At D=16 (L31) this caps at N≈11; deg=14
+        # would silently truncate c_12..c_14 to zero in encoding, leaving an
+        # under-fit polynomial that overshoots silu(13.4)≈13 to ~-42 (4× and
+        # sign-flipped). Picking deg empirically by min Linf-at-quantized-
+        # precision is more robust than the analytic cap.
+        _silu_xs = np.linspace(silu_domain[0], silu_domain[1], 1001)
+        _silu_actual = silu_np(_silu_xs)
+        _SILU_ENC_SCALE = SCALE  # CKKS encoding scale; max precision 1/SCALE
+        silu_deg = 14
+        silu_coeffs = fit_silu_coeffs(silu_domain, deg=14)
+        _best_err = float(np.abs(np.polyval(
+            [round(c * _SILU_ENC_SCALE) / _SILU_ENC_SCALE
+             for c in silu_coeffs[::-1]], _silu_xs) - _silu_actual).max())
+        for _d in (6, 8, 10, 12):
+            _c = fit_silu_coeffs(silu_domain, deg=_d)
+            _cq = [round(c * _SILU_ENC_SCALE) / _SILU_ENC_SCALE for c in _c]
+            _err = float(np.abs(np.polyval(_cq[::-1], _silu_xs) - _silu_actual).max())
+            if _err < _best_err:
+                _best_err = _err
+                silu_deg = _d
+                silu_coeffs = _c
+        if verbose:
+            margin = BOOT_CALIB_MARGIN
+            ks = ("x_in", "rms1_out", "x_mid", "rms2_out",
+                   "q", "scores", "gate", "up", "h")
+            np_str = "  ".join(f"{k}={max_abs_calib[k]/margin:.3f}" for k in ks)
+            print(f"  [calib] z1={z1_l:.3e} z2={z2_l:.3e}  np-max-abs (pre-margin):  {np_str}")
+            print(f"  [calib] silu polynomial domain: [{-silu_max*1.2:.2f}, {silu_max*1.2:.2f}] "
+                  f"(deg={silu_deg}, Linf-at-CKKS={_best_err:.3e})")
+            print(f"  [calib] softmax_safety_scale={max_abs_calib.get('softmax_safety_scale', 1.0):.4f}")
 
         # Encrypt inputs (multi-ct K, V)
         x_ct, k_cts, v_cts, c_per_head, _ = encrypt_layer_inputs_multi(
@@ -576,7 +608,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             x_mid_norm,
             diag_gate_irp, diag_up_irp, diag_down_irp,
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-            max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs)
+            max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
+            sk=sk if verbose else None, verbose_mag=verbose)
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
         # residual2
         y_ct = residual(ctx, x_mid_ct, mlp_out)

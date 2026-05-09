@@ -793,11 +793,20 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             diag_gate_irp, diag_up_irp, diag_down_irp,
                             sub_mask_wide_pt, sub_mask_tall_pt, input_mask_pt,
                             stage_times=None, max_abs_calib=None,
-                            silu_coeffs=None, probe_np=None, sk=None):
+                            silu_coeffs=None, probe_np=None, sk=None,
+                            verbose_mag=False):
     """MLP (SwiGLU) forward.
     probe_np/sk: when not None, emit [probe-L31] diff lines at each sub-stage.
     Wide (gate/up) IRP outputs are in permuted stride-t' layout; comparison is orderless.
+    verbose_mag: when True (and sk is provided), print FHE max/mean magnitude at each stage.
     """
+    def _vp(name, ct):
+        if not verbose_mag or sk is None:
+            return
+        v = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
+                     dtype=np.float64)
+        print(f"    [mlp-mag] {name:<24s} chain={ct.chain_index()}  "
+              f"max|.|={np.abs(v).max():.4e}  mean|.|={np.abs(v).mean():.4e}")
     # Layer-0 defaults; overridden per-layer via max_abs_calib (Stage 3a').
     _calib = {"gate": 1.66, "up": 1.78, "h": 1.26}
     if max_abs_calib is not None:
@@ -818,6 +827,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     else:
         x_irp = x_mid_norm
     _rec("layout_shift", t0)
+    _vp("input_x_irp", x_irp)
 
     # Wide IRP (gate/up) output layout: permuted stride-t' where
     # t' = N / D_PAD_MLP = 32768 / 16384 = 2.
@@ -837,6 +847,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # gate_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
     gate_ct = phantom.rescale_to_next(ctx, gate_ct)
     gate_ct.set_scale(SCALE)
+    _vp("post_Wgate", gate_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("17.post_Wgate", ctx, encoder, sk, gate_ct,
                     probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -846,6 +857,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
                              max_abs=_calib["gate"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    _vp("post_gate_boot", gate_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("18.post_gate_boot", ctx, encoder, sk, gate_ct,
                     probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -855,6 +867,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     t0 = _t()
     silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs)
     _rec("mlp_silu", t0)
+    _vp("post_silu", silu_gate)
     if probe_np is not None and sk is not None:
         _probe_diff("19.post_silu", ctx, encoder, sk, silu_gate,
                     probe_np["silu_gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -871,6 +884,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # up_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
     up_ct = phantom.rescale_to_next(ctx, up_ct)
     up_ct.set_scale(SCALE)
+    _vp("post_Wup", up_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("20.post_Wup", ctx, encoder, sk, up_ct,
                     probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -880,6 +894,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     up_ct = bootstrap_safe(engine, ctx, encoder, up_ct,
                            max_abs=_calib["up"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    _vp("post_up_boot", up_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("21.post_up_boot", ctx, encoder, sk, up_ct,
                     probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -898,6 +913,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     h_ct = phantom.rescale_to_next(ctx, h_ct)
     h_ct.set_scale(SCALE)
     _rec("mlp_swiglu", t0)
+    _vp("post_swiglu_h", h_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("22.post_swiglu", ctx, encoder, sk, h_ct,
                     probe_np["h_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -912,6 +928,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
     h_fresh = phantom.mod_switch_to(ctx, h_fresh, irp_mlp_chain)
     _rec("bootstrap", t0)
+    _vp("post_h_boot", h_fresh)
     if probe_np is not None and sk is not None:
         _probe_diff("23.post_h_boot", ctx, encoder, sk, h_fresh,
                     probe_np["h_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
@@ -933,6 +950,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     out_ct.set_scale(SCALE)
     out_periodic = out_ct
     _rec("layout_shift", t0)
+    _vp("post_Wdown_out", out_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("24.post_Wdown", ctx, encoder, sk, out_ct,
                     probe_np["out_P"], stride=T_MODEL, count=D_MODEL)
