@@ -325,6 +325,87 @@ def compute_qkt_irp(
     return acc
 
 
+def compute_qkt_irp_multi(
+    ctx, encoder, relin_key, galois_key,
+    q_ct, k_blocks_cts,
+    d_head: int, d_total: int, t: int,
+    num_tokens: int = None,
+):
+    """QK^T over a multi-ciphertext K cache (Stage 3b-b).
+
+    Each k_block holds up to t = T_MODEL = 8 token positions packed in the
+    same in-block layout that compute_qkt_irp consumes. Block k holds tokens
+    [k*t, k*t + t). The final block may be partial (block_size < t); slots
+    beyond block_size are zero in the K-block ct, and the resulting score
+    block has zeros at those positions too — those are masked downstream.
+
+    Args:
+        q_ct: query ciphertext (single, post-Wq-IRP, stride-t Q layout).
+        k_blocks_cts: list of n_blocks K-block ciphertexts.
+        d_head, d_total, t: same as compute_qkt_irp.
+        num_tokens: total number of active tokens across all blocks. Used to
+            compute per-block sizes (returned alongside the score blocks).
+            If None, defaults to len(k_blocks_cts) * t (assume all full).
+
+    Returns:
+        score_blocks: list of n_blocks ciphertexts, each with the same per-
+            block layout that compute_qkt_irp's single-ct output has —
+            slot[h*d_head*t + tok_local] = m[tok_local, h] for tok_local in
+            [0, t). The mid-head junk slots [d_head*tok_local + 1 .. ] hold
+            partial-junk that the caller must mask out.
+        block_sizes: list of n_blocks ints, the number of valid tokens in
+            each block. block_sizes[k] = min(t, num_tokens - k*t).
+
+    Q is preprocessed (replicated across t-slots) ONCE outside the per-block
+    loop — saves log2(t) rotations per block at the cost of one extra ct
+    holding the preprocessed Q.
+
+    Caller is responsible for:
+      * mod_switch'ing each k_block to q_ct's chain (the existing pipeline
+        does this via mod_switch_to_inplace before compute_qkt_irp);
+      * applying mask*scale + per-head sub on each score block (block-aware
+        mask: only block_sizes[k] tokens are meaningful in block k);
+      * cross-block softmax aggregation in the multi-ct softmax pipeline.
+    """
+    n_blocks = len(k_blocks_cts)
+    if num_tokens is None:
+        num_tokens = n_blocks * t
+    block_sizes = [min(t, num_tokens - k * t) for k in range(n_blocks)]
+
+    if not _is_pow2(d_head):
+        raise ValueError("compute_qkt_irp_multi: d_head must be a power of 2")
+    if not _is_pow2(d_total):
+        raise ValueError("compute_qkt_irp_multi: d_total must be a power of 2")
+    if not _is_pow2(t):
+        raise ValueError("compute_qkt_irp_multi: t must be a power of 2")
+    log_t = int(round(math.log2(t)))
+    log_d_head = int(round(math.log2(d_head)))
+
+    # Preprocess Q ONCE across the per-block loop: pure replicate across t-slots.
+    q_pp = q_ct
+    for s in range(log_t):
+        rot_amt = -(1 << s)
+        rot_ct = phantom.rotate(ctx, q_pp, int(rot_amt), galois_key)
+        q_pp = phantom.add(ctx, q_pp, rot_ct)
+
+    score_blocks = []
+    for k_ct in k_blocks_cts:
+        # ct·ct multiply Q_pp × K_block.
+        nominal = q_pp.scale()
+        prod = phantom.multiply_and_relin(ctx, q_pp, k_ct, relin_key)
+        prod = phantom.rescale_to_next(ctx, prod)
+        prod.set_scale(nominal)
+        # Reduce over j-axis (the d_head dimension).
+        acc = prod
+        for s in range(log_d_head):
+            rot_amt = t * (1 << s)
+            rot_ct = phantom.rotate(ctx, acc, int(rot_amt), galois_key)
+            acc = phantom.add(ctx, acc, rot_ct)
+        score_blocks.append(acc)
+
+    return score_blocks, block_sizes
+
+
 # ---------------------------------------------------------------------------
 # IRP-native finalize_softmax (replaces phantom.finalize_softmax for stride-t)
 # ---------------------------------------------------------------------------
