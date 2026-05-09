@@ -351,6 +351,31 @@ def _probe(tag, ctx, encoder, sk, ct):
           f"max|.|={np.abs(v).max():.4e} mean|.|={np.abs(v).mean():.4e}")
 
 
+def _probe_diff(tag, ctx, encoder, sk, ct, np_ref,
+                stride, count, orderless=False):
+    """Decrypt ct, extract meaningful slots, compare to np_ref.
+
+    stride/count: meaningful slots are at positions [0, stride, 2*stride, ...,
+    (count-1)*stride].  If orderless=True, compare sorted magnitudes (for
+    permuted MLP intermediates).  np_ref must be a 1-D array of length `count`
+    in the same order as the slot extraction (or any order when orderless=True).
+    """
+    raw = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
+                   dtype=np.float64)
+    fhe_vals = raw[::stride][:count]
+    np_vals  = np.asarray(np_ref, dtype=np.float64).ravel()[:count]
+    if orderless:
+        fhe_vals = np.sort(np.abs(fhe_vals))
+        np_vals  = np.sort(np.abs(np_vals))
+    diff = fhe_vals - np_vals
+    fhe_max  = float(np.abs(fhe_vals).max()) if len(fhe_vals) else 0.0
+    np_max   = float(np.abs(np_vals).max())  if len(np_vals)  else 0.0
+    diff_max = float(np.abs(diff).max())     if len(diff)     else 0.0
+    diff_rms = float(np.linalg.norm(diff) / math.sqrt(max(len(diff), 1)))
+    print(f"[probe-L31] {tag:30s}  fhe_max={fhe_max:.2e}  np_max={np_max:.2e}"
+          f"  diff_max={diff_max:.2e}  diff_rms={diff_rms:.2e}")
+
+
 def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
                     x_ct, k_ct, v_ct, c_per_head,
                     diag_wq_irp, diag_wo_irp, mask_attn_pt,
@@ -358,15 +383,19 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
                     sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
                     rms1_w, rms2_w, rms1_p, rms2_p,
                     boot_before, label="layer", probe=False,
-                    max_abs_calib=None, silu_coeffs=None):
+                    max_abs_calib=None, silu_coeffs=None, probe_np=None):
     """Run one decoder layer in FHE. Returns (y_full_np, total_ms, stage_times).
-    y_full_np is the decrypted output in stride-T_MODEL layout."""
+    y_full_np is the decrypted output in stride-T_MODEL layout.
+    probe_np: dict of numpy reference intermediates (populated by caller for L31)."""
     stage_times = {}
     stage_times.setdefault("bootstrap", 0.0)
     if probe:
         _probe("input x_ct", ctx, encoder, sk, x_ct)
         _probe("input k_ct", ctx, encoder, sk, k_ct)
         _probe("input v_ct", ctx, encoder, sk, v_ct)
+        if probe_np is not None:
+            _probe_diff("1.input_x", ctx, encoder, sk, x_ct,
+                        probe_np["x_btd_P"], stride=T_MODEL, count=D_MODEL)
 
     # Outer bootstrap calibrations between named layers. Default = layer-0
     # tuning; overridden per-layer by max_abs_calib (Stage 3a').
@@ -397,6 +426,9 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
     stage_times["rms1"] = (time.perf_counter() - t0) * 1000
     print(f"  rms1 done. chain={x_norm.chain_index()}")
     if probe: _probe("post-rms1 x_norm", ctx, encoder, sk, x_norm)
+    if probe and probe_np is not None:
+        _probe_diff("2.post_rms1", ctx, encoder, sk, x_norm,
+                    probe_np["xn_P"], stride=T_MODEL, count=D_MODEL)
 
     # attention
     x_norm = _maybe_boot("attention", x_norm)
@@ -405,24 +437,37 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         engine, ctx, encoder, relin_key, galois_key,
         x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
         k_ct, v_ct, c_per_head, stage_times=stage_times,
-        max_abs_calib=max_abs_calib)
+        max_abs_calib=max_abs_calib, probe_np=probe_np if probe else None,
+        sk=sk if probe else None)
     stage_times["attention"] = (time.perf_counter() - t0) * 1000
     print(f"  attention done. chain={attn_out.chain_index()}")
     if probe: _probe("post-attention attn_out", ctx, encoder, sk, attn_out)
+    if probe and probe_np is not None:
+        _probe_diff("13.post_Wo", ctx, encoder, sk, attn_out,
+                    probe_np["o_P"], stride=T_MODEL, count=D_MODEL)
 
     # residual1
     x_mid_ct = residual(ctx, x_ct, attn_out)
     print(f"  residual1 done. chain={x_mid_ct.chain_index()}")
     if probe: _probe("post-residual1 x_mid", ctx, encoder, sk, x_mid_ct)
+    if probe and probe_np is not None:
+        _probe_diff("14.post_residual1", ctx, encoder, sk, x_mid_ct,
+                    probe_np["x_mid_P"], stride=T_MODEL, count=D_MODEL)
 
     # rms2
     x_mid_ct = _maybe_boot("rms2", x_mid_ct)
+    if probe and probe_np is not None:
+        _probe_diff("15.post_rms2_boot", ctx, encoder, sk, x_mid_ct,
+                    probe_np["x_mid_P"], stride=T_MODEL, count=D_MODEL)
     t0 = time.perf_counter()
     x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
                                            x_mid_ct, rms2_w, rms2_p, t=T_MODEL)
     stage_times["rms2"] = (time.perf_counter() - t0) * 1000
     print(f"  rms2 done. chain={x_mid_norm.chain_index()}")
     if probe: _probe("post-rms2 x_mid_norm", ctx, encoder, sk, x_mid_norm)
+    if probe and probe_np is not None:
+        _probe_diff("16.post_rms2", ctx, encoder, sk, x_mid_norm,
+                    probe_np["x_mid_n_P"], stride=T_MODEL, count=D_MODEL)
 
     # mlp
     x_mid_norm = _maybe_boot("mlp", x_mid_norm)
@@ -433,12 +478,17 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         diag_gate_irp, diag_up_irp, diag_down_irp,
         sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
         stage_times=stage_times, max_abs_calib=max_abs_calib,
-        silu_coeffs=silu_coeffs)
+        silu_coeffs=silu_coeffs,
+        probe_np=probe_np if probe else None,
+        sk=sk if probe else None)
     stage_times["mlp"] = (time.perf_counter() - t0) * 1000
     print(f"  mlp done. chain={mlp_out.chain_index()}")
     if probe: _probe("post-mlp mlp_out", ctx, encoder, sk, mlp_out)
 
     y_ct = residual(ctx, x_mid_ct, mlp_out)
+    if probe and probe_np is not None:
+        _probe_diff("25.post_residual2", ctx, encoder, sk, y_ct,
+                    probe_np["y_P"], stride=T_MODEL, count=D_MODEL)
     total_ms = (time.perf_counter() - t_total0) * 1000
 
     print(f"  decrypt y_ct at chain={y_ct.chain_index()} scale={y_ct.scale():.3e}")
@@ -465,11 +515,13 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
                                  diag_wq_irp, diag_wo_irp,
                                  mask_attn_pt,
                                  k_ct, v_ct, c_per_head,
-                                 stage_times=None, max_abs_calib=None):
+                                 stage_times=None, max_abs_calib=None,
+                                 probe_np=None, sk=None):
     """Stage-2 IRP-native attention. Q stays in stride-T_MODEL packing through
     the entire SDPA. K/V cache packed interleaved across t tokens within a
     single ciphertext (Cachemir §5.1). No sk-touching relayouts in the
     decoder body.
+    probe_np/sk: when not None, emit [probe-L31] diff lines at each sub-stage.
     """
     # Layer-0 defaults; overridden per-layer via max_abs_calib (Stage 3a').
     _calib = {"q": 2.5, "scores": 45.10}
@@ -503,6 +555,9 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     q_ct = phantom.rescale_to_next(ctx, q_ct)
     q_ct.set_scale(SCALE)
     _rec("wq_irp", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("3.post_Wq", ctx, encoder, sk, q_ct,
+                    probe_np["Q_P_flat"], stride=T_MODEL, count=D_TOTAL)
 
     # ---- bootstrap to refresh chain to 16 so Stage A has the full SDPA
     # budget. Without this, q_ct at chain ~28 would push compute_qkt_irp +
@@ -511,6 +566,9 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
                           max_abs=_calib["q"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("4.post_q_boot", ctx, encoder, sk, q_ct,
+                    probe_np["Q_P_flat"], stride=T_MODEL, count=D_TOTAL)
 
     # ---- compute_qkt_irp + mask*scale + sub(C[h]). ----
     # Output: scores at slot[h*D_HEAD*T_MODEL + tok] = m[tok, h], with
@@ -532,12 +590,46 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
         c_per_head, scores_ct.chain_index(), scores_ct.scale())
     scores_ct = phantom.sub_plain(ctx, scores_ct, sub_pt)
     _rec("attn_A", t0)
+    if probe_np is not None and sk is not None:
+        # scores layout: slot[h*D_HEAD*T_MODEL + tok] = scores[tok, h]
+        # Build flat reference: for each head h, for each token tok:
+        #   ref[h*D_HEAD*T_MODEL + tok] = (scores_np[tok,h] - c_per_head[h])
+        scores_ref_slots = np.zeros(N_HEADS * D_HEAD * T_MODEL, dtype=np.float64)
+        scores_np_ref = probe_np["scores_minus_c"]  # [NUM_TOKENS, N_HEADS]
+        for h_i in range(N_HEADS):
+            for tok in range(NUM_TOKENS):
+                scores_ref_slots[h_i * D_HEAD * T_MODEL + tok] = scores_np_ref[tok, h_i]
+        # Extract FHE slots at positions 0..N_HEADS*D_HEAD*T_MODEL-1
+        raw_s = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, scores_ct)),
+                         dtype=np.float64)
+        fhe_s = raw_s[:N_HEADS * D_HEAD * T_MODEL]
+        # Only compare the meaningful tok slots (tok < NUM_TOKENS within each head block)
+        meaningful_mask = np.zeros(N_HEADS * D_HEAD * T_MODEL, dtype=bool)
+        for h_i in range(N_HEADS):
+            for tok in range(NUM_TOKENS):
+                meaningful_mask[h_i * D_HEAD * T_MODEL + tok] = True
+        fhe_s_m = fhe_s[meaningful_mask]
+        ref_s_m = scores_ref_slots[meaningful_mask]
+        diff_s = fhe_s_m - ref_s_m
+        print(f"[probe-L31] {'5.post_scores':30s}  fhe_max={np.abs(fhe_s_m).max():.2e}"
+              f"  np_max={np.abs(ref_s_m).max():.2e}"
+              f"  diff_max={np.abs(diff_s).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_s)/math.sqrt(len(diff_s)):.2e}")
 
     # ---- bootstrap before damped squarings. ----
     t0 = _t()
     scores_ct = bootstrap_safe(engine, ctx, encoder, scores_ct,
                                max_abs=_calib["scores"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    if probe_np is not None and sk is not None:
+        raw_s2 = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, scores_ct)),
+                          dtype=np.float64)
+        fhe_s2_m = raw_s2[:N_HEADS * D_HEAD * T_MODEL][meaningful_mask]
+        diff_s2 = fhe_s2_m - ref_s_m
+        print(f"[probe-L31] {'6.post_scores_boot':30s}  fhe_max={np.abs(fhe_s2_m).max():.2e}"
+              f"  np_max={np.abs(ref_s_m).max():.2e}"
+              f"  diff_max={np.abs(diff_s2).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_s2)/math.sqrt(len(diff_s2)):.2e}")
 
     # ---- ps_exp_init + damped squarings. ----
     t0 = _t()
@@ -547,6 +639,21 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
         NUM_TOKENS, NUM_SQUARINGS, EXTRA_SCALE)
     phantom.square_iterations_damped_inplace(ctx, encoder, relin_key, e_ct, damps)
     _rec("attn_B", t0)
+    if probe_np is not None and sk is not None:
+        # After ps_exp_init + damped squarings the meaningful slots hold
+        # approx: (extra_scale * NUM_TOKENS^(-1/2^k))^(2^k) * exp(score-c)
+        # = (0.5 * 4^(-1/16))^16 * exp(score-c)
+        # Compute the exact scalar factor:
+        _scale_factor = (EXTRA_SCALE * (NUM_TOKENS ** (-1.0 / (2 ** NUM_SQUARINGS)))) ** (2 ** NUM_SQUARINGS)
+        exp_ref = _scale_factor * np.exp(ref_s_m)  # [N_HEADS*NUM_TOKENS]
+        raw_e = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                         dtype=np.float64)
+        fhe_e_m = raw_e[:N_HEADS * D_HEAD * T_MODEL][meaningful_mask]
+        diff_e = fhe_e_m - exp_ref
+        print(f"[probe-L31] {'7.post_ps_exp':30s}  fhe_max={np.abs(fhe_e_m).max():.2e}"
+              f"  np_max={np.abs(exp_ref).max():.2e}"
+              f"  diff_max={np.abs(diff_e).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_e)/math.sqrt(len(diff_e)):.2e}")
 
     # ---- bootstrap before finalize_softmax. ----
     # The IRP layout has very different fill-rate: only N_HEADS*NUM_TOKENS=128
@@ -561,8 +668,27 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     mean_pt_pre = encoder.encode_double_vector(
         ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
     e_ct = phantom.sub_plain(ctx, e_ct, mean_pt_pre)
+    if probe_np is not None and sk is not None:
+        raw_e2 = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                          dtype=np.float64)
+        fhe_e2_m = raw_e2[:N_HEADS * D_HEAD * T_MODEL][meaningful_mask]
+        exp_ref_sub = exp_ref - _PRE_FINSMX_MEAN
+        diff_e2 = fhe_e2_m - exp_ref_sub
+        print(f"[probe-L31] {'8.post_mean_sub':30s}  fhe_max={np.abs(fhe_e2_m).max():.2e}"
+              f"  np_max={np.abs(exp_ref_sub).max():.2e}"
+              f"  diff_max={np.abs(diff_e2).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_e2)/math.sqrt(len(diff_e2)):.2e}")
     e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
                           max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+    if probe_np is not None and sk is not None:
+        raw_e3 = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                          dtype=np.float64)
+        fhe_e3_m = raw_e3[:N_HEADS * D_HEAD * T_MODEL][meaningful_mask]
+        diff_e3 = fhe_e3_m - exp_ref_sub
+        print(f"[probe-L31] {'9.post_finsmx_boot':30s}  fhe_max={np.abs(fhe_e3_m).max():.2e}"
+              f"  np_max={np.abs(exp_ref_sub).max():.2e}"
+              f"  diff_max={np.abs(diff_e3).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_e3)/math.sqrt(len(diff_e3)):.2e}")
     mean_pt_post = encoder.encode_double_vector(
         ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
     e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
@@ -579,12 +705,39 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
     e_ct = phantom.rescale_to_next(ctx, e_ct)
     e_ct.set_scale(e_nominal)
+    if probe_np is not None and sk is not None:
+        raw_e4 = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                          dtype=np.float64)
+        fhe_e4_m = raw_e4[:N_HEADS * D_HEAD * T_MODEL][meaningful_mask]
+        diff_e4 = fhe_e4_m - exp_ref
+        print(f"[probe-L31] {'10.post_mask':30s}  fhe_max={np.abs(fhe_e4_m).max():.2e}"
+              f"  np_max={np.abs(exp_ref).max():.2e}"
+              f"  diff_max={np.abs(diff_e4).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_e4)/math.sqrt(len(diff_e4)):.2e}")
 
     # IRP-native softmax: cyclic-broadcast trick (rotate -NUM_TOKENS) makes
     # sum_reduce_stride(stride=1, count=NUM_TOKENS) broadcast the full per-head
     # sum to every valid token slot.
     weights_ct = finalize_softmax_irp_t(
         ctx, encoder, relin_key, galois_key, e_ct, NUM_TOKENS, ITERS)
+    if probe_np is not None and sk is not None:
+        # After finalize_softmax weights[tok, h] = softmax(scores[tok, h])
+        # softmax_ref[tok, h] for each head h; slot[h*D_HEAD*T_MODEL + tok]
+        softmax_ref = probe_np["softmax_weights"]  # [NUM_TOKENS, N_HEADS]
+        raw_w = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, weights_ct)),
+                         dtype=np.float64)
+        fhe_w_m = raw_w[:N_HEADS * D_HEAD * T_MODEL][meaningful_mask]
+        ref_w_m = np.zeros(N_HEADS * NUM_TOKENS, dtype=np.float64)
+        idx = 0
+        for h_i in range(N_HEADS):
+            for tok in range(NUM_TOKENS):
+                ref_w_m[idx] = softmax_ref[tok, h_i]
+                idx += 1
+        diff_w = fhe_w_m - ref_w_m
+        print(f"[probe-L31] {'11.post_finalize_smx':30s}  fhe_max={np.abs(fhe_w_m).max():.2e}"
+              f"  np_max={np.abs(ref_w_m).max():.2e}"
+              f"  diff_max={np.abs(diff_w).max():.2e}"
+              f"  diff_rms={np.linalg.norm(diff_w)/math.sqrt(len(diff_w)):.2e}")
 
     # IRP-native score×V: weights_ct in cyclic-broadcast layout × interleaved
     # V_cache → stride-T_MODEL output ready for Wo IRP.
@@ -602,6 +755,11 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
         D_HEAD, D_TOTAL, NUM_TOKENS, T_MODEL,
         sv_mask)
     _rec("attn_C", t0)
+    if probe_np is not None and sk is not None:
+        # attn_irp: stride-T_MODEL, slot[h*D_HEAD*T_MODEL + d] = attn[h, d]
+        # ref: attn_P [N_HEADS*D_HEAD] = weights @ V_full reshaped
+        _probe_diff("12.post_score_v", ctx, encoder, sk, attn_irp,
+                    probe_np["attn_P"], stride=T_MODEL, count=N_HEADS * D_HEAD)
 
     # ---- Wo via IRP. attn_irp is already stride-T_MODEL at d=D_TOTAL —
     # exactly the layout Wo IRP expects, no relayout needed. The Wo IRP
@@ -624,6 +782,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     o_ct = phantom.rescale_to_next(ctx, o_ct)
     o_ct.set_scale(SCALE)
     _rec("layout_shift", t0)
+    # Stage 13 probe (post-Wo) is emitted in run_decoder_fhe after return
     return o_ct
 
 
@@ -634,7 +793,11 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             diag_gate_irp, diag_up_irp, diag_down_irp,
                             sub_mask_wide_pt, sub_mask_tall_pt, input_mask_pt,
                             stage_times=None, max_abs_calib=None,
-                            silu_coeffs=None):
+                            silu_coeffs=None, probe_np=None, sk=None):
+    """MLP (SwiGLU) forward.
+    probe_np/sk: when not None, emit [probe-L31] diff lines at each sub-stage.
+    Wide (gate/up) IRP outputs are in permuted stride-t' layout; comparison is orderless.
+    """
     # Layer-0 defaults; overridden per-layer via max_abs_calib (Stage 3a').
     _calib = {"gate": 1.66, "up": 1.78, "h": 1.26}
     if max_abs_calib is not None:
@@ -656,6 +819,13 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
         x_irp = x_mid_norm
     _rec("layout_shift", t0)
 
+    # Wide IRP (gate/up) output layout: permuted stride-t' where
+    # t' = N / D_PAD_MLP = 32768 / 16384 = 2.
+    # Meaningful slots at positions 0, 2, 4, ..., 2*(D_PAD_MLP-1).
+    # Values at slot 2*c_perm = y[c' + q*D_MODEL] where c'=c_perm//alpha, q=c_perm%alpha,
+    # alpha = D_PAD_MLP // D_MODEL = 4. Comparison done orderless (sorted magnitudes).
+    _T_PRIME_WIDE = NUM_SLOTS // D_PAD_MLP   # = 2
+
     # ---- gate = Wgate @ x  (rect wide; output in PERMUTED stride-t' layout). ----
     t0 = _t()
     gate_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_gate_irp,
@@ -667,16 +837,29 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # gate_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
     gate_ct = phantom.rescale_to_next(ctx, gate_ct)
     gate_ct.set_scale(SCALE)
+    if probe_np is not None and sk is not None:
+        _probe_diff("17.post_Wgate", ctx, encoder, sk, gate_ct,
+                    probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
     # ---- Refresh gate_ct via homomorphic bootstrap. ----
     t0 = _t()
     gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
                              max_abs=_calib["gate"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("18.post_gate_boot", ctx, encoder, sk, gate_ct,
+                    probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
 
     # ---- silu(gate). ----
     t0 = _t()
     silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs)
     _rec("mlp_silu", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("19.post_silu", ctx, encoder, sk, silu_gate,
+                    probe_np["silu_gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
+
     # ---- up = Wup @ x. (Re-use x_irp; same chain.) ----
     t0 = _t()
     up_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_up_irp,
@@ -688,11 +871,19 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # up_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
     up_ct = phantom.rescale_to_next(ctx, up_ct)
     up_ct.set_scale(SCALE)
+    if probe_np is not None and sk is not None:
+        _probe_diff("20.post_Wup", ctx, encoder, sk, up_ct,
+                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
     # ---- Refresh up_ct via homomorphic bootstrap. ----
     t0 = _t()
     up_ct = bootstrap_safe(engine, ctx, encoder, up_ct,
                            max_abs=_calib["up"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("21.post_up_boot", ctx, encoder, sk, up_ct,
+                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
 
     # ---- h = silu_gate * up. ----
     t0 = _t()
@@ -707,6 +898,10 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     h_ct = phantom.rescale_to_next(ctx, h_ct)
     h_ct.set_scale(SCALE)
     _rec("mlp_swiglu", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("22.post_swiglu", ctx, encoder, sk, h_ct,
+                    probe_np["h_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
 
     # ---- Refresh h via homomorphic bootstrap (preserves permuted layout). ----
     t0 = _t()
@@ -717,6 +912,10 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
     h_fresh = phantom.mod_switch_to(ctx, h_fresh, irp_mlp_chain)
     _rec("bootstrap", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("23.post_h_boot", ctx, encoder, sk, h_fresh,
+                    probe_np["h_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
 
     # ---- out = Wdown @ h  (rect tall). ----
     t0 = _t()
@@ -734,6 +933,9 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     out_ct.set_scale(SCALE)
     out_periodic = out_ct
     _rec("layout_shift", t0)
+    if probe_np is not None and sk is not None:
+        _probe_diff("24.post_Wdown", ctx, encoder, sk, out_ct,
+                    probe_np["out_P"], stride=T_MODEL, count=D_MODEL)
     return out_periodic
 
 
@@ -1024,6 +1226,64 @@ def main():
             ctx, encoder, sk, fresh_ci, x_btd,
             w["g1"], Wq_baked, w["Wk"], w["Wv"],
             cos_all, sin_all, P)
+
+        # ---- Build probe_np dict for L31 per-stage diff probes. ----
+        # All intermediates computed from the same weights and x_btd that the
+        # FHE pipeline uses, so FHE-vs-numpy diffs isolate FHE error alone.
+        _pnp = None
+        if layer_idx == 31:
+            _xn = rmsnorm_np(x_btd, w["g1"])               # post-rms1, [NUM_TOKENS, D_MODEL]
+            _K = ((_xn @ w["Wk"].T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD))
+            _V = ((_xn @ w["Wv"].T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD))
+            _K = apply_rope_np(_K, cos_all, sin_all)
+            _K_full = np.repeat(_K, N_KV_GROUPS, axis=1)   # [NUM_TOKENS, N_HEADS, D_HEAD]
+            _V_full = np.repeat(_V, N_KV_GROUPS, axis=1)
+            # Q at position P: Wq_baked already includes RoPE for position P
+            _Q_P = (_xn[P] @ Wq_baked.T).reshape(N_HEADS, D_HEAD)  # [N_HEADS, D_HEAD]
+            # scores[tok, h] = Q_P[h] . K_full[tok, h] / sqrt(D_HEAD)
+            _scores = np.einsum('hd,thd->th', _Q_P, _K_full) / math.sqrt(D_HEAD)
+            _c_per_head = _scores.max(0) + 0.5              # [N_HEADS]
+            _scores_minus_c = _scores - _c_per_head[None, :]  # [NUM_TOKENS, N_HEADS]
+            # softmax (true, not FHE approx)
+            _exp_s = np.exp(_scores_minus_c - _scores_minus_c.max(0, keepdims=True))
+            _softmax_w = _exp_s / _exp_s.sum(0, keepdims=True)  # [NUM_TOKENS, N_HEADS]
+            # attention output at P: weights @ V, then Wo
+            _attn_P = np.einsum('th,thd->hd', _softmax_w, _V_full).reshape(N_HEADS * D_HEAD)
+            _o_P = _attn_P @ w["Wo"].T                      # [D_MODEL]
+            _x_mid = x_btd.copy(); _x_mid[P] = x_btd[P] + _o_P
+            _x_mid_n = rmsnorm_np(_x_mid, w["g2"])
+            _gate_P = _x_mid_n[P] @ w["Wgate"].T            # [D_HIDDEN]
+            # Pad gate/up to D_PAD_MLP to match what the FHE IRP produces
+            _gate_P_pad = np.zeros(D_PAD_MLP, dtype=np.float64)
+            _gate_P_pad[:D_HIDDEN] = _gate_P
+            _silu_gate_P_pad = np.zeros(D_PAD_MLP, dtype=np.float64)
+            _silu_gate_P_pad[:D_HIDDEN] = silu_np(_gate_P)
+            _up_P = _x_mid_n[P] @ w["Wup"].T               # [D_HIDDEN]
+            _up_P_pad = np.zeros(D_PAD_MLP, dtype=np.float64)
+            _up_P_pad[:D_HIDDEN] = _up_P
+            _h_P = silu_np(_gate_P) * _up_P                 # [D_HIDDEN]
+            _h_P_pad = np.zeros(D_PAD_MLP, dtype=np.float64)
+            _h_P_pad[:D_HIDDEN] = _h_P
+            _out_P = _h_P @ w["Wdown"].T                    # [D_MODEL]
+            _y_P = _x_mid[P] + _out_P
+            _pnp = {
+                "x_btd_P":       x_btd[P],                  # [D_MODEL]
+                "xn_P":          _xn[P],                     # [D_MODEL]
+                "Q_P_flat":      _Q_P.reshape(-1),           # [D_TOTAL]
+                "scores_minus_c": _scores_minus_c,           # [NUM_TOKENS, N_HEADS]
+                "softmax_weights": _softmax_w,               # [NUM_TOKENS, N_HEADS]
+                "attn_P":        _attn_P,                    # [N_HEADS*D_HEAD]
+                "o_P":           _o_P,                       # [D_MODEL]
+                "x_mid_P":       _x_mid[P],                  # [D_MODEL]
+                "x_mid_n_P":     _x_mid_n[P],               # [D_MODEL]
+                "gate_P":        _gate_P_pad,                # [D_PAD_MLP]
+                "silu_gate_P":   _silu_gate_P_pad,           # [D_PAD_MLP]
+                "up_P":          _up_P_pad,                  # [D_PAD_MLP]
+                "h_P":           _h_P_pad,                   # [D_PAD_MLP]
+                "out_P":         _out_P,                     # [D_MODEL]
+                "y_P":           _y_P,                       # [D_MODEL]
+            }
+
         # FHE forward
         y_full_fhe, total_ms, stage_times, _y_ct_out = run_decoder_fhe(
             engine, ctx, encoder, sk, relin_key, galois_key,
@@ -1033,7 +1293,8 @@ def main():
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             rms1_w, rms2_w, rms1_p, rms2_p, boot_before,
             label=f"decoder{layer_idx}", max_abs_calib=max_abs_calib,
-            silu_coeffs=silu_coeffs)
+            silu_coeffs=silu_coeffs,
+            probe=(layer_idx == 31), probe_np=_pnp)
         y_p_fhe = y_full_fhe[::T_MODEL][:D_MODEL]
         # accuracy vs numpy reference at P
         err_np = y_p_fhe - y_btd_np[P]
