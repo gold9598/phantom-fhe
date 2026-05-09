@@ -1,8 +1,26 @@
 """SiLU via Chebyshev polynomial evaluation."""
 
 import sys
+import numpy as np
+from numpy.polynomial import Chebyshev, Polynomial
 sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/build/lib")
 import pyPhantom as phantom
+
+
+def _silu(x):
+    return x * (1.0 / (1.0 + np.exp(-x)))
+
+
+def fit_silu_coeffs(domain, deg=14, n_samples=4001):
+    """Fit a degree-`deg` Chebyshev polynomial to silu on the given symmetric
+    domain (-d, d) and return monomial coefficients suitable for
+    phantom.eval_polynomial. Cost: ~5ms per fit.
+    """
+    x = np.linspace(domain[0], domain[1], n_samples)
+    y = _silu(x)
+    cheb = Chebyshev.fit(x, y, deg, domain=domain)
+    mono = cheb.convert(kind=Polynomial, domain=domain, window=domain)
+    return mono.coef.tolist()
 
 # Degree-8 Chebyshev fit of SiLU on [-2, 2]. L_inf err 2.74e-5 over [-2, 2].
 # Calibrated for layer-0 gate magnitudes; saturates badly outside [-2, 2]
@@ -65,12 +83,12 @@ SILU_COEFFS_DEG14_R6 = [
 ]
 
 
-def silu(ctx, encoder, relin_key, ct):
-    """Evaluate SiLU on ct using the Chebyshev approximation. Default uses
-    the degree-14 fit on [-6, 6]: covers the gate magnitudes observed across
-    all 32 LLaMA-3.1-8B decoder layers (max|gate|=5.88), and stays at the
-    same depth (4 levels via PS) as the original degree-8 polynomial — the
-    higher-degree variants below cost +1 level each, which pushes the
-    downstream swiglu past the per-block level budget and regresses
-    accuracy at deeper layers."""
-    return phantom.eval_polynomial(ctx, encoder, relin_key, ct, SILU_COEFFS_DEG14_R6)
+def silu(ctx, encoder, relin_key, ct, coeffs=None):
+    """Evaluate SiLU on ct using a Chebyshev polynomial. If `coeffs` is None
+    use the default degree-14 fit on [-6, 6] (covers max|gate|≈5.88 observed
+    across the first 31 LLaMA-3.1-8B layers; layer 31's gate reaches 12.7,
+    so the caller should pass a wider per-layer fit via fit_silu_coeffs).
+    Coefficients must be in monomial order, length determines the polynomial
+    degree."""
+    return phantom.eval_polynomial(ctx, encoder, relin_key, ct,
+                                    coeffs if coeffs is not None else SILU_COEFFS_DEG14_R6)

@@ -47,7 +47,7 @@ from blocks.attention import (
     sdpa_irp_required_steps,
 )
 from blocks.softmax import softmax_damping_schedule
-from blocks.silu import silu
+from blocks.silu import silu, fit_silu_coeffs
 from blocks.bootstrap import bootstrap_safe
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
@@ -358,7 +358,7 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
                     sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
                     rms1_w, rms2_w, rms1_p, rms2_p,
                     boot_before, label="layer", probe=False,
-                    max_abs_calib=None):
+                    max_abs_calib=None, silu_coeffs=None):
     """Run one decoder layer in FHE. Returns (y_full_np, total_ms, stage_times).
     y_full_np is the decrypted output in stride-T_MODEL layout."""
     stage_times = {}
@@ -432,7 +432,8 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         x_mid_norm,
         diag_gate_irp, diag_up_irp, diag_down_irp,
         sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-        stage_times=stage_times, max_abs_calib=max_abs_calib)
+        stage_times=stage_times, max_abs_calib=max_abs_calib,
+        silu_coeffs=silu_coeffs)
     stage_times["mlp"] = (time.perf_counter() - t0) * 1000
     print(f"  mlp done. chain={mlp_out.chain_index()}")
     if probe: _probe("post-mlp mlp_out", ctx, encoder, sk, mlp_out)
@@ -632,7 +633,8 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             x_mid_norm,
                             diag_gate_irp, diag_up_irp, diag_down_irp,
                             sub_mask_wide_pt, sub_mask_tall_pt, input_mask_pt,
-                            stage_times=None, max_abs_calib=None):
+                            stage_times=None, max_abs_calib=None,
+                            silu_coeffs=None):
     # Layer-0 defaults; overridden per-layer via max_abs_calib (Stage 3a').
     _calib = {"gate": 1.66, "up": 1.78, "h": 1.26}
     if max_abs_calib is not None:
@@ -673,7 +675,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
 
     # ---- silu(gate). ----
     t0 = _t()
-    silu_gate = silu(ctx, encoder, relin_key, gate_ct)
+    silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs)
     _rec("mlp_silu", t0)
     # ---- up = Wup @ x. (Re-use x_irp; same chain.) ----
     t0 = _t()
@@ -968,7 +970,7 @@ def main():
     print(render_plan_table(plan))
     boot_before = {plan.layers[s.layer_idx].name: s.bootstrap_before for s in plan.steps}
 
-    NUM_DECODERS = 2
+    NUM_DECODERS = 32
     # Stage 3a: each layer is tested in isolation against PyTorch ground truth.
     # x_btd at layer L is set to pytorch_ref[L] (PyTorch's hidden state at L's
     # input). FHE output at P should then match pytorch_ref[L+1, P]. This avoids
@@ -998,10 +1000,16 @@ def main():
         z2_min, z2_max = rms_z_window(z2_l)
         # Per-layer bootstrap_safe calibrations from numpy forward.
         max_abs_calib = compute_layer_max_abs(x_btd, w, cos_all, sin_all, P)
+        # Per-layer silu polynomial fit to this layer's actual gate range.
+        # max_abs_calib["gate"] already includes the BOOT_CALIB_MARGIN; reuse it
+        # as the silu polynomial domain so the fit covers all gate values with
+        # the same margin used everywhere else.
+        silu_domain = (-max_abs_calib["gate"], max_abs_calib["gate"])
+        silu_coeffs = fit_silu_coeffs(silu_domain, deg=14)
         print(f"  [calib] layer {layer_idx}: z1={z1_l:.3e} z2={z2_l:.3e}; "
               f"q={max_abs_calib['q']:.2f} scores={max_abs_calib['scores']:.2f} "
-              f"gate={max_abs_calib['gate']:.2f} up={max_abs_calib['up']:.2f} "
-              f"h={max_abs_calib['h']:.2f}")
+              f"gate={max_abs_calib['gate']:.2f} (silu domain ±{max_abs_calib['gate']:.2f}) "
+              f"up={max_abs_calib['up']:.2f} h={max_abs_calib['h']:.2f}")
         rms1_p = _make_rms_params(z1_min, z1_max)
         rms2_p = _make_rms_params(z2_min, z2_max)
         rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, w["g1"].tolist(), stride=T_MODEL)
@@ -1020,7 +1028,8 @@ def main():
             diag_gate_irp, diag_up_irp, diag_down_irp,
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             rms1_w, rms2_w, rms1_p, rms2_p, boot_before,
-            label=f"decoder{layer_idx}", max_abs_calib=max_abs_calib)
+            label=f"decoder{layer_idx}", max_abs_calib=max_abs_calib,
+            silu_coeffs=silu_coeffs)
         y_p_fhe = y_full_fhe[::T_MODEL][:D_MODEL]
         # accuracy vs numpy reference at P
         err_np = y_p_fhe - y_btd_np[P]
