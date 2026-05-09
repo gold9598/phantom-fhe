@@ -213,6 +213,60 @@ def rms_z_window(z):
     """Symmetric multiplicative window around z."""
     return (z * (1.0 - RMS_Z_MARGIN), z * (1.0 + RMS_Z_MARGIN))
 
+BOOT_CALIB_MARGIN = 1.5  # safety margin over numpy-predicted max|.| at each
+                          # bootstrap_safe site, to absorb FHE-side noise drift.
+
+
+def compute_layer_max_abs(x_btd, w, cos_all, sin_all, P, margin=BOOT_CALIB_MARGIN):
+    """Trace numpy forward and record max|.| at every bootstrap_safe site.
+    Returns a dict of per-site max_abs values (margined) for this layer's
+    actual input distribution. Used by fhe_attention_irp_bootstrap and
+    fhe_mlp_irp_bootstrap to calibrate the in-block CKKS bootstraps."""
+    g1, g2 = w["g1"], w["g2"]
+    Wq, Wk, Wv, Wo = w["Wq"], w["Wk"], w["Wv"], w["Wo"]
+    Wgate, Wup, Wdown = w["Wgate"], w["Wup"], w["Wdown"]
+
+    xn = rmsnorm_np(x_btd, g1)  # post-rms1
+    Q_full = (xn @ Wq.T).reshape(NUM_TOKENS, N_HEADS, D_HEAD)
+    K_full = (xn @ Wk.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    V_full = (xn @ Wv.T).reshape(NUM_TOKENS, N_KV_HEADS, D_HEAD)
+    Q_full = apply_rope_np(Q_full, cos_all, sin_all)
+    K_full = apply_rope_np(K_full, cos_all, sin_all)
+    K_full = np.repeat(K_full, N_KV_GROUPS, axis=1)
+    V_full = np.repeat(V_full, N_KV_GROUPS, axis=1)
+    q_max = float(np.abs(Q_full[P]).max())
+    scores = np.einsum('hd,thd->ht', Q_full[P], K_full) / math.sqrt(D_HEAD)
+    c_per_head = scores.max(0) + 0.5
+    scores_post_C = scores - c_per_head[None, :]
+    scores_max = float(np.abs(scores_post_C).max())
+    weights = np.exp(scores_post_C - scores_post_C.max(-1, keepdims=True))
+    weights = weights / weights.sum(-1, keepdims=True)
+    attn_p = np.einsum('ht,thd->hd', weights, V_full).reshape(N_HEADS * D_HEAD)
+    o_p = attn_p @ Wo.T
+    x_mid_full = x_btd.copy(); x_mid_full[P] = x_btd[P] + o_p
+    x_mid_max = float(np.abs(x_mid_full[P]).max())
+    x_mid_n = rmsnorm_np(x_mid_full, g2)
+    rms2_out_max = float(np.abs(x_mid_n[P]).max())
+    gate_pre = x_mid_n[P] @ Wgate.T
+    gate_max = float(np.abs(gate_pre).max())
+    gate_silu = silu_np(gate_pre)
+    up = x_mid_n[P] @ Wup.T
+    up_max = float(np.abs(up).max())
+    h = gate_silu * up
+    h_max = float(np.abs(h).max())
+    return {
+        "x_in":     float(np.abs(x_btd[P]).max()) * margin,  # pre-rms1 (boot before rms1)
+        "rms1_out": float(np.abs(xn[P]).max()) * margin,      # post-rms1 (boot before attn)
+        "x_mid":    x_mid_max * margin,                        # post-residual1 (boot before rms2)
+        "rms2_out": rms2_out_max * margin,                    # post-rms2 (boot before mlp)
+        "q":        q_max * margin,                            # post-Wq IRP
+        "scores":   scores_max * margin,                       # post-attn_A scores - C
+        "gate":     gate_max * margin,                         # post-Wgate IRP (pre-silu)
+        "up":       up_max * margin,                           # post-Wup IRP
+        "h":        h_max * margin,                            # post-silu*up (swiglu output)
+    }
+
+
 def compute_layer_z(x_btd, g1, g2, Wq, Wk, Wv, Wo, cos_all, sin_all, P):
     """Return (z_rms1, z_rms2) — the mean(x²)+EPSILON values that the rms1
     and rms2 polynomials must cover for this layer's query position P."""
@@ -303,7 +357,8 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
                     diag_gate_irp, diag_up_irp, diag_down_irp,
                     sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
                     rms1_w, rms2_w, rms1_p, rms2_p,
-                    boot_before, label="layer", probe=False):
+                    boot_before, label="layer", probe=False,
+                    max_abs_calib=None):
     """Run one decoder layer in FHE. Returns (y_full_np, total_ms, stage_times).
     y_full_np is the decrypted output in stride-T_MODEL layout."""
     stage_times = {}
@@ -313,11 +368,13 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         _probe("input k_ct", ctx, encoder, sk, k_ct)
         _probe("input v_ct", ctx, encoder, sk, v_ct)
 
+    # Outer bootstrap calibrations between named layers. Default = layer-0
+    # tuning; overridden per-layer by max_abs_calib (Stage 3a').
     _BOOT_MAX_ABS = {
-        "rms1": 1.0,
-        "attention": 1.0,
-        "rms2": 1.0,
-        "mlp": 1.0,
+        "rms1":      (max_abs_calib or {}).get("x_in",     1.0),
+        "attention": (max_abs_calib or {}).get("rms1_out", 1.0),
+        "rms2":      (max_abs_calib or {}).get("x_mid",    1.0),
+        "mlp":       (max_abs_calib or {}).get("rms2_out", 1.0),
     }
 
     def _maybe_boot(name, ct):
@@ -347,7 +404,8 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
     attn_out = fhe_attention_irp_bootstrap(
         engine, ctx, encoder, relin_key, galois_key,
         x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
-        k_ct, v_ct, c_per_head, stage_times=stage_times)
+        k_ct, v_ct, c_per_head, stage_times=stage_times,
+        max_abs_calib=max_abs_calib)
     stage_times["attention"] = (time.perf_counter() - t0) * 1000
     print(f"  attention done. chain={attn_out.chain_index()}")
     if probe: _probe("post-attention attn_out", ctx, encoder, sk, attn_out)
@@ -374,7 +432,7 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         x_mid_norm,
         diag_gate_irp, diag_up_irp, diag_down_irp,
         sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-        stage_times=stage_times)
+        stage_times=stage_times, max_abs_calib=max_abs_calib)
     stage_times["mlp"] = (time.perf_counter() - t0) * 1000
     print(f"  mlp done. chain={mlp_out.chain_index()}")
     if probe: _probe("post-mlp mlp_out", ctx, encoder, sk, mlp_out)
@@ -406,12 +464,17 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
                                  diag_wq_irp, diag_wo_irp,
                                  mask_attn_pt,
                                  k_ct, v_ct, c_per_head,
-                                 stage_times=None):
+                                 stage_times=None, max_abs_calib=None):
     """Stage-2 IRP-native attention. Q stays in stride-T_MODEL packing through
     the entire SDPA. K/V cache packed interleaved across t tokens within a
     single ciphertext (Cachemir §5.1). No sk-touching relayouts in the
     decoder body.
     """
+    # Layer-0 defaults; overridden per-layer via max_abs_calib (Stage 3a').
+    _calib = {"q": 2.5, "scores": 45.10}
+    if max_abs_calib is not None:
+        _calib.update({k: max_abs_calib[k] for k in ("q", "scores") if k in max_abs_calib})
+
     def _t(): return time.perf_counter()
     def _rec(name, t0):
         if stage_times is None: return
@@ -445,7 +508,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     # mask*scale past chain 29 (= NSL_MAX) and overflow. ----
     t0 = _t()
     q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
-                          max_abs=2.5, slot_count=NUM_SLOTS)
+                          max_abs=_calib["q"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- compute_qkt_irp + mask*scale + sub(C[h]). ----
@@ -472,7 +535,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     # ---- bootstrap before damped squarings. ----
     t0 = _t()
     scores_ct = bootstrap_safe(engine, ctx, encoder, scores_ct,
-                               max_abs=45.10, slot_count=NUM_SLOTS)
+                               max_abs=_calib["scores"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- ps_exp_init + damped squarings. ----
@@ -569,7 +632,12 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             x_mid_norm,
                             diag_gate_irp, diag_up_irp, diag_down_irp,
                             sub_mask_wide_pt, sub_mask_tall_pt, input_mask_pt,
-                            stage_times=None):
+                            stage_times=None, max_abs_calib=None):
+    # Layer-0 defaults; overridden per-layer via max_abs_calib (Stage 3a').
+    _calib = {"gate": 1.66, "up": 1.78, "h": 1.26}
+    if max_abs_calib is not None:
+        _calib.update({k: max_abs_calib[k] for k in ("gate", "up", "h") if k in max_abs_calib})
+
     def _t(): return time.perf_counter()
     def _rec(name, t0):
         if stage_times is None: return
@@ -600,7 +668,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # ---- Refresh gate_ct via homomorphic bootstrap. ----
     t0 = _t()
     gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
-                             max_abs=1.66, slot_count=NUM_SLOTS)
+                             max_abs=_calib["gate"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- silu(gate). ----
@@ -621,7 +689,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # ---- Refresh up_ct via homomorphic bootstrap. ----
     t0 = _t()
     up_ct = bootstrap_safe(engine, ctx, encoder, up_ct,
-                           max_abs=1.78, slot_count=NUM_SLOTS)
+                           max_abs=_calib["up"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
 
     # ---- h = silu_gate * up. ----
@@ -641,7 +709,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # ---- Refresh h via homomorphic bootstrap (preserves permuted layout). ----
     t0 = _t()
     h_fresh = bootstrap_safe(engine, ctx, encoder, h_ct,
-                             max_abs=1.26, slot_count=NUM_SLOTS)
+                             max_abs=_calib["h"], slot_count=NUM_SLOTS)
     # Mod-switch to IRP_MLP chain so plaintext chain indices align and GPU
     # memory stays within budget (chain 16 has 30 primes; chain 26 has 5).
     irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
@@ -928,8 +996,12 @@ def main():
                                       cos_all, sin_all, P)
         z1_min, z1_max = rms_z_window(z1_l)
         z2_min, z2_max = rms_z_window(z2_l)
-        print(f"  [calib] layer {layer_idx}: z1={z1_l:.3e} window=[{z1_min:.3e},{z1_max:.3e}]; "
-              f"z2={z2_l:.3e} window=[{z2_min:.3e},{z2_max:.3e}]")
+        # Per-layer bootstrap_safe calibrations from numpy forward.
+        max_abs_calib = compute_layer_max_abs(x_btd, w, cos_all, sin_all, P)
+        print(f"  [calib] layer {layer_idx}: z1={z1_l:.3e} z2={z2_l:.3e}; "
+              f"q={max_abs_calib['q']:.2f} scores={max_abs_calib['scores']:.2f} "
+              f"gate={max_abs_calib['gate']:.2f} up={max_abs_calib['up']:.2f} "
+              f"h={max_abs_calib['h']:.2f}")
         rms1_p = _make_rms_params(z1_min, z1_max)
         rms2_p = _make_rms_params(z2_min, z2_max)
         rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, w["g1"].tolist(), stride=T_MODEL)
@@ -948,7 +1020,7 @@ def main():
             diag_gate_irp, diag_up_irp, diag_down_irp,
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             rms1_w, rms2_w, rms1_p, rms2_p, boot_before,
-            label=f"decoder{layer_idx}")
+            label=f"decoder{layer_idx}", max_abs_calib=max_abs_calib)
         y_p_fhe = y_full_fhe[::T_MODEL][:D_MODEL]
         # accuracy vs numpy reference at P
         err_np = y_p_fhe - y_btd_np[P]
