@@ -612,6 +612,54 @@ def score_times_v_irp(
     return out
 
 
+def score_times_v_irp_multi(
+    ctx, encoder, relin_key, galois_key,
+    weights_blocks, v_blocks_cts,
+    d_head: int, d_total: int, t: int,
+    output_mask_pt,
+    num_tokens_per_block: int = None,
+):
+    """Compute Σ_t weights[t, h] * V[t, h, j] over a multi-ciphertext
+    weights/V cache (Stage 3b-d).
+
+    Each weights_block_k and v_block_k holds tokens [k*t, (k+1)*t). Calls
+    score_times_v_irp on each pair to produce a per-block partial attn
+    output, then sums across blocks for the final attn_irp ct.
+
+    For partial blocks (last block with block_size < t), the weights_block
+    is already masked (slots beyond block_size are zero from the per-block
+    softmax pipeline), so the contribution from those slots is zero — we
+    pass num_tokens_per_block=t for all blocks. The reduce step in
+    score_times_v_irp sums all t slots; the masked-out positions contribute
+    zero.
+
+    Required Galois steps: same as score_times_v_irp for a single block —
+    {-t, -2t, ..., -t*d_head/2} (broadcast over j-axis) and {1, 2, ..., t/2}
+    (reduce over tok-axis).
+    """
+    if num_tokens_per_block is None:
+        num_tokens_per_block = t
+    n_blocks = len(weights_blocks)
+    if len(v_blocks_cts) != n_blocks:
+        raise ValueError("score_times_v_irp_multi: weights and v block counts mismatch")
+    if n_blocks == 0:
+        raise ValueError("score_times_v_irp_multi: blocks list is empty")
+
+    partials = []
+    for w_block, v_block in zip(weights_blocks, v_blocks_cts):
+        partial = score_times_v_irp(
+            ctx, encoder, relin_key, galois_key,
+            w_block, v_block,
+            d_head, d_total, num_tokens_per_block, t, output_mask_pt)
+        partials.append(partial)
+
+    # Cross-block sum: free in level cost (just adds).
+    attn = partials[0]
+    for k in range(1, n_blocks):
+        attn = phantom.add(ctx, attn, partials[k])
+    return attn
+
+
 def attention_forward_required_steps(
     baby_steps: int,
     d_head: int,
