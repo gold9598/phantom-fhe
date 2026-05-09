@@ -1,0 +1,495 @@
+"""End-to-end MRPC single-example FHE forward via multi-ct K/V cache.
+
+Stage 3b-f-1: skeleton that runs at NUM_TOKENS up to T_MODEL=8 (single
+block, n_blocks=1). Verifies the multi-ct attention path reduces to the
+single-ct path on a known input. Same prompt as the existing llama3.py
+sanity check: [BOS, "The", " quick", " brown"] (4 tokens).
+
+3b-f-2 will scale to NUM_TOKENS=64 (n_blocks=8) on a real MRPC prompt.
+"""
+import json
+import math
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/build/lib")
+import pyPhantom as phantom
+
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
+from blocks.attention import (
+    compute_qkt_irp_multi, multi_ct_softmax_finalize, score_times_v_irp_multi,
+    qkt_irp_mask_scale_plaintext, qkt_irp_per_head_sub_plaintext,
+    score_v_irp_output_mask_plaintext,
+    sdpa_irp_required_steps,
+)
+from blocks.bootstrap import bootstrap_safe
+from blocks.bootstrap_placement import (
+    build_layers_from_table, find_optimal_placement, render_plan_table,
+)
+from blocks.irp import (
+    encode_irp_diagonals_host, irp_matvec_host,
+    encode_irp_mask, irp_required_steps,
+    encode_irp_diagonals_rect_host, irp_matvec_rect_host,
+    encode_irp_mask_rect, irp_required_steps_rect,
+)
+from blocks.kv_layout import pack_kv_blocks
+from blocks.lm_head import yes_no_logits_np
+from blocks.residual import residual
+from blocks.rmsnorm import (
+    rmsnorm_forward_stride_t, rmsnorm_required_steps_stride_t,
+    setup_rmsnorm_weights,
+)
+from blocks.silu import silu, fit_silu_coeffs
+from blocks.softmax import softmax_damping_schedule
+from llama3 import (
+    LOG_N, N, NUM_SLOTS, SCALE, SPARSE_HW,
+    D_MODEL, D_HEAD, N_HEADS, N_KV_HEADS, N_KV_GROUPS, D_TOTAL,
+    T_MODEL, BABY_STEPS_IRP_SQUARE, D_HIDDEN, D_PAD_MLP, BABY_STEPS_IRP_MLP,
+    EPSILON, P, NUM_SQUARINGS, EXTRA_SCALE, ITERS, TARGET_MAG, RMS_POLY_DEG,
+    NUM_SCALE_LEVELS, NUM_SPECIAL_PRIMES,
+    USER_LEVEL_IRP_ATTN, USER_LEVEL_IRP_MLP,
+    PROBE, PROBE_FULL,
+    BOOT_CALIB_MARGIN,
+    rmsnorm_np, apply_rope_np, rope_matrix_np, silu_np,
+    rms_z_window, compute_layer_z, compute_layer_max_abs,
+    forward_decoder_np,
+    load_layer_weights, encode_layer_irps,
+    fhe_mlp_irp_bootstrap,
+)
+
+
+def _make_rms_params_local(zmin, zmax):
+    """Local rmsnorm_params builder (mirrors llama3.main()'s nested fn)."""
+    p = phantom.rmsnorm_params()
+    p.d_model = D_MODEL
+    p.epsilon = EPSILON
+    p.z_min = zmin
+    p.z_max = zmax
+    p.poly_degree = RMS_POLY_DEG
+    return p
+
+
+def build_user_steps_mrpc():
+    """Galois rotation steps needed for the multi-ct MRPC pipeline at
+    NUM_TOKENS_PER_BLOCK=T_MODEL=8."""
+    log_t = int(round(math.log2(T_MODEL)))
+    log_d_head = int(round(math.log2(D_HEAD)))
+
+    rms_steps = rmsnorm_required_steps_stride_t(D_MODEL, T_MODEL)
+    sdpa_steps = sdpa_irp_required_steps(D_HEAD, D_TOTAL, T_MODEL, T_MODEL)
+    irp_attn_steps = irp_required_steps(NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE)
+    irp_mlp_w_steps = irp_required_steps_rect(NUM_SLOTS, D_MODEL, D_PAD_MLP,
+                                                baby_steps=BABY_STEPS_IRP_MLP)
+    irp_mlp_t_steps = irp_required_steps_rect(NUM_SLOTS, D_PAD_MLP, D_MODEL,
+                                                baby_steps=BABY_STEPS_IRP_MLP)
+    # Multi-ct softmax: within-block + broadcast doubling
+    softmax_steps = []
+    for s in range(log_t):
+        softmax_steps.append(int(1 << s))
+        softmax_steps.append(-int(1 << s))
+
+    user_steps = sorted(set(
+        list(rms_steps) + list(sdpa_steps) +
+        list(irp_attn_steps) + list(irp_mlp_w_steps) + list(irp_mlp_t_steps) +
+        softmax_steps
+    ))
+    return user_steps
+
+
+def setup_engine(user_steps, target_chain_default):
+    """Build engine with the given Galois rotation steps. Uniform target
+    chain for simplicity (3b-f-1); per-step optimization deferred to 3b-f-3."""
+    target_chain_indices = [target_chain_default] * len(user_steps)
+    cfg = phantom.ckks_engine_config()
+    cfg.log_n = LOG_N
+    cfg.user_scale = SCALE
+    cfg.num_scale_levels = NUM_SCALE_LEVELS
+    cfg.sparse_hw = SPARSE_HW
+    cfg.num_special_primes = NUM_SPECIAL_PRIMES
+    cfg.include_user_rotations = False
+    cfg.user_rotation_steps = user_steps
+    cfg.user_rotation_target_chain_indices = target_chain_indices
+    print(f"  Engine: logN={LOG_N} NSL={NUM_SCALE_LEVELS} #user_steps={len(user_steps)}")
+    t0 = time.perf_counter()
+    eng = phantom.ckks_engine(cfg)
+    print(f"  engine built in {time.perf_counter()-t0:.1f}s")
+    return eng
+
+
+def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
+                                 num_tokens, cos_all, sin_all):
+    """Compute K, V at all NUM_TOKENS positions, RoPE, pack into n_blocks
+    slot vectors, encrypt. Also encrypt x at query position P.
+
+    Returns:
+      x_ct: 1 ciphertext (single-token query in stride-T_MODEL layout)
+      k_cts: list of n_blocks K ciphertexts
+      v_cts: list of n_blocks V ciphertexts
+      c_per_head: numpy array (N_HEADS,) — per-head softmax shift constant
+      Wq_baked: numpy (D_TOTAL, D_MODEL) — Wq with R_P pre-applied
+    """
+    g1 = w["g1"]; Wq = w["Wq"]; Wk = w["Wk"]; Wv = w["Wv"]
+    Wq_baked = Wq.copy()
+    for h in range(N_HEADS):
+        s, e = h * D_HEAD, (h + 1) * D_HEAD
+        Wq_baked[s:e, :] = R_P @ Wq[s:e, :]
+
+    xn = rmsnorm_np(x_btd, g1)
+    K = (xn @ Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+    V = (xn @ Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+    K = apply_rope_np(K, cos_all, sin_all)
+    K_full_h = np.repeat(K, N_KV_GROUPS, axis=1)  # (num_tokens, N_HEADS, D_HEAD)
+    V_full_h = np.repeat(V, N_KV_GROUPS, axis=1)
+
+    Q_np = (xn[P] @ Wq_baked.T).reshape(N_HEADS, D_HEAD)
+    scores_np = np.einsum('hd,thd->th', Q_np, K_full_h) / math.sqrt(D_HEAD)
+    c_per_head = scores_np.max(0) + 0.5
+
+    k_blocks_slots, v_blocks_slots = pack_kv_blocks(
+        K_full_h, V_full_h, num_tokens, T_MODEL, NUM_SLOTS, N_HEADS, D_HEAD)
+    k_cts = [sk.encrypt_symmetric(ctx,
+        encoder.encode_double_vector(ctx, kb.tolist(), SCALE, fresh_ci))
+        for kb in k_blocks_slots]
+    v_cts = [sk.encrypt_symmetric(ctx,
+        encoder.encode_double_vector(ctx, vb.tolist(), SCALE, fresh_ci))
+        for vb in v_blocks_slots]
+
+    x_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+    x_slots[::T_MODEL][:D_MODEL] = x_btd[P]
+    x_ct = sk.encrypt_symmetric(ctx,
+        encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, fresh_ci))
+
+    return x_ct, k_cts, v_cts, c_per_head, Wq_baked
+
+
+def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
+                             x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
+                             k_cts, v_cts, c_per_head,
+                             num_tokens, max_abs_calib, head_first_slot_mask_slots,
+                             stage_times=None):
+    """Multi-ct attention block. Same shape as fhe_attention_irp_bootstrap
+    but using compute_qkt_irp_multi + per-block softmax pipeline +
+    multi_ct_softmax_finalize + score_times_v_irp_multi.
+
+    For a single block (n_blocks=1, NUM_TOKENS<=T_MODEL=8) this reduces to
+    the single-ct flow (within FHE noise tolerance) — Stage 3b-f-1 sanity.
+    """
+    def _t(): return time.perf_counter()
+    def _rec(name, t0):
+        if stage_times is None: return
+        stage_times.setdefault(name, 0.0)
+        stage_times[name] += (time.perf_counter() - t0) * 1000.0
+
+    n_blocks = len(k_cts)
+    _calib = {"q": 2.5, "scores": 45.10}
+    if max_abs_calib is not None:
+        _calib.update({k: max_abs_calib[k] for k in ("q", "scores") if k in max_abs_calib})
+
+    # mod_switch x_norm to USER_LEVEL_IRP_ATTN chain
+    t0 = _t()
+    irp_attn_ci = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
+    if x_norm.chain_index() < irp_attn_ci:
+        x_irp = phantom.mod_switch_to(ctx, x_norm, irp_attn_ci)
+    else:
+        x_irp = x_norm
+    _rec("layout_shift", t0)
+
+    # Wq IRP -> q_ct
+    t0 = _t()
+    q_ct = irp_matvec_host(ctx, encoder, galois_key, x_irp, diag_wq_irp,
+                            NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE,
+                            mask_pt=mask_attn_pt)
+    q_ct = phantom.rescale_to_next(ctx, q_ct)
+    q_ct.set_scale(SCALE)
+    _rec("wq_irp", t0)
+
+    # Bootstrap q_ct
+    t0 = _t()
+    q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
+                           max_abs=_calib["q"], slot_count=NUM_SLOTS)
+    _rec("bootstrap", t0)
+
+    # compute_qkt_irp_multi — produces n_blocks score blocks
+    t0 = _t()
+    for k_ct in k_cts:
+        phantom.mod_switch_to_inplace(ctx, k_ct, q_ct.chain_index())
+    score_blocks, block_sizes = compute_qkt_irp_multi(
+        ctx, encoder, relin_key, galois_key,
+        q_ct, k_cts, D_HEAD, D_TOTAL, T_MODEL, num_tokens=num_tokens)
+
+    # Per-block: mask*scale + sub C[h] + bootstrap + ps_exp + damped + mean handling + mask
+    e_blocks = []
+    for blk, (sb, blk_size) in enumerate(zip(score_blocks, block_sizes)):
+        # mask*scale (block-aware: only first blk_size tokens active)
+        nominal = sb.scale()
+        inv_sqrt_d = 1.0 / math.sqrt(float(D_HEAD))
+        ms_pt = qkt_irp_mask_scale_plaintext(
+            ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
+            inv_sqrt_d, sb.chain_index(), SCALE)
+        sb = phantom.multiply_plain(ctx, sb, ms_pt)
+        sb = phantom.rescale_to_next(ctx, sb)
+        sb.set_scale(nominal)
+        sub_pt = qkt_irp_per_head_sub_plaintext(
+            ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
+            c_per_head, sb.chain_index(), sb.scale())
+        sb = phantom.sub_plain(ctx, sb, sub_pt)
+
+        # Bootstrap before damped squarings
+        sb = bootstrap_safe(engine, ctx, encoder, sb,
+                              max_abs=_calib["scores"], slot_count=NUM_SLOTS)
+
+        # ps_exp + damped squarings (use TOTAL num_tokens for damping schedule)
+        damps = softmax_damping_schedule(NUM_SQUARINGS, num_tokens, EXTRA_SCALE, TARGET_MAG)
+        e_ct = phantom.ps_exp_init(
+            ctx, encoder, relin_key, sb,
+            num_tokens, NUM_SQUARINGS, EXTRA_SCALE)
+        phantom.square_iterations_damped_inplace(
+            ctx, encoder, relin_key, e_ct, damps)
+
+        # Mean-sub + bootstrap + mean-add
+        _PRE_FINSMX_MEAN = 0.4487
+        mean_pt_pre = encoder.encode_double_vector(
+            ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.sub_plain(ctx, e_ct, mean_pt_pre)
+        e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
+                                max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+        mean_pt_post = encoder.encode_double_vector(
+            ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
+
+        # Mask: zero out non-meaningful slots
+        e_nominal = e_ct.scale()
+        mask_pt = qkt_irp_mask_scale_plaintext(
+            ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
+            1.0, e_ct.chain_index(), SCALE)
+        e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
+        e_ct = phantom.rescale_to_next(ctx, e_ct)
+        e_ct.set_scale(e_nominal)
+
+        e_blocks.append(e_ct)
+    _rec("attn_blocks", t0)
+
+    # Multi-ct softmax aggregation. Encode the per-head first-slot mask
+    # at e_blocks[0]'s chain so multiply_plain inside the call accepts it.
+    t0 = _t()
+    a_chain_guess = e_blocks[0].chain_index()
+    head_first_slot_mask_pt = encoder.encode_double_vector(
+        ctx, head_first_slot_mask_slots.tolist(), SCALE, a_chain_guess)
+    weights_blocks = multi_ct_softmax_finalize(
+        ctx, encoder, relin_key, galois_key,
+        e_blocks, head_first_slot_mask_pt,
+        N_HEADS, D_HEAD, T_MODEL, ITERS, SCALE)
+    _rec("softmax_finalize", t0)
+
+    # score_times_v_irp_multi
+    t0 = _t()
+    weights_ci = weights_blocks[0].chain_index()
+    for v_ct in v_cts:
+        phantom.mod_switch_to_inplace(ctx, v_ct, weights_ci)
+    sv_mask = score_v_irp_output_mask_plaintext(
+        ctx, encoder, D_HEAD, D_TOTAL, T_MODEL,
+        weights_ci + 1, SCALE)
+    attn_irp = score_times_v_irp_multi(
+        ctx, encoder, relin_key, galois_key,
+        weights_blocks, v_cts,
+        D_HEAD, D_TOTAL, T_MODEL, sv_mask)
+    _rec("score_v", t0)
+
+    # Wo IRP
+    t0 = _t()
+    irp_attn_ci = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
+    if attn_irp.chain_index() < irp_attn_ci:
+        attn_irp = phantom.mod_switch_to(ctx, attn_irp, irp_attn_ci)
+    o_ct = irp_matvec_host(ctx, encoder, galois_key, attn_irp, diag_wo_irp,
+                            NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE,
+                            mask_pt=mask_attn_pt)
+    o_ct = phantom.rescale_to_next(ctx, o_ct)
+    o_ct.set_scale(SCALE)
+    _rec("wo_irp", t0)
+    return o_ct
+
+
+def main():
+    """Stage 3b-f-1 sanity: NUM_TOKENS=4 (single block, n_blocks=1).
+    Same prompt as the existing llama3.py: [BOS, "The", " quick", " brown"].
+    """
+    print("=== Stage 3b-f-1: end-to-end MRPC FHE on 4-token sanity prompt ===")
+    NUM_TOKENS = 4
+
+    # ---- Probe v1: 4-token embed + RoPE
+    L = lambda n: np.load(f"{PROBE}/{n}.npy")
+    cos_all = L("rope_cos")
+    sin_all = L("rope_sin")
+    R_P = rope_matrix_np(cos_all[P], sin_all[P])
+
+    # ---- PyTorch reference activations + LM head data
+    pytorch_pre_norm = np.load(f"{PROBE_FULL}/ref_acts/qbrown4_bos_prenorm.npy").astype(np.float64)  # (4, D_MODEL)
+    pytorch_ref = np.load(f"{PROBE_FULL}/ref_acts/qbrown4_bos.npy").astype(np.float64)  # (33, 4, D_MODEL)
+    final_norm_g = np.load(f"{PROBE_FULL}/final_norm_g.npy").astype(np.float64)
+    lm_head_yesno = np.load(f"{PROBE_FULL}/lm_head_yesno.npy").astype(np.float64)
+    meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
+    yes_id = meta["yes_token_id"]
+    no_id = meta["no_token_id"]
+
+    # ---- Engine
+    user_steps = build_user_steps_mrpc()
+    print(f"User steps ({len(user_steps)}): first 10 = {user_steps[:10]}")
+    engine = setup_engine(user_steps, target_chain_default=16)
+    ctx = engine.context()
+    encoder = engine.encoder()
+    sk = engine.secret_key()
+    relin_key = engine.relin_key()
+    galois_key = engine.galois_key()
+    fresh_ci = engine.user_level_chain_index(0)
+
+    # ---- Layer-independent IRP masks
+    irp_attn_chain = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
+    irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
+    mask_attn_pt = encode_irp_mask(ctx, encoder, NUM_SLOTS, D_TOTAL, SCALE, irp_attn_chain)
+    sub_mask_mlp_wide_pt = encode_irp_mask_rect(
+        ctx, encoder, NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE, irp_mlp_chain)
+    sub_mask_mlp_tall_pt = encode_irp_mask_rect(
+        ctx, encoder, NUM_SLOTS, D_PAD_MLP, D_MODEL, SCALE, irp_mlp_chain + 1)
+    input_mask_mlp_pt = encode_irp_mask(ctx, encoder, NUM_SLOTS, D_MODEL,
+                                          SCALE, irp_mlp_chain)
+
+    # head_first_slot_mask: 1.0 at slot[h*D_HEAD*T_MODEL + 0] for h in [0, N_HEADS).
+    # Encode at runtime at the correct chain (depends on intermediate level
+    # usage; passed as raw slot vector to fhe_attention_multi_ct).
+    hf_mask_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+    for h in range(N_HEADS):
+        hf_mask_slots[h * D_HEAD * T_MODEL] = 1.0
+
+    # ---- Bootstrap placement (same as llama3.py)
+    NSL_MAX = NUM_SCALE_LEVELS - 1
+    T_BOOT_MS = 182.0
+    OUTPUT_LEVEL_AFTER_IRP = USER_LEVEL_IRP_ATTN + 2
+    placement_table = [
+        ("rms1",      7,  29.4, True,  None, True),
+        ("attention", 0, 521.0, True,  OUTPUT_LEVEL_AFTER_IRP, False),
+        ("residual1", 0,   1.0, True,  None, False),
+        ("rms2",      7,  27.4, True,  None, True),
+        ("mlp",       0, 624.1, True,  OUTPUT_LEVEL_AFTER_IRP, False),
+        ("residual2", 0,   1.0, True,  None, False),
+    ]
+    layers_for_dag = build_layers_from_table(placement_table)
+    plan = find_optimal_placement(layers_for_dag, NSL_MAX, T_BOOT_MS)
+    boot_before = {plan.layers[s.layer_idx].name: s.bootstrap_before for s in plan.steps}
+
+    # ---- Per-layer FHE forward
+    NUM_DECODERS = 32
+    print(f"\nRunning {NUM_DECODERS} decoder layers...")
+    layer_times = []
+    y_p_fhe = None  # final hidden state at P (post-residual2 of last layer)
+
+    for layer_idx in range(NUM_DECODERS):
+        t_layer_start = time.perf_counter()
+        x_btd = pytorch_ref[layer_idx]  # (NUM_TOKENS, D_MODEL) — input to layer L
+
+        # Per-layer real weights + IRP encoding
+        w = load_layer_weights(layer_idx)
+        Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
+            encode_layer_irps(ctx, encoder, w, R_P)
+
+        # Per-layer rmsnorm calibration
+        z1_l, z2_l = compute_layer_z(x_btd, w["g1"], w["g2"],
+                                       w["Wq"], w["Wk"], w["Wv"], w["Wo"],
+                                       cos_all, sin_all, P)
+        z1_min, z1_max = rms_z_window(z1_l)
+        z2_min, z2_max = rms_z_window(z2_l)
+        rms1_p = _make_rms_params_local(z1_min, z1_max)
+        rms2_p = _make_rms_params_local(z2_min, z2_max)
+        rms1_w = setup_rmsnorm_weights(ctx, encoder, rms1_p, w["g1"].tolist(), stride=T_MODEL)
+        rms2_w = setup_rmsnorm_weights(ctx, encoder, rms2_p, w["g2"].tolist(), stride=T_MODEL)
+
+        # Per-layer bootstrap_safe + silu calibration
+        max_abs_calib = compute_layer_max_abs(x_btd, w, cos_all, sin_all, P)
+        silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN
+        silu_coeffs = fit_silu_coeffs((-silu_max * 1.2, silu_max * 1.2), deg=14)
+
+        # Encrypt inputs (multi-ct K, V)
+        x_ct, k_cts, v_cts, c_per_head, _ = encrypt_layer_inputs_multi(
+            ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
+            NUM_TOKENS, cos_all, sin_all)
+
+        # ---- FHE forward through one decoder layer ----
+        # rms1
+        if boot_before.get("rms1", False):
+            x_ct = bootstrap_safe(engine, ctx, encoder, x_ct,
+                                    max_abs=max_abs_calib.get("x_in", 1.0),
+                                    slot_count=NUM_SLOTS)
+        x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
+                                            x_ct, rms1_w, rms1_p, t=T_MODEL)
+        # attention (multi-ct)
+        if boot_before.get("attention", False):
+            x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
+                                      max_abs=max_abs_calib.get("rms1_out", 1.0),
+                                      slot_count=NUM_SLOTS)
+        attn_out = fhe_attention_multi_ct(
+            engine, ctx, encoder, relin_key, galois_key, sk,
+            x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
+            k_cts, v_cts, c_per_head,
+            NUM_TOKENS, max_abs_calib, hf_mask_slots)
+        # residual1
+        x_mid_ct = residual(ctx, x_ct, attn_out)
+        # rms2
+        if boot_before.get("rms2", False):
+            x_mid_ct = bootstrap_safe(engine, ctx, encoder, x_mid_ct,
+                                        max_abs=max_abs_calib.get("x_mid", 1.0),
+                                        slot_count=NUM_SLOTS)
+        x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
+                                                x_mid_ct, rms2_w, rms2_p, t=T_MODEL)
+        # mlp
+        if boot_before.get("mlp", False):
+            x_mid_norm = bootstrap_safe(engine, ctx, encoder, x_mid_norm,
+                                           max_abs=max_abs_calib.get("rms2_out", 1.0),
+                                           slot_count=NUM_SLOTS)
+        mlp_out = fhe_mlp_irp_bootstrap(
+            engine, ctx, encoder, relin_key, galois_key,
+            x_mid_norm,
+            diag_gate_irp, diag_up_irp, diag_down_irp,
+            sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+            max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs)
+        # residual2
+        y_ct = residual(ctx, x_mid_ct, mlp_out)
+        layer_ms = (time.perf_counter() - t_layer_start) * 1000
+        layer_times.append(layer_ms)
+
+        # Decrypt for accuracy check (vs pre-norm reference for L=31, vs pytorch_ref[L+1] for others)
+        y_full = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
+                           dtype=np.float64)
+        y_p = y_full[::T_MODEL][:D_MODEL]
+        if layer_idx < NUM_DECODERS - 1:
+            ref = pytorch_ref[layer_idx + 1, P]
+        else:
+            ref = pytorch_pre_norm[P]  # pre-final-norm for L=31
+        max_err = float(np.abs(y_p - ref).max())
+        rel_rms = float(np.linalg.norm(y_p - ref) / np.linalg.norm(ref))
+        print(f"  Layer {layer_idx:2d}: ‖y_fhe‖={np.linalg.norm(y_p):.4f}  "
+              f"‖y_ref‖={np.linalg.norm(ref):.4f}  max|err|={max_err:.3e}  "
+              f"rel-RMS={rel_rms:.3e}  t={layer_ms:.0f}ms")
+        y_p_fhe = y_p
+
+    # ---- LM head (host-side)
+    print("\n--- LM head (host-side) ---")
+    yes_logit, no_logit = yes_no_logits_np(y_p_fhe, final_norm_g, lm_head_yesno,
+                                              eps=meta["rms_norm_eps"])
+    print(f"  FHE yes_logit = {yes_logit:.4f}")
+    print(f"  FHE no_logit  = {no_logit:.4f}")
+
+    # PyTorch reference (computed once in test_lm_head)
+    yes_pt_ref, no_pt_ref = 0.9551, 3.2324
+    print(f"  PT  yes_logit = {yes_pt_ref:.4f}")
+    print(f"  PT  no_logit  = {no_pt_ref:.4f}")
+    print(f"  diff yes={abs(yes_logit-yes_pt_ref):.3e}  no={abs(no_logit-no_pt_ref):.3e}")
+    print(f"  pred FHE: {'Yes' if yes_logit > no_logit else 'No'}  "
+          f"PT: {'Yes' if yes_pt_ref > no_pt_ref else 'No'}")
+
+    print(f"\n--- Total layer time: {sum(layer_times)/1000:.1f}s "
+          f"(avg {sum(layer_times)/len(layer_times):.0f}ms/layer) ---")
+
+
+if __name__ == "__main__":
+    main()
