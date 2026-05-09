@@ -1001,14 +1001,18 @@ def main():
         # Per-layer bootstrap_safe calibrations from numpy forward.
         max_abs_calib = compute_layer_max_abs(x_btd, w, cos_all, sin_all, P)
         # Per-layer silu polynomial fit to this layer's actual gate range.
-        # max_abs_calib["gate"] already includes the BOOT_CALIB_MARGIN; reuse it
-        # as the silu polynomial domain so the fit covers all gate values with
-        # the same margin used everywhere else.
-        silu_domain = (-max_abs_calib["gate"], max_abs_calib["gate"])
+        # max_abs_calib["gate"] is the numpy gate-magnitude × BOOT_CALIB_MARGIN
+        # (1.5x). For silu we use a tighter margin (1.05x) because: (1) FHE
+        # noise on gate is ~1e-3, far less than the 1.5x bootstrap_safe margin
+        # needs; (2) deg-14 Chebyshev fit error scales rapidly with domain
+        # width, so a wider-than-necessary domain costs precision near 0
+        # where most gate slots cluster.
+        silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN  # un-margined
+        silu_domain = (-silu_max * 1.2, silu_max * 1.2)
         silu_coeffs = fit_silu_coeffs(silu_domain, deg=14)
         print(f"  [calib] layer {layer_idx}: z1={z1_l:.3e} z2={z2_l:.3e}; "
               f"q={max_abs_calib['q']:.2f} scores={max_abs_calib['scores']:.2f} "
-              f"gate={max_abs_calib['gate']:.2f} (silu domain ±{max_abs_calib['gate']:.2f}) "
+              f"gate={max_abs_calib['gate']:.2f} (silu ±{silu_domain[1]:.2f}) "
               f"up={max_abs_calib['up']:.2f} h={max_abs_calib['h']:.2f}")
         rms1_p = _make_rms_params(z1_min, z1_max)
         rms2_p = _make_rms_params(z2_min, z2_max)
