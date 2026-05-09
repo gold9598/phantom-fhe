@@ -330,6 +330,7 @@ def multi_ct_softmax_finalize(
     e_blocks, head_first_slot_mask_pt,
     n_heads: int, d_head: int, t: int, iters: int,
     user_scale: float,
+    sk=None, verbose=False,
 ):
     """Cross-block softmax aggregation for multi-ct e (Stage 3b-c).
 
@@ -376,9 +377,18 @@ def multi_ct_softmax_finalize(
         raise ValueError("multi_ct_softmax_finalize: t must be a power of 2")
 
     # 1. Cross-block sum.
+    def _p(tag, ct):
+        if not (verbose and sk is not None): return
+        v = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
+                     dtype=np.float64)
+        # show value at slot[h*d_head*t + 0] for h=0 (representative per-head sum)
+        slot0 = v[0]
+        print(f"      [softmax-probe] {tag:25s} slot0={slot0:.4e} max|.|={np.abs(v).max():.4e}")
+
     e_sum = e_blocks[0]
     for k in range(1, n_blocks):
         e_sum = phantom.add(ctx, e_sum, e_blocks[k])
+    _p("e_sum (cross-block)", e_sum)
 
     # 2. Within-block sum_reduce: stride=1, count=t. After log2(t) iterations,
     # acc[h*d_head*t + 0] holds the global per-head sum; slots 1..t-1 hold
@@ -391,6 +401,7 @@ def multi_ct_softmax_finalize(
         a = phantom.add(ctx, a, rot)
         step <<= 1
         reach <<= 1
+    _p("a (post-reduce)", a)
 
     # 3. Mask + broadcast. Mask zeroes everything except slot[h*d_head*t + 0]
     # for each h, leaving the correct per-head sum at slot 0 only. Then
@@ -398,12 +409,14 @@ def multi_ct_softmax_finalize(
     a_masked = phantom.multiply_plain(ctx, a, head_first_slot_mask_pt)
     a_masked = phantom.rescale_to_next(ctx, a_masked)
     a_masked.set_scale(user_scale)
+    _p("a_masked", a_masked)
     a_bc = a_masked
     s = 1
     while s < t:
         rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
         a_bc = phantom.add(ctx, a_bc, rot)
         s <<= 1
+    _p("a_bc (broadcast)", a_bc)
 
     # 4. Per-block Goldschmidt. The e_blocks are still at the pre-mask-rescale
     # chain; mod_switch them down to a_bc's chain so softmax_correct accepts

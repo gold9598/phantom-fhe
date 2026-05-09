@@ -107,12 +107,26 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
     K_full = np.repeat(K_full, N_KV_GROUPS, axis=1)
     V_full = np.repeat(V_full, N_KV_GROUPS, axis=1)
     q_max = float(np.abs(Q_full[P_q]).max())
+    # scores: shape (N_HEADS, num_tokens). Per-head max for c_per_head.
     scores = np.einsum('hd,thd->ht', Q_full[P_q], K_full) / math.sqrt(D_HEAD)
-    c_per_head = scores.max(0) + 0.5
-    scores_post_C = scores - c_per_head[None, :]
+    c_per_head = scores.max(-1) + 0.5  # (N_HEADS,) — per-head softmax shift
+    scores_post_C = scores - c_per_head[:, None]  # broadcast over T
     scores_max = float(np.abs(scores_post_C).max())
     weights = np.exp(scores_post_C - scores_post_C.max(-1, keepdims=True))
     weights = weights / weights.sum(-1, keepdims=True)
+    # Softmax safety scale: post-damped per-head sum is approximately
+    # TARGET_MAG (0.45) * sum_t exp(score_post_C[h, t]). When scores are
+    # tightly clustered (typical at L0 with many similar embeddings), this
+    # sum can exceed Goldschmidt's convergence range (0, 2). Scale e_blocks
+    # by safety_scale before softmax_correct so the per-head sum stays under
+    # 1.5; weights are scale-invariant so this changes nothing in the math.
+    SOFTMAX_TARGET = 1.5
+    sum_t_exp = np.exp(scores_post_C).sum(axis=-1)  # (N_HEADS,) — per-head sum
+    expected_max_sum = float(sum_t_exp.max() * 0.45)  # TARGET_MAG
+    if expected_max_sum > SOFTMAX_TARGET:
+        softmax_safety_scale = SOFTMAX_TARGET / expected_max_sum
+    else:
+        softmax_safety_scale = 1.0
     attn_p = np.einsum('ht,thd->hd', weights, V_full).reshape(N_HEADS * D_HEAD)
     o_p = attn_p @ Wo.T
     x_mid_full = x_btd.copy(); x_mid_full[P_q] = x_btd[P_q] + o_p
@@ -138,6 +152,7 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
         "gate":     gate_max * margin,
         "up":       up_max * margin,
         "h":        h_max * margin,
+        "softmax_safety_scale": softmax_safety_scale,
     }
     return z1, z2, max_abs
 
@@ -239,7 +254,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
                              x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
                              k_cts, v_cts, c_per_head,
                              num_tokens, max_abs_calib, head_first_slot_mask_slots,
-                             stage_times=None):
+                             stage_times=None, verbose=False):
     """Multi-ct attention block. Same shape as fhe_attention_irp_bootstrap
     but using compute_qkt_irp_multi + per-block softmax pipeline +
     multi_ct_softmax_finalize + score_times_v_irp_multi.
@@ -276,11 +291,13 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     q_ct.set_scale(SCALE)
     _rec("wq_irp", t0)
 
+    if verbose: _probe("attn post-Wq", ctx, encoder, sk, q_ct)
     # Bootstrap q_ct
     t0 = _t()
     q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
                            max_abs=_calib["q"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
+    if verbose: _probe("attn post-q-boot", ctx, encoder, sk, q_ct)
 
     # compute_qkt_irp_multi — produces n_blocks score blocks
     t0 = _t()
@@ -289,6 +306,9 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     score_blocks, block_sizes = compute_qkt_irp_multi(
         ctx, encoder, relin_key, galois_key,
         q_ct, k_cts, D_HEAD, D_TOTAL, T_MODEL, num_tokens=num_tokens)
+    if verbose:
+        for kk, sb in enumerate(score_blocks):
+            _probe(f"attn post-qkt[{kk}]", ctx, encoder, sk, sb)
 
     # Per-block: mask*scale + sub C[h] + bootstrap + ps_exp + damped + mean handling + mask
     e_blocks = []
@@ -330,17 +350,27 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
             ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
         e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
 
-        # Mask: zero out non-meaningful slots
+        # Mask + safety scale fused: mask zeros non-meaningful slots AND
+        # multiplies meaningful slots by safety_scale. This keeps the per-head
+        # sum after cross-block aggregation below Goldschmidt's (0, 2)
+        # convergence range. Folding the scale into the existing mask
+        # multiply is level-free vs a separate post-scale step.
+        safety_scale = max_abs_calib.get("softmax_safety_scale", 1.0) if max_abs_calib else 1.0
         e_nominal = e_ct.scale()
         mask_pt = qkt_irp_mask_scale_plaintext(
             ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
-            1.0, e_ct.chain_index(), SCALE)
+            safety_scale, e_ct.chain_index(), SCALE)
         e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
         e_ct = phantom.rescale_to_next(ctx, e_ct)
         e_ct.set_scale(e_nominal)
 
         e_blocks.append(e_ct)
     _rec("attn_blocks", t0)
+    if verbose:
+        if safety_scale < 0.999:
+            print(f"    [softmax-scale] safety_scale={safety_scale:.4f} folded into mask")
+        for kk, eb in enumerate(e_blocks):
+            _probe(f"attn post-e[{kk}]", ctx, encoder, sk, eb)
 
     # Multi-ct softmax aggregation. Encode the per-head first-slot mask
     # at e_blocks[0]'s chain so multiply_plain inside the call accepts it.
@@ -351,8 +381,12 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     weights_blocks = multi_ct_softmax_finalize(
         ctx, encoder, relin_key, galois_key,
         e_blocks, head_first_slot_mask_pt,
-        N_HEADS, D_HEAD, T_MODEL, ITERS, SCALE)
+        N_HEADS, D_HEAD, T_MODEL, ITERS, SCALE,
+        sk=sk if verbose else None, verbose=verbose)
     _rec("softmax_finalize", t0)
+    if verbose:
+        for kk, wb in enumerate(weights_blocks):
+            _probe(f"attn post-weights[{kk}]", ctx, encoder, sk, wb)
 
     # score_times_v_irp_multi
     t0 = _t()
@@ -367,6 +401,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         weights_blocks, v_cts,
         D_HEAD, D_TOTAL, T_MODEL, sv_mask)
     _rec("score_v", t0)
+    if verbose: _probe("attn post-score_v", ctx, encoder, sk, attn_irp)
 
     # Wo IRP
     t0 = _t()
@@ -382,8 +417,16 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     return o_ct
 
 
+def _probe(tag, ctx, encoder, sk, ct):
+    v = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
+                 dtype=np.float64)
+    print(f"    [probe] {tag:30s} chain={ct.chain_index():2d} "
+          f"max|.|={np.abs(v).max():.4e} mean|.|={np.abs(v).mean():.4e}")
+
+
 def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
-                         cos_all_full, sin_all_full, label="prompt"):
+                         cos_all_full, sin_all_full, label="prompt",
+                         debug_layer=None, max_layer=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -456,7 +499,11 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     y_p_fhe = None  # final hidden state at P (post-residual2 of last layer)
 
     for layer_idx in range(NUM_DECODERS):
+        if max_layer is not None and layer_idx > max_layer:
+            print(f"  early exit after layer {max_layer}")
+            break
         t_layer_start = time.perf_counter()
+        verbose = (debug_layer is not None and layer_idx == debug_layer)
         x_btd = pytorch_ref[layer_idx]  # (NUM_TOKENS, D_MODEL) — input to layer L
 
         # Per-layer real weights + IRP encoding
@@ -483,6 +530,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             num_tokens, cos_all, sin_all, P_local)
 
         # ---- FHE forward through one decoder layer ----
+        if verbose:
+            _probe("input x_ct", ctx, encoder, sk, x_ct)
+            for kk, kct in enumerate(k_cts):
+                _probe(f"input k_ct[{kk}]", ctx, encoder, sk, kct)
+            for kk, vct in enumerate(v_cts):
+                _probe(f"input v_ct[{kk}]", ctx, encoder, sk, vct)
         # rms1
         if boot_before.get("rms1", False):
             x_ct = bootstrap_safe(engine, ctx, encoder, x_ct,
@@ -490,6 +543,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                                     slot_count=NUM_SLOTS)
         x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
                                             x_ct, rms1_w, rms1_p, t=T_MODEL)
+        if verbose: _probe("post-rms1", ctx, encoder, sk, x_norm)
         # attention (multi-ct)
         if boot_before.get("attention", False):
             x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
@@ -499,9 +553,11 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             engine, ctx, encoder, relin_key, galois_key, sk,
             x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
             k_cts, v_cts, c_per_head,
-            num_tokens, max_abs_calib, hf_mask_slots)
+            num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose)
+        if verbose: _probe("post-attention", ctx, encoder, sk, attn_out)
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
+        if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
         # rms2
         if boot_before.get("rms2", False):
             x_mid_ct = bootstrap_safe(engine, ctx, encoder, x_mid_ct,
@@ -509,6 +565,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                                         slot_count=NUM_SLOTS)
         x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
                                                 x_mid_ct, rms2_w, rms2_p, t=T_MODEL)
+        if verbose: _probe("post-rms2", ctx, encoder, sk, x_mid_norm)
         # mlp
         if boot_before.get("mlp", False):
             x_mid_norm = bootstrap_safe(engine, ctx, encoder, x_mid_norm,
@@ -520,8 +577,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             diag_gate_irp, diag_up_irp, diag_down_irp,
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs)
+        if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
         # residual2
         y_ct = residual(ctx, x_mid_ct, mlp_out)
+        if verbose: _probe("post-residual2 y_ct", ctx, encoder, sk, y_ct)
         layer_ms = (time.perf_counter() - t_layer_start) * 1000
         layer_times.append(layer_ms)
 
@@ -585,6 +644,10 @@ def capture_pytorch_ref(token_ids):
     return pytorch_ref, pytorch_pre_norm, yes_pt, no_pt
 
 
+DEBUG_LAYER = None
+MAX_LAYER = None
+
+
 def run_mrpc_example(idx):
     """Tokenize MRPC dev example #idx, run FHE pipeline, compare to PyTorch."""
     from datasets import load_dataset
@@ -615,7 +678,8 @@ def run_mrpc_example(idx):
 
     yes_logit, no_logit = run_classifier_fhe(
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
-        cos_all_full, sin_all_full, label=f"mrpc_{idx}")
+        cos_all_full, sin_all_full, label=f"mrpc_{idx}",
+        debug_layer=DEBUG_LAYER, max_layer=MAX_LAYER)
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     print(f"\n=== Stage 3b-f-2 result ===")
     print(f"  FHE yes={yes_logit:.4f}  no={no_logit:.4f}  pred={fhe_pred}")
@@ -652,7 +716,13 @@ if __name__ == "__main__":
     ap.add_argument("--mode", default="mrpc", choices=["mrpc", "qbrown4"])
     ap.add_argument("--idx", type=int, default=359,
                     help="MRPC dev example index (default: 359 — 44-token shortest)")
+    ap.add_argument("--debug-layer", type=int, default=None,
+                    help="Print stage probes for this layer index")
+    ap.add_argument("--max-layer", type=int, default=None,
+                    help="Stop after this layer index (early exit)")
     args = ap.parse_args()
+    DEBUG_LAYER = args.debug_layer
+    MAX_LAYER = args.max_layer
     if args.mode == "qbrown4":
         main_4tok()
     else:
