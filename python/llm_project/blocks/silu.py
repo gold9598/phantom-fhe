@@ -11,15 +11,31 @@ def _silu(x):
     return x * (1.0 / (1.0 + np.exp(-x)))
 
 
-def fit_silu_coeffs(domain, deg=14, n_samples=4001):
+def fit_silu_coeffs(domain, deg=14, n_samples=4001, normalized=False):
     """Fit a degree-`deg` Chebyshev polynomial to silu on the given symmetric
     domain (-d, d) and return monomial coefficients suitable for
     phantom.eval_polynomial. Cost: ~5ms per fit.
+
+    When `normalized=False` (default), coefficients are for the polynomial
+    in x (the input ciphertext value). For wide domains (D > ~6), the
+    high-order coefficients become smaller than CKKS encoding precision
+    (1/SCALE ~ 9e-13) and silently quantize to zero, leaving an under-fit
+    polynomial.
+
+    When `normalized=True`, coefficients are for the polynomial in
+    z = x/D, fit on [-1, 1]. Equivalent to the same function but with
+    coefficients c'_i = c_i * D^i — large enough to survive CKKS encoding
+    even at high degree on wide domain. Caller must scale ct by 1/D before
+    polynomial evaluation (one extra ct·scalar multiplication, 1 level).
     """
     x = np.linspace(domain[0], domain[1], n_samples)
     y = _silu(x)
     cheb = Chebyshev.fit(x, y, deg, domain=domain)
-    mono = cheb.convert(kind=Polynomial, domain=domain, window=domain)
+    if normalized:
+        # Coefficients for the polynomial in z = x/D, fit on [-1, 1].
+        mono = cheb.convert(kind=Polynomial, domain=domain, window=(-1.0, 1.0))
+    else:
+        mono = cheb.convert(kind=Polynomial, domain=domain, window=domain)
     return mono.coef.tolist()
 
 # Degree-8 Chebyshev fit of SiLU on [-2, 2]. L_inf err 2.74e-5 over [-2, 2].
@@ -83,12 +99,30 @@ SILU_COEFFS_DEG14_R6 = [
 ]
 
 
-def silu(ctx, encoder, relin_key, ct, coeffs=None):
+def silu(ctx, encoder, relin_key, ct, coeffs=None, norm_factor=None,
+         slot_count=None):
     """Evaluate SiLU on ct using a Chebyshev polynomial. If `coeffs` is None
     use the default degree-14 fit on [-6, 6] (covers max|gate|≈5.88 observed
     across the first 31 LLaMA-3.1-8B layers; layer 31's gate reaches 12.7,
     so the caller should pass a wider per-layer fit via fit_silu_coeffs).
     Coefficients must be in monomial order, length determines the polynomial
-    degree."""
+    degree.
+
+    When `norm_factor` is set, ct is pre-scaled by `norm_factor` (1 level
+    cost) so the polynomial evaluates on z = norm_factor·x ∈ [-1, 1]. This
+    pairs with `fit_silu_coeffs(..., normalized=True)` to enable high-degree
+    fits on wide domains where un-normalized coefficients would underflow
+    CKKS encoding precision. `slot_count` must be passed when `norm_factor`
+    is set (used to encode the scalar plaintext)."""
+    if norm_factor is not None:
+        if slot_count is None:
+            raise ValueError("silu: slot_count required when norm_factor is set")
+        user_scale = ct.scale()
+        norm_pt = encoder.encode_double_vector(
+            ctx, [float(norm_factor)] * slot_count,
+            ct.scale(), ct.chain_index())
+        ct = phantom.multiply_plain(ctx, ct, norm_pt)
+        ct = phantom.rescale_to_next(ctx, ct)
+        ct.set_scale(user_scale)
     return phantom.eval_polynomial(ctx, encoder, relin_key, ct,
                                     coeffs if coeffs is not None else SILU_COEFFS_DEG14_R6)

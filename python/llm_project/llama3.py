@@ -793,7 +793,8 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             diag_gate_irp, diag_up_irp, diag_down_irp,
                             sub_mask_wide_pt, sub_mask_tall_pt, input_mask_pt,
                             stage_times=None, max_abs_calib=None,
-                            silu_coeffs=None, probe_np=None, sk=None,
+                            silu_coeffs=None, silu_norm_factor=None,
+                            probe_np=None, sk=None,
                             verbose_mag=False):
     """MLP (SwiGLU) forward.
     probe_np/sk: when not None, emit [probe-L31] diff lines at each sub-stage.
@@ -865,7 +866,9 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
 
     # ---- silu(gate). ----
     t0 = _t()
-    silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs)
+    silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs,
+                     norm_factor=silu_norm_factor,
+                     slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
     _rec("mlp_silu", t0)
     _vp("post_silu", silu_gate)
     if probe_np is not None and sk is not None:

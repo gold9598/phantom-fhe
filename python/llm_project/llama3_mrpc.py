@@ -523,25 +523,30 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
         silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN
         silu_domain = (-silu_max * 1.2, silu_max * 1.2)
-        # Cap polynomial degree so all coefficients stay above CKKS encoding
-        # precision (~2^-40). Heuristic: c_N ~ D^(1-N); need D^(N-1) < 2^40,
-        # i.e. N < 1 + 40·ln2/ln(D). At D=16 (L31) this caps at N≈11; deg=14
-        # would silently truncate c_12..c_14 to zero in encoding, leaving an
-        # under-fit polynomial that overshoots silu(13.4)≈13 to ~-42 (4× and
-        # sign-flipped). Picking deg empirically by min Linf-at-quantized-
-        # precision is more robust than the analytic cap.
+        # Use NORMALIZED Chebyshev fit: coeffs are for the polynomial in
+        # z = x/D where D = silu_domain[1]. Equivalent to scaling all
+        # coeffs by D^i, which lifts the high-order coefficients above
+        # CKKS encoding precision (1/SCALE ~ 9e-13) even at deg=20+ on
+        # wide D=16 domains. Caller (silu()) does z = x/D as one extra
+        # ct·scalar multiply (1 level cost). The adaptive picker tests
+        # multiple degrees and chooses min Linf-at-CKKS-quantized.
+        _silu_D = silu_domain[1]
         _silu_xs = np.linspace(silu_domain[0], silu_domain[1], 1001)
+        _silu_zs = _silu_xs / _silu_D
         _silu_actual = silu_np(_silu_xs)
-        _SILU_ENC_SCALE = SCALE  # CKKS encoding scale; max precision 1/SCALE
+        _SILU_ENC_SCALE = SCALE
         silu_deg = 14
-        silu_coeffs = fit_silu_coeffs(silu_domain, deg=14)
+        silu_coeffs = fit_silu_coeffs(silu_domain, deg=14, normalized=True)
+        silu_norm_factor = 1.0 / _silu_D
         _best_err = float(np.abs(np.polyval(
             [round(c * _SILU_ENC_SCALE) / _SILU_ENC_SCALE
-             for c in silu_coeffs[::-1]], _silu_xs) - _silu_actual).max())
-        for _d in (6, 8, 10, 12):
-            _c = fit_silu_coeffs(silu_domain, deg=_d)
+             for c in silu_coeffs[::-1]], _silu_zs) - _silu_actual).max())
+        # Test degrees up to 20 (PS depth 5; +1 for normalization = 6 levels,
+        # within budget). Beyond 20, gains shrink and PS depth grows.
+        for _d in (10, 12, 16, 18, 20):
+            _c = fit_silu_coeffs(silu_domain, deg=_d, normalized=True)
             _cq = [round(c * _SILU_ENC_SCALE) / _SILU_ENC_SCALE for c in _c]
-            _err = float(np.abs(np.polyval(_cq[::-1], _silu_xs) - _silu_actual).max())
+            _err = float(np.abs(np.polyval(_cq[::-1], _silu_zs) - _silu_actual).max())
             if _err < _best_err:
                 _best_err = _err
                 silu_deg = _d
@@ -609,6 +614,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             diag_gate_irp, diag_up_irp, diag_down_irp,
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
+            silu_norm_factor=silu_norm_factor,
             sk=sk if verbose else None, verbose_mag=verbose)
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
         # residual2
@@ -681,11 +687,13 @@ DEBUG_LAYER = None
 MAX_LAYER = None
 
 
-def run_mrpc_example(idx):
-    """Tokenize MRPC dev example #idx, run FHE pipeline, compare to PyTorch."""
+def run_mrpc_example(idx, truncate_to=None):
+    """Tokenize MRPC dev example #idx, run FHE pipeline, compare to PyTorch.
+    If truncate_to is set, use only the first `truncate_to` tokens (for
+    num_tokens-vs-error sweep)."""
     from datasets import load_dataset
     from transformers import AutoTokenizer
-    print(f"--- run_mrpc_example idx={idx} ---")
+    print(f"--- run_mrpc_example idx={idx} truncate_to={truncate_to} ---")
     tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
     ds = load_dataset("nyu-mll/glue", "mrpc")["validation"]
     row = ds[idx]
@@ -694,6 +702,8 @@ def run_mrpc_example(idx):
                   "Answer (Yes or No):")
     prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
     token_ids = tok(prompt).input_ids
+    if truncate_to is not None and truncate_to < len(token_ids):
+        token_ids = token_ids[:truncate_to]
     num_tokens = len(token_ids)
     P_local = num_tokens - 1
     print(f"  num_tokens={num_tokens}  label={row['label']}")
@@ -753,10 +763,12 @@ if __name__ == "__main__":
                     help="Print stage probes for this layer index")
     ap.add_argument("--max-layer", type=int, default=None,
                     help="Stop after this layer index (early exit)")
+    ap.add_argument("--truncate-to", type=int, default=None,
+                    help="Truncate the MRPC prompt to first N tokens (for num_tokens sweep)")
     args = ap.parse_args()
     DEBUG_LAYER = args.debug_layer
     MAX_LAYER = args.max_layer
     if args.mode == "qbrown4":
         main_4tok()
     else:
-        run_mrpc_example(args.idx)
+        run_mrpc_example(args.idx, truncate_to=args.truncate_to)
