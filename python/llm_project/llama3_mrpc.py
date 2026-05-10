@@ -159,7 +159,12 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
 
 def build_user_steps_mrpc():
     """Galois rotation steps needed for the multi-ct MRPC pipeline at
-    NUM_TOKENS_PER_BLOCK=T_MODEL=8."""
+    NUM_TOKENS_PER_BLOCK=T_MODEL=8.
+
+    Returns (user_steps, step_categories) where step_categories is a dict
+    of step subsets used by setup_engine for per-step target chain
+    assignment.
+    """
     log_t = int(round(math.log2(T_MODEL)))
     log_d_head = int(round(math.log2(D_HEAD)))
 
@@ -181,13 +186,105 @@ def build_user_steps_mrpc():
         list(irp_attn_steps) + list(irp_mlp_w_steps) + list(irp_mlp_t_steps) +
         softmax_steps
     ))
-    return user_steps
+    step_categories = {
+        "rms": set(rms_steps),
+        "sdpa": set(sdpa_steps),
+        "irp_attn": set(irp_attn_steps),
+        "irp_mlp_w": set(irp_mlp_w_steps),
+        "irp_mlp_t": set(irp_mlp_t_steps),
+        "softmax_within_block": {int(1 << s) for s in range(log_t)},
+        "softmax_cross_block_doubling": {-int(1 << s) for s in range(log_t)},
+        "qkt_q_preprocess": {-int(1 << s) for s in range(log_t)},
+        "sdpa_score_v_broadcast": {-int(T_MODEL * (1 << s)) for s in range(log_d_head)},
+    }
+    return user_steps, step_categories
 
 
-def setup_engine(user_steps, target_chain_default):
-    """Build engine with the given Galois rotation steps. Uniform target
-    chain for simplicity (3b-f-1); per-step optimization deferred to 3b-f-3."""
-    target_chain_indices = [target_chain_default] * len(user_steps)
+def setup_engine(user_steps, step_categories=None, target_chain_default=16):
+    """Build engine with per-step Galois target chain assignment (Stage 3b-f-4).
+
+    Mirrors the optimization in llama3.py main(): each step's target_chain
+    is set to the SHALLOWEST chain at which it actually fires in the pipeline.
+    Smaller-target keys are larger; larger-target keys are smaller. Empirically
+    on this 5090 build the savings are storage-only (per-layer compute time
+    is unchanged from uniform target_chain=16) — phantom rotations cost scales
+    with the ciphertext's chain, not the key's coverage size. Kept for memory
+    correctness and parity with main()'s structure.
+
+    Pipeline chain trace (between bootstraps each stage restarts at 16):
+
+      rms steps fire at chain 16 (sum_reduce inside rmsnorm)              -> 16
+      qkt_q_preprocess {-1,-2,-4} fires at chain 16 (post-Wq bootstrap)   -> 16
+      finalize_softmax sum_reduce {1,2,4} fires at chain 17 (post mask)   -> 17
+      cross-block doubling {-1,-2,-4} fires at chain 17 (post mask)       -> 17
+        (collides with qkt_q_preprocess on same galois elt; min wins -> 16)
+      score_v broadcast {-T_MODEL*2^s} fires at chain 23 (post softmax)   -> 23
+      IRP-only steps fire at chain 26 (USER_LEVEL_IRP_ATTN=10)            -> 26
+
+    Galois-element collisions are resolved with min-target-wins: the engine
+    generates one key per distinct galois element, so two steps mapping to
+    the same element must share the smaller (= shallowest-chain) target,
+    otherwise a key sized for a deep chain would be silently used at a
+    shallower chain and cause out-of-bounds reads.
+    """
+    if step_categories is not None:
+        FRESHEST_CHAIN = 16
+        TARGET_RMS      = FRESHEST_CHAIN + 0   # 16
+        TARGET_FINALIZE = FRESHEST_CHAIN + 1   # 17
+        TARGET_SCORE_V  = FRESHEST_CHAIN + 7   # 23 (6 Goldschmidt + 1 mask)
+        TARGET_IRP      = FRESHEST_CHAIN + USER_LEVEL_IRP_ATTN  # 26
+
+        rms_set         = step_categories["rms"]
+        sdpa_set        = step_categories["sdpa"]
+        irp_all_set     = (step_categories["irp_attn"]
+                           | step_categories["irp_mlp_w"]
+                           | step_categories["irp_mlp_t"])
+        irp_only_set    = irp_all_set - rms_set - sdpa_set
+        qkt_q_set       = step_categories["qkt_q_preprocess"]
+        finalize_set    = step_categories["softmax_within_block"]   # {1, 2, 4}
+        score_v_set     = step_categories["sdpa_score_v_broadcast"]
+        cross_block_set = step_categories["softmax_cross_block_doubling"]  # {-1,-2,-4}
+
+        target_chain_indices = []
+        for s in user_steps:
+            if s in rms_set:
+                target_chain_indices.append(TARGET_RMS)
+            elif s in qkt_q_set:
+                target_chain_indices.append(TARGET_RMS)         # post-bootstrap qkt
+            elif s in cross_block_set:
+                target_chain_indices.append(TARGET_FINALIZE)    # 17
+            elif s in finalize_set:
+                target_chain_indices.append(TARGET_FINALIZE)    # 17
+            elif s in score_v_set:
+                target_chain_indices.append(TARGET_SCORE_V)     # 23
+            elif s in irp_only_set:
+                target_chain_indices.append(TARGET_IRP)         # 26
+            else:
+                target_chain_indices.append(TARGET_RMS)         # safe fallback
+
+        # Resolve galois-element collisions with min-wins.
+        def _galois_elt(step):
+            m = 2 * N
+            power = (step % (N // 2)) + (N // 2) if step < 0 else step % (N // 2)
+            return pow(3, power, m)
+
+        elt_min_target = {}
+        for s, t in zip(user_steps, target_chain_indices):
+            e = _galois_elt(s)
+            if e not in elt_min_target or t < elt_min_target[e]:
+                elt_min_target[e] = t
+        target_chain_indices = [elt_min_target[_galois_elt(s)] for s in user_steps]
+
+        by_target = {}
+        for s, t in zip(user_steps, target_chain_indices):
+            by_target.setdefault(t, []).append(s)
+        print(f"  Per-step galois target chain assignment:")
+        for t in sorted(by_target):
+            print(f"    chain={t}: {len(by_target[t]):3d} steps")
+    else:
+        # Fallback: uniform target_chain (slow path retained for compatibility)
+        target_chain_indices = [target_chain_default] * len(user_steps)
+
     cfg = phantom.ckks_engine_config()
     cfg.log_n = LOG_N
     cfg.user_scale = SCALE
@@ -448,9 +545,9 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
 
     # ---- Engine
-    user_steps = build_user_steps_mrpc()
+    user_steps, step_categories = build_user_steps_mrpc()
     print(f"User steps ({len(user_steps)}): first 10 = {user_steps[:10]}")
-    engine = setup_engine(user_steps, target_chain_default=16)
+    engine = setup_engine(user_steps, step_categories=step_categories)
     ctx = engine.context()
     encoder = engine.encoder()
     sk = engine.secret_key()
