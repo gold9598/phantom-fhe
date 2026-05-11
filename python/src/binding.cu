@@ -127,11 +127,6 @@ PYBIND11_MODULE(pyPhantom, m) {
     py::class_<PhantomCKKSEncoder>(m, "ckks_encoder")
             .def(py::init<const PhantomContext &>())
             .def("slot_count", &PhantomCKKSEncoder::slot_count)
-            .def("encode_complex_vector",
-                 py::overload_cast<const PhantomContext &, const std::vector<cuDoubleComplex> &, double, size_t>(
-                         &PhantomCKKSEncoder::encode<cuDoubleComplex>),
-                 py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
-                 py::call_guard<py::gil_scoped_release>())
             // numpy-array fast path: skips per-element Python iteration. Pybind11
             // dispatches here when caller passes a numpy complex128 array.
             .def("encode_complex_vector",
@@ -153,11 +148,10 @@ PYBIND11_MODULE(pyPhantom, m) {
                  py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
                  "Encode a numpy complex128 1-D array (fast path — no Python "
                  "object iteration).")
-            .def("encode_double_vector",
-                 py::overload_cast<const PhantomContext &, const std::vector<double> &, double, size_t>(
-                         &PhantomCKKSEncoder::encode<double>),
-                 py::arg(), py::arg(), py::arg(),
-                 py::arg("chain_index") = 1,
+            .def("encode_complex_vector",
+                 py::overload_cast<const PhantomContext &, const std::vector<cuDoubleComplex> &, double, size_t>(
+                         &PhantomCKKSEncoder::encode<cuDoubleComplex>),
+                 py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
                  py::call_guard<py::gil_scoped_release>())
             // numpy-array fast path for double-precision real input.
             .def("encode_double_vector",
@@ -176,6 +170,12 @@ PYBIND11_MODULE(pyPhantom, m) {
                  py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
                  "Encode a numpy float64 1-D array (fast path — no Python "
                  "object iteration).")
+            .def("encode_double_vector",
+                 py::overload_cast<const PhantomContext &, const std::vector<double> &, double, size_t>(
+                         &PhantomCKKSEncoder::encode<double>),
+                 py::arg(), py::arg(), py::arg(),
+                 py::arg("chain_index") = 1,
+                 py::call_guard<py::gil_scoped_release>())
             .def("decode_complex_vector",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
                          &PhantomCKKSEncoder::decode<cuDoubleComplex>),
@@ -425,20 +425,6 @@ PYBIND11_MODULE(pyPhantom, m) {
                  [](const phantom::SingleChainPlaintext &p) { return p.scale; },
                  "Return the SCP's encoding scale.");
 
-    m.def("encode_single_chain_plaintext",
-          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
-             std::vector<std::complex<double>> slots, double scale) {
-              // `slots` is already a C++ vector at this point (pybind11
-              // unpacked the Python list during argument marshalling), so
-              // we no longer need the GIL for the NTT + encode work below.
-              // Releasing here lets concurrent worker threads encode in
-              // parallel during the Wq IRP pre-encode phase (32 layers x
-              // 256 SCPs = 8,192 calls per example).
-              py::gil_scoped_release release;
-              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
-          },
-          py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
-
     // numpy-array fast path for encode_single_chain_plaintext: pybind11
     // dispatches here when callers pass a numpy complex128 array directly.
     // Avoids the GIL-held per-element marshalling of `.tolist()` -> std::vector
@@ -483,6 +469,20 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"),
           "Encode a numpy float64 1-D array into a SingleChainPlaintext (real "
           "values promoted to complex). Faster than the list-based overload.");
+
+    m.def("encode_single_chain_plaintext",
+          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
+             std::vector<std::complex<double>> slots, double scale) {
+              // `slots` is already a C++ vector at this point (pybind11
+              // unpacked the Python list during argument marshalling), so
+              // we no longer need the GIL for the NTT + encode work below.
+              // Releasing here lets concurrent worker threads encode in
+              // parallel during the Wq IRP pre-encode phase (32 layers x
+              // 256 SCPs = 8,192 calls per example).
+              py::gil_scoped_release release;
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
+          },
+          py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
 
     // Reconstruct a SingleChainPlaintext from raw coeff bytes + scale.
     // Allocates pinned host memory and memcpy's the bytes in. Used by the
