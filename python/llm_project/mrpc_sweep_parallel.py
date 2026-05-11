@@ -53,6 +53,21 @@ CSV_HEADER = [
 # read concurrently from multiple GPUs via UVA.
 CSV_LOCK = threading.Lock()
 
+# Opt 1b: process-wide cache of pre-encoded Wq IRPs keyed by num_tokens.
+# Wq encoding depends only on R_P = rope_matrix(num_tokens-1) and the
+# layer weights. In a 408-MRPC sweep there are ~40 distinct num_tokens
+# values, so the same encoded IRPs are reused ~10x on average. Structure:
+#   SHARED_WQ_CACHE[num_tokens] -> {layer_idx -> tuple-from-encode_layer_irps}
+# SHARED_WQ_CACHE_EVENTS[num_tokens] is a threading.Event() set by the
+# first thread that finishes encoding for that num_tokens; other threads
+# with the same num_tokens see the Event and wait. Lock guards the
+# "check / create Event / publish entry" sequence only — the heavy
+# encode call happens outside the lock so different num_tokens still
+# parallelize across GPUs.
+SHARED_WQ_CACHE = {}
+SHARED_WQ_CACHE_EVENTS = {}
+SHARED_WQ_CACHE_LOCK = threading.Lock()
+
 
 def _ensure_csv(path):
     if not os.path.exists(path):
@@ -258,12 +273,21 @@ def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
         idx, token_ids, capture_pytorch_ref_fn)
     pt_pred = "Yes" if yes_pt > no_pt else "No"
 
+    # wq-cache HIT/MISS log: useful for verifying dedup actually fires
+    # across examples with the same num_tokens. Cheap (dict membership).
+    _wq_status = "HIT" if num_tokens in SHARED_WQ_CACHE else "MISS"
+    print(f"  [gpu{gpu_id}] idx={idx} nt={num_tokens} wq_cache={_wq_status}",
+          flush=True)
+
     t0 = time.perf_counter()
     yes_logit, no_logit = run_classifier_fhe_fn(
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}_gpu{gpu_id}",
         debug_layer=None, max_layer=None, min_layer=None,
-        rp_indep_cache=shared_cache, engine=engine)
+        rp_indep_cache=shared_cache, engine=engine,
+        shared_wq_cache=SHARED_WQ_CACHE,
+        shared_wq_cache_events=SHARED_WQ_CACHE_EVENTS,
+        shared_wq_cache_lock=SHARED_WQ_CACHE_LOCK)
     elapsed = time.perf_counter() - t0
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     return {

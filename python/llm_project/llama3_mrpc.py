@@ -10,6 +10,7 @@ sanity check: [BOS, "The", " quick", " brown"] (4 tokens).
 import json
 import math
 import sys
+import threading
 import time
 
 import numpy as np
@@ -572,7 +573,9 @@ def _probe(tag, ctx, encoder, sk, ct):
 def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
                          cos_all_full, sin_all_full, label="prompt",
                          debug_layer=None, max_layer=None, min_layer=None,
-                         rp_indep_cache=None, engine=None):
+                         rp_indep_cache=None, engine=None,
+                         shared_wq_cache=None, shared_wq_cache_events=None,
+                         shared_wq_cache_lock=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -649,20 +652,105 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     # is unchanged but the per-layer printed time becomes a clean view of
     # FHE compute. rp_indep_cache fills lazily inside encode_layer_irps;
     # on subsequent examples the call is Wq-only (~1.5s/layer).
+    #
+    # Opt 1b: optional process-wide shared_wq_cache keyed by num_tokens.
+    # R_P depends only on num_tokens (and the RoPE tables, which are
+    # process-global), so across a 408-MRPC sweep where ~40 distinct
+    # num_tokens exist, the same wq_cache entries can be reused ~10x on
+    # average. Per-num_tokens Event coordinates concurrent threads so
+    # only one thread encodes each (num_tokens) value; others wait.
+    # The cache is a 2-level dict: shared_wq_cache[num_tokens][layer_idx].
+    # layer_weights is local: encode_layer_irps needs `w` for Wq_baked,
+    # but the encoded plaintexts are the heavy artifact (32 layers of
+    # SCP tuples), so caching just those is enough.
     t_wq_encode0 = time.perf_counter()
-    wq_cache = {}  # layer_idx -> (Wq_baked, diag_wq_irp, diag_wo_irp,
-                   #               diag_gate_irp, diag_up_irp, diag_down_irp)
     layer_weights = {}  # layer_idx -> w (cache weight loads too)
-    for _li in range(NUM_DECODERS):
-        if min_layer is not None and _li < min_layer:
-            continue
-        if max_layer is not None and _li > max_layer:
-            break
-        _w = load_layer_weights(_li)
-        layer_weights[_li] = _w
-        wq_cache[_li] = encode_layer_irps(ctx, encoder, _w, R_P,
-                                            rp_indep_cache=rp_indep_cache,
-                                            layer_idx=_li)
+    _shared_hit = False
+    if shared_wq_cache is not None and num_tokens in shared_wq_cache:
+        wq_cache = shared_wq_cache[num_tokens]
+        _shared_hit = True
+        print(f"[wq encode: HIT shared_wq_cache nt={num_tokens}]")
+    elif shared_wq_cache is not None:
+        # Coordinate concurrent encoders for the same num_tokens.
+        # The lock protects only the Event-creation step; encoding
+        # happens outside the lock so different num_tokens parallelize.
+        assert shared_wq_cache_lock is not None, \
+            "shared_wq_cache requires shared_wq_cache_lock"
+        assert shared_wq_cache_events is not None, \
+            "shared_wq_cache requires shared_wq_cache_events"
+        with shared_wq_cache_lock:
+            if num_tokens in shared_wq_cache:
+                # Another thread completed encoding while we waited.
+                wq_cache = shared_wq_cache[num_tokens]
+                _shared_hit = True
+                ev = None
+                owner = False
+            elif num_tokens in shared_wq_cache_events:
+                # Another thread is currently encoding for this num_tokens.
+                ev = shared_wq_cache_events[num_tokens]
+                owner = False
+            else:
+                # We are the first; create the Event so peers wait for us.
+                ev = threading.Event()
+                shared_wq_cache_events[num_tokens] = ev
+                owner = True
+        if _shared_hit:
+            print(f"[wq encode: HIT shared_wq_cache nt={num_tokens}]")
+        elif not owner:
+            # Wait for the owner thread to publish the encoded cache.
+            print(f"[wq encode: WAIT shared_wq_cache nt={num_tokens}]")
+            ev.wait()
+            wq_cache = shared_wq_cache[num_tokens]
+            _shared_hit = True
+        else:
+            # Owner: encode all 32 layers, publish, then signal.
+            # Memory accounting: Wq IRP = 256 SCPs * 512 KB = 128 MB/layer.
+            # 32 layers * ~40 distinct num_tokens * 128 MB = ~160 GB total
+            # for the shared cache (fits in 256 GB host alongside the
+            # ~36 GB rp_indep_cache). Wq_baked (the numpy matrix returned
+            # by encode_layer_irps) is dropped from the cached entry: it
+            # is not used downstream in run_classifier_fhe and would add
+            # another 32 * 40 * 128 MB = 160 GB if retained.
+            wq_cache = {}
+            for _li in range(NUM_DECODERS):
+                if min_layer is not None and _li < min_layer:
+                    continue
+                if max_layer is not None and _li > max_layer:
+                    break
+                _w = load_layer_weights(_li)
+                layer_weights[_li] = _w
+                _tup = encode_layer_irps(
+                    ctx, encoder, _w, R_P,
+                    rp_indep_cache=rp_indep_cache, layer_idx=_li)
+                # _tup = (Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp,
+                #         diag_up_irp, diag_down_irp). Drop Wq_baked (unused
+                # in the layer body) to save ~160 GB across the sweep.
+                wq_cache[_li] = (None,) + tuple(_tup[1:])
+            shared_wq_cache[num_tokens] = wq_cache
+            ev.set()
+    if not _shared_hit and shared_wq_cache is None:
+        # No shared cache: legacy local-only path.
+        wq_cache = {}
+        for _li in range(NUM_DECODERS):
+            if min_layer is not None and _li < min_layer:
+                continue
+            if max_layer is not None and _li > max_layer:
+                break
+            _w = load_layer_weights(_li)
+            layer_weights[_li] = _w
+            wq_cache[_li] = encode_layer_irps(
+                ctx, encoder, _w, R_P,
+                rp_indep_cache=rp_indep_cache, layer_idx=_li)
+    # On a shared-cache hit we still need per-layer weights for downstream
+    # (rmsnorm, lm_head, calib). Load them now without re-encoding IRPs.
+    if _shared_hit:
+        for _li in range(NUM_DECODERS):
+            if min_layer is not None and _li < min_layer:
+                continue
+            if max_layer is not None and _li > max_layer:
+                break
+            if _li not in layer_weights:
+                layer_weights[_li] = load_layer_weights(_li)
     t_wq_encode = time.perf_counter() - t_wq_encode0
     print(f"[wq encode: {t_wq_encode:.1f}s]")
 
