@@ -31,13 +31,19 @@ def main():
     rng = np.random.default_rng(0)
     v = rng.standard_normal(NUM_SLOTS).tolist()
 
-    # 1) Encode + encrypt + decrypt + decode
+    # 1a) Encode + decode (no encryption): tests encoder NTT roundtrip alone.
     pt = encoder.encode_double_vector(ctx, v, SCALE, fresh_ci)
+    dec_pt = np.array(encoder.decode_double_vector(ctx, pt))
+    err = float(np.abs(dec_pt - np.array(v)).max())
+    print(f"[1a] encode/decode (no encrypt)  max|err|={err:.3e}  norm={np.linalg.norm(dec_pt):.4f}  "
+          f"{'OK' if err < 1e-3 else 'FAIL'}", flush=True)
+
+    # 1b) Encrypt + decrypt (no compute): tests sk roundtrip alone.
     ct = sk.encrypt_symmetric(ctx, pt)
-    dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)))
-    err = float(np.abs(dec - np.array(v)).max())
-    print(f"[1] encode/decrypt roundtrip   max|err|={err:.3e}  {'OK' if err < 1e-3 else 'FAIL'}",
-          flush=True)
+    dec_ct = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)))
+    err = float(np.abs(dec_ct - np.array(v)).max())
+    print(f"[1b] encrypt/decrypt + decode    max|err|={err:.3e}  norm={np.linalg.norm(dec_ct):.4f}  "
+          f"{'OK' if err < 1e-3 else 'FAIL'}", flush=True)
 
     # 2) Multiply by plaintext constant 2
     pt2 = encoder.encode_double_vector(ctx, [2.0]*NUM_SLOTS, SCALE, ct.chain_index())
