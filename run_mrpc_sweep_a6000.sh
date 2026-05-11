@@ -62,30 +62,28 @@ if [ -n "${REBUILD:-}" ] || ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&
     cmake --build build --target pyPhantom -j"$(nproc)"
 fi
 
-# ---- Single-GPU (default): full 0..407 sweep ----
-exec "$PYTHON" -u python/llm_project/mrpc_sweep.py \
-    --start 0 --end 408 \
-    2>&1 | tee "$LOG_DIR/mrpc_sweep_full.log"
+# ---- Auto-detect GPU count and dispatch ----
+# Auto-detect the number of available GPUs (override with NUM_GPUS env var)
+if [ -z "${NUM_GPUS:-}" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+        [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -lt 1 ] && NUM_GPUS=1
+    else
+        NUM_GPUS=1
+    fi
+fi
+echo "[setup] Detected $NUM_GPUS GPU(s) (override with NUM_GPUS env var)"
 
-# ---- 4× A6000 parallel option ----
-# Uncomment below + comment the single-GPU block above. Splits 408 into
-# 4 disjoint ranges (102 each). Each process gets its own CUDA device
-# and its own results CSV file; merge afterwards.
-#
-# for i in 0 1 2 3; do
-#     start=$((i * 102))
-#     end=$((start + 102))
-#     [ $end -gt 408 ] && end=408
-#     CUDA_VISIBLE_DEVICES=$i \
-#     CSV_PATH=$LOG_DIR/mrpc_sweep_gpu${i}.csv \
-#     "$PYTHON" -u python/llm_project/mrpc_sweep.py \
-#         --start $start --end $end \
-#         > "$LOG_DIR/mrpc_sweep_gpu${i}.log" 2>&1 &
-# done
-# wait
-# # Merge CSVs (skip duplicated headers):
-# {
-#     head -1 "$LOG_DIR/mrpc_sweep_gpu0.csv"
-#     for i in 0 1 2 3; do tail -n +2 "$LOG_DIR/mrpc_sweep_gpu${i}.csv"; done
-# } > "$CSV_PATH"
-# "$PYTHON" -u python/llm_project/mrpc_sweep.py --summary
+# Dispatch to parallel or single-GPU sweep
+# Set SINGLE_GPU=1 to force the single-GPU path for debugging
+if [ "${SINGLE_GPU:-0}" = "1" ] || [ "$NUM_GPUS" = "1" ]; then
+    echo "[setup] Using single-GPU mrpc_sweep.py"
+    exec "$PYTHON" -u python/llm_project/mrpc_sweep.py \
+        --start 0 --end 408 \
+        2>&1 | tee "$LOG_DIR/mrpc_sweep_full.log"
+else
+    echo "[setup] Using $NUM_GPUS-GPU parallel sweep"
+    exec "$PYTHON" -u python/llm_project/mrpc_sweep_parallel.py \
+        --start 0 --end 408 --num-gpus "$NUM_GPUS" \
+        2>&1 | tee "$LOG_DIR/mrpc_sweep_parallel.log"
+fi
