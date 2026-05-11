@@ -2,6 +2,8 @@
 #include <pybind11/complex.h>
 #include <pybind11/stl.h>
 
+#include <cuda_runtime.h>
+
 #include "phantom.h"
 #include "attention.h"
 #include "bootstrap.h"
@@ -86,16 +88,19 @@ PYBIND11_MODULE(pyPhantom, m) {
                  py::arg("context"), py::arg("galois_elt_idx"), py::arg("target_chain_index") = 0)
             .def("encrypt_symmetric",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
-                         &PhantomSecretKey::encrypt_symmetric, py::const_), py::arg(), py::arg())
+                         &PhantomSecretKey::encrypt_symmetric, py::const_), py::arg(), py::arg(),
+                 py::call_guard<py::gil_scoped_release>())
             .def("decrypt",
                  py::overload_cast<const PhantomContext &, const PhantomCiphertext &>(
-                         &PhantomSecretKey::decrypt), py::arg(), py::arg());
+                         &PhantomSecretKey::decrypt), py::arg(), py::arg(),
+                 py::call_guard<py::gil_scoped_release>());
 
     py::class_<PhantomPublicKey>(m, "public_key")
             .def(py::init<>())
             .def("encrypt_asymmetric",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
-                         &PhantomPublicKey::encrypt_asymmetric), py::arg(), py::arg());
+                         &PhantomPublicKey::encrypt_asymmetric), py::arg(), py::arg(),
+                 py::call_guard<py::gil_scoped_release>());
 
     py::class_<PhantomRelinKey>(m, "relin_key")
             .def(py::init<>());
@@ -123,19 +128,23 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("encode_complex_vector",
                  py::overload_cast<const PhantomContext &, const std::vector<cuDoubleComplex> &, double, size_t>(
                          &PhantomCKKSEncoder::encode<cuDoubleComplex>),
-                 py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1)
+                 py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
+                 py::call_guard<py::gil_scoped_release>())
             .def("encode_double_vector",
                  py::overload_cast<const PhantomContext &, const std::vector<double> &, double, size_t>(
                          &PhantomCKKSEncoder::encode<double>),
                  py::arg(), py::arg(), py::arg(),
-                 py::arg("chain_index") = 1)
+                 py::arg("chain_index") = 1,
+                 py::call_guard<py::gil_scoped_release>())
             .def("decode_complex_vector",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
                          &PhantomCKKSEncoder::decode<cuDoubleComplex>),
-                 py::arg(), py::arg())
+                 py::arg(), py::arg(),
+                 py::call_guard<py::gil_scoped_release>())
             .def("decode_double_vector",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
-                         &PhantomCKKSEncoder::decode<double>), py::arg(), py::arg());
+                         &PhantomCKKSEncoder::decode<double>), py::arg(), py::arg(),
+                 py::call_guard<py::gil_scoped_release>());
 
     py::class_<PhantomPlaintext>(m, "plaintext")
             .def(py::init<>());
@@ -146,76 +155,99 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("chain_index", [](const PhantomCiphertext &ct) { return ct.chain_index(); })
             .def("scale", [](const PhantomCiphertext &ct) { return ct.scale(); });
 
-    m.def("negate", &phantom::negate, py::arg(), py::arg());
+    m.def("negate", &phantom::negate, py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("add", &phantom::add, py::arg(), py::arg(), py::arg());
+    m.def("add", &phantom::add, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("add_plain", &phantom::add_plain, py::arg(), py::arg(), py::arg());
+    m.def("add_plain", &phantom::add_plain, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("add_many", &phantom::add_many, py::arg(), py::arg(), py::arg());
+    m.def("add_many", &phantom::add_many, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("sub", &phantom::sub, py::arg(), py::arg(), py::arg(), py::arg("negate") = false);
+    m.def("sub", &phantom::sub, py::arg(), py::arg(), py::arg(), py::arg("negate") = false,
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("sub_plain", &phantom::sub_plain, py::arg(), py::arg(), py::arg());
+    m.def("sub_plain", &phantom::sub_plain, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("multiply", &phantom::multiply, py::arg(), py::arg(), py::arg());
+    m.def("multiply", &phantom::multiply, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("multiply_and_relin", &phantom::multiply_and_relin, py::arg(), py::arg(), py::arg(), py::arg());
+    m.def("multiply_and_relin", &phantom::multiply_and_relin, py::arg(), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("multiply_plain", &phantom::multiply_plain, py::arg(), py::arg(), py::arg());
+    m.def("multiply_plain", &phantom::multiply_plain, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("relinearize", &phantom::relinearize, py::arg(), py::arg(), py::arg());
+    m.def("relinearize", &phantom::relinearize, py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("rescale_to_next", &phantom::rescale_to_next, py::arg(), py::arg());
+    m.def("rescale_to_next", &phantom::rescale_to_next, py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("mod_switch_to_next",
           py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(&phantom::mod_switch_to_next),
-          py::arg(), py::arg());
+          py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("mod_switch_to_next",
           py::overload_cast<const PhantomContext &, const PhantomCiphertext &>(&phantom::mod_switch_to_next),
-          py::arg(), py::arg());
+          py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("mod_switch_to", py::overload_cast<const PhantomContext &, const PhantomPlaintext &, size_t>(
-            &phantom::mod_switch_to), py::arg(), py::arg(), py::arg());
+            &phantom::mod_switch_to), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("mod_switch_to", py::overload_cast<const PhantomContext &, const PhantomCiphertext &, size_t>(
-            &phantom::mod_switch_to), py::arg(), py::arg(), py::arg());
+            &phantom::mod_switch_to), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("mod_switch_to_inplace",
           py::overload_cast<const PhantomContext &, PhantomCiphertext &, size_t>(
                   &phantom::mod_switch_to_inplace),
-          py::arg(), py::arg(), py::arg());
+          py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("mod_switch_to_inplace",
           py::overload_cast<const PhantomContext &, PhantomPlaintext &, size_t>(
                   &phantom::mod_switch_to_inplace),
-          py::arg(), py::arg(), py::arg());
+          py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("apply_galois",
           py::overload_cast<const PhantomContext &, const PhantomCiphertext &, size_t,
                             const PhantomGaloisKey &>(&phantom::apply_galois),
-          py::arg(), py::arg(), py::arg(), py::arg());
+          py::arg(), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("rotate",
           py::overload_cast<const PhantomContext &, const PhantomCiphertext &, int,
                             const PhantomGaloisKey &>(&phantom::rotate),
-          py::arg(), py::arg(), py::arg(), py::arg());
+          py::arg(), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("apply_galois_with_key",
           py::overload_cast<const PhantomContext &, const PhantomCiphertext &, size_t,
                             const PhantomRelinKey &>(&phantom::apply_galois),
-          py::arg(), py::arg(), py::arg(), py::arg());
+          py::arg(), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("rotate_with_key",
           py::overload_cast<const PhantomContext &, const PhantomCiphertext &, int,
                             const PhantomRelinKey &>(&phantom::rotate),
-          py::arg(), py::arg(), py::arg(), py::arg());
+          py::arg(), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
-    m.def("hoisting", &phantom::hoisting, py::arg(), py::arg(), py::arg(), py::arg());
+    m.def("hoisting", &phantom::hoisting, py::arg(), py::arg(), py::arg(), py::arg(),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("hoist_rotations", &phantom::hoist_rotations,
-          py::arg("context"), py::arg("ct"), py::arg("glk"), py::arg("steps"));
+          py::arg("context"), py::arg("ct"), py::arg("glk"), py::arg("steps"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== CKKS bootstrap (Phase 6) =====
     py::class_<phantom::SmallBootstrapKey>(m, "small_bootstrap_key");
@@ -260,7 +292,8 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("ct"),
           py::arg("bk"),
           py::arg("user_scale"),
-          py::arg("split_scale_down") = false);
+          py::arg("split_scale_down") = false,
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== CKKSEngine: user-facing facade with bootstrap =====
     py::class_<phantom::CKKSEngineConfig>(m, "ckks_engine_config")
@@ -288,9 +321,12 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("max_user_level", &phantom::CKKSEngine::max_user_level)
             .def("user_level", &phantom::CKKSEngine::user_level)
             .def("user_level_chain_index", &phantom::CKKSEngine::user_level_chain_index)
-            .def("encrypt", &phantom::CKKSEngine::encrypt)
-            .def("decrypt_decode", &phantom::CKKSEngine::decrypt_decode)
-            .def("bootstrap_inplace", &phantom::CKKSEngine::bootstrap_inplace)
+            .def("encrypt", &phantom::CKKSEngine::encrypt,
+                 py::call_guard<py::gil_scoped_release>())
+            .def("decrypt_decode", &phantom::CKKSEngine::decrypt_decode,
+                 py::call_guard<py::gil_scoped_release>())
+            .def("bootstrap_inplace", &phantom::CKKSEngine::bootstrap_inplace,
+                 py::call_guard<py::gil_scoped_release>())
             .def("context", &phantom::CKKSEngine::context, py::return_value_policy::reference_internal)
             .def("encoder", &phantom::CKKSEngine::mutable_encoder, py::return_value_policy::reference_internal)
             .def("secret_key", &phantom::CKKSEngine::mutable_secret_key, py::return_value_policy::reference_internal)
@@ -307,6 +343,24 @@ PYBIND11_MODULE(pyPhantom, m) {
                      return static_cast<double>(e.ckks_rescaled_scale_at(idx));
                  });
 
+    // ===== CUDA device control =====
+    m.def("set_cuda_device", [](int dev) {
+        auto err = cudaSetDevice(dev);
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("cudaSetDevice failed: ") +
+                                     cudaGetErrorString(err));
+    }, py::arg("device_id"),
+       "Set the active CUDA device for the calling thread. Required before "
+       "constructing a CKKSEngine on a non-default GPU and at the start of each "
+       "worker thread in multi-GPU sweeps.");
+
+    m.def("get_cuda_device_count", []() -> int {
+        int count = 0;
+        auto err = cudaGetDeviceCount(&count);
+        if (err != cudaSuccess) return 0;
+        return count;
+    }, "Return the number of CUDA devices visible to this process.");
+
     // ===== Single-chain (host-pinned, level-agnostic) plaintext =====
     py::class_<phantom::SingleChainPlaintext>(m, "single_chain_plaintext")
             .def_property_readonly("scale",
@@ -322,16 +376,19 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
 
     m.def("expand_single_chain_to_full", &phantom::expand_single_chain_to_full,
-          py::arg("context"), py::arg("scp"), py::arg("target_chain_index"));
+          py::arg("context"), py::arg("scp"), py::arg("target_chain_index"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== FD-packed matrix-vector multiply =====
     m.def("inner_sum", &phantom::inner_sum,
           py::arg("context"), py::arg("galois_key"), py::arg("ct"),
-          py::arg("block_size"));
+          py::arg("block_size"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("replicate", &phantom::replicate,
           py::arg("context"), py::arg("galois_key"), py::arg("ct"),
-          py::arg("period"), py::arg("num_slots"));
+          py::arg("period"), py::arg("num_slots"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== BSGS-diagonal matrix-vector multiply =====
     py::class_<phantom::BsgsDiagonals>(m, "bsgs_diagonals")
@@ -358,14 +415,17 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("bsgs_required_steps", &phantom::bsgs_required_steps, py::arg("baby_steps"));
 
     m.def("bsgs_matmul_preencoded", &phantom::bsgs_matmul_preencoded,
-          py::arg("context"), py::arg("galois_key"), py::arg("x"), py::arg("diags"));
+          py::arg("context"), py::arg("galois_key"), py::arg("x"), py::arg("diags"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("compute_bsgs_babies", &phantom::compute_bsgs_babies,
           py::arg("context"), py::arg("galois_key"), py::arg("x"), py::arg("baby_steps"),
-          py::return_value_policy::move);
+          py::return_value_policy::move,
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("bsgs_apply_giants_with_babies", &phantom::bsgs_apply_giants_with_babies,
-          py::arg("context"), py::arg("galois_key"), py::arg("babies"), py::arg("diags"));
+          py::arg("context"), py::arg("galois_key"), py::arg("babies"), py::arg("diags"),
+          py::call_guard<py::gil_scoped_release>());
 
     py::enum_<phantom::ComplexFoldMode>(m, "complex_fold_mode")
         .value("Rows", phantom::ComplexFoldMode::Rows)
@@ -389,7 +449,8 @@ PYBIND11_MODULE(pyPhantom, m) {
     // ===== Paterson-Stockmeyer polynomial evaluation =====
     m.def("eval_polynomial", &phantom::eval_polynomial,
           py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
-          py::arg("ct"), py::arg("coeffs"));
+          py::arg("ct"), py::arg("coeffs"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== RMSNorm =====
     py::class_<phantom::RmsNormParams>(m, "rmsnorm_params")
@@ -417,30 +478,36 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     m.def("rmsnorm_forward", &phantom::rmsnorm_forward,
           py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
-          py::arg("galois_key"), py::arg("x"), py::arg("weights"), py::arg("params"));
+          py::arg("galois_key"), py::arg("x"), py::arg("weights"), py::arg("params"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== Softmax =====
     m.def("ps_exp_init", &phantom::ps_exp_init,
           py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
           py::arg("scores"), py::arg("num_tokens"), py::arg("num_squarings"),
-          py::arg("extra_scale"));
+          py::arg("extra_scale"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("square_iterations_inplace", &phantom::square_iterations_inplace,
           py::arg("context"), py::arg("relin_key"), py::arg("ct"),
-          py::arg("num_squarings"));
+          py::arg("num_squarings"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("square_iterations_damped_inplace", &phantom::square_iterations_damped_inplace,
           py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
-          py::arg("ct"), py::arg("damps"));
+          py::arg("ct"), py::arg("damps"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("softmax_correct", &phantom::softmax_correct,
           py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
-          py::arg("e_ct"), py::arg("a_ct"), py::arg("iters"));
+          py::arg("e_ct"), py::arg("a_ct"), py::arg("iters"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("finalize_softmax", &phantom::finalize_softmax,
           py::arg("context"), py::arg("encoder"), py::arg("relin_key"),
           py::arg("galois_key"), py::arg("e_ct"), py::arg("num_tokens"),
-          py::arg("stride"), py::arg("iters"));
+          py::arg("stride"), py::arg("iters"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== SwiGLU MLP =====
     py::class_<phantom::MlpWeights>(m, "mlp_weights")
@@ -459,7 +526,8 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("mlp_forward", &phantom::mlp_forward,
           py::arg("context"), py::arg("encoder"),
           py::arg("relin_key"), py::arg("galois_key"),
-          py::arg("x"), py::arg("w"));
+          py::arg("x"), py::arg("w"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== Complex-folded MLP (2x faster matmuls via complex slot packing) =====
     py::class_<phantom::ComplexBsgsDiagonals>(m, "complex_bsgs_diagonals");
@@ -467,7 +535,8 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("bsgs_apply_giants_with_babies_complex",
           &phantom::bsgs_apply_giants_with_babies_complex,
           py::arg("context"), py::arg("galois_key"),
-          py::arg("babies"), py::arg("diags"));
+          py::arg("babies"), py::arg("diags"),
+          py::call_guard<py::gil_scoped_release>());
 
     py::class_<phantom::MlpWeightsComplex>(m, "mlp_weights_complex")
             .def(py::init<>())
@@ -498,16 +567,19 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("mlp_forward_complex", &phantom::mlp_forward_complex,
           py::arg("context"), py::arg("encoder"),
           py::arg("relin_key"), py::arg("galois_key"),
-          py::arg("x"), py::arg("w"));
+          py::arg("x"), py::arg("w"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== Attention: QK^T =====
     m.def("compute_qkt", &phantom::compute_qkt,
           py::arg("context"), py::arg("relin_key"), py::arg("galois_key"),
-          py::arg("q"), py::arg("packed_k"), py::arg("d_head"));
+          py::arg("q"), py::arg("packed_k"), py::arg("d_head"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ===== Attention: score × V =====
     m.def("score_times_v", &phantom::score_times_v,
           py::arg("context"), py::arg("relin_key"), py::arg("galois_key"),
           py::arg("score_cts"), py::arg("v_cts"), py::arg("mask_pt"),
-          py::arg("d_head"), py::arg("d_total"), py::arg("positions_per_ct"));
+          py::arg("d_head"), py::arg("d_total"), py::arg("positions_per_ct"),
+          py::call_guard<py::gil_scoped_release>());
 }
