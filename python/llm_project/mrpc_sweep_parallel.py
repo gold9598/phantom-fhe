@@ -172,7 +172,10 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
                                   load_layer_weights_fn,
                                   encode_layer_rp_indep_irps_fn):
     """Build the R_P-independent IRP cache once, spreading the encode work
-    round-robin across all engines (and thus all GPUs).
+    across N worker threads (one per GPU) in parallel.
+
+    Each thread encodes a round-robin subset of layers on its assigned GPU:
+    thread i gets layers [i, i+N, i+2N, ...] where N = len(engines).
 
     Encoding only one layer per GPU keeps Phantom's per-device
     cudaMallocAsync pool small on each GPU, instead of concentrating
@@ -202,24 +205,45 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
             print(f"  rp_indep loaded from disk ({len(cache)} layers) in "
                   f"{time.perf_counter() - t0:.1f}s", flush=True)
             return cache
+
+    # Parallel encode: spawn N worker threads, one per GPU.
     cache = {}
+    cache_lock = threading.Lock()
     num_engines = len(engines)
-    for L in range(num_decoders):
-        gpu_id = L % num_engines
-        # Phantom uses the active CUDA device for its encode kernels;
-        # bind the main thread to the engine we're about to use so the
-        # NTT runs on that engine's GPU and the pool retention stays
-        # there (not on GPU 0).
+
+    def _worker_encode_layers(gpu_id, engine):
+        """Worker thread: encode assigned layers on gpu_id."""
         phantom.set_cuda_device(gpu_id)
-        ctx = engines[gpu_id].context()
-        encoder = engines[gpu_id].encoder()
-        t0 = time.perf_counter()
-        w = load_layer_weights_fn(L)
-        cache[L] = encode_layer_rp_indep_irps_fn(ctx, encoder, w, pack_gate_up=True)
-        print(f"  cached layer {L:02d} on gpu{gpu_id}  "
-              f"({time.perf_counter() - t0:.1f}s)", flush=True)
+        ctx = engine.context()
+        encoder = engine.encoder()
+        # Assign layers in round-robin: thread gpu_id gets layers [gpu_id, gpu_id+num_engines, ...]
+        for L in range(gpu_id, num_decoders, num_engines):
+            t0 = time.perf_counter()
+            w = load_layer_weights_fn(L)
+            result = encode_layer_rp_indep_irps_fn(ctx, encoder, w, pack_gate_up=True)
+            elapsed = time.perf_counter() - t0
+            # Write to shared dict under lock.
+            with cache_lock:
+                cache[L] = result
+                print(f"  cached layer {L:02d} on gpu{gpu_id}  "
+                      f"({elapsed:.1f}s)", flush=True)
+
+    threads = []
+    for gpu_id in range(num_engines):
+        t = threading.Thread(
+            target=_worker_encode_layers,
+            name=f"rp_indep-gpu{gpu_id}",
+            args=(gpu_id, engines[gpu_id]))
+        threads.append(t)
+        t.start()
+
+    # Wait for all threads to finish.
+    for t in threads:
+        t.join()
+
     # Restore main thread to device 0 for any later main-thread work.
     phantom.set_cuda_device(0)
+
     if rp_path:
         t_save0 = time.perf_counter()
         print(f"  saving rp_indep_cache to disk: {rp_path}", flush=True)
