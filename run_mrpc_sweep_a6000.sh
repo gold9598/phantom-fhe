@@ -26,6 +26,20 @@ CSV_PATH=${CSV_PATH:-/tmp/mrpc_sweep_results.csv}
 
 cd "$REPO"
 
+# Ensure pyPhantom .so is built. The Python binding is built as
+# build/lib/pyPhantom.cpython-<ver>-<arch>.so by the repo's CMake.
+if ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&1; then
+    echo "[setup] pyPhantom .so not found in $REPO/build/lib — building..."
+    # CUDA_ARCH default 86 (Ampere — A6000/A100). Override with
+    # CUDA_ARCH=120 for 5090 (Blackwell), 89 for 4090 (Ada), etc.
+    CUDA_ARCH=${CUDA_ARCH:-86}
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+        -DPHANTOM_USE_CUDA_PTX=ON \
+        -DPHANTOM_ENABLE_PYTHON_BINDING=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}
+    cmake --build build --target pyPhantom -j"$(nproc)"
+fi
+
 # ---- Single-GPU (default): full 0..407 sweep ----
 exec "$PYTHON" -u python/llm_project/mrpc_sweep.py \
     --start 0 --end 408 \
