@@ -854,6 +854,13 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # alpha = D_PAD_MLP // D_MODEL = 4. Comparison done orderless (sorted magnitudes).
     _T_PRIME_WIDE = NUM_SLOTS // D_PAD_MLP   # = 2
 
+    # TODO(perf): pack Wdown via Phantom's BSGS ColsConj fold (~2.6s/layer
+    # additional savings). Requires switching Wdown from IRP to BSGS API,
+    # packing h_ct into complex (h_top + i·h_bot) before the bootstrap so
+    # the packing levels are absorbed in the chain reset, and matching the
+    # stride-T_MODEL output layout for the residual2 path. Estimated
+    # 2-3 day refactor; defer until after the 408-MRPC sweep confirms
+    # current accuracy is adequate.
     if diag_up_irp is None:
         # ---- Packed gate+up matvec: Wgate is in real, Wup in imag of the same
         # IRP plaintext set. One matvec produces a complex ct with
