@@ -635,6 +635,29 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
     # ---- Per-layer FHE forward
     NUM_DECODERS = 32
+    # Opt 1: pre-encode all 32 layers' R_P-dependent Wq IRPs (and prime
+    # rp_indep_cache on first example) BEFORE the layer loop. Moves
+    # ~1.5s/layer of encoding work out of the per-layer timer; total work
+    # is unchanged but the per-layer printed time becomes a clean view of
+    # FHE compute. rp_indep_cache fills lazily inside encode_layer_irps;
+    # on subsequent examples the call is Wq-only (~1.5s/layer).
+    t_wq_encode0 = time.perf_counter()
+    wq_cache = {}  # layer_idx -> (Wq_baked, diag_wq_irp, diag_wo_irp,
+                   #               diag_gate_irp, diag_up_irp, diag_down_irp)
+    layer_weights = {}  # layer_idx -> w (cache weight loads too)
+    for _li in range(NUM_DECODERS):
+        if min_layer is not None and _li < min_layer:
+            continue
+        if max_layer is not None and _li > max_layer:
+            break
+        _w = load_layer_weights(_li)
+        layer_weights[_li] = _w
+        wq_cache[_li] = encode_layer_irps(ctx, encoder, _w, R_P,
+                                            rp_indep_cache=rp_indep_cache,
+                                            layer_idx=_li)
+    t_wq_encode = time.perf_counter() - t_wq_encode0
+    print(f"[wq encode: {t_wq_encode:.1f}s]")
+
     print(f"\nRunning {NUM_DECODERS} decoder layers...")
     layer_times = []
     y_p_fhe = None  # final hidden state at P (post-residual2 of last layer)
@@ -649,11 +672,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         verbose = (debug_layer is not None and layer_idx == debug_layer)
         x_btd = pytorch_ref[layer_idx]  # (NUM_TOKENS, D_MODEL) — input to layer L
 
-        # Per-layer real weights + IRP encoding
-        w = load_layer_weights(layer_idx)
+        # Per-layer real weights + IRP encoding (pre-encoded above)
+        w = layer_weights[layer_idx]
         Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
-            encode_layer_irps(ctx, encoder, w, R_P,
-                                rp_indep_cache=rp_indep_cache, layer_idx=layer_idx)
+            wq_cache[layer_idx]
 
         # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware)
         z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
