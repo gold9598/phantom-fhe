@@ -113,7 +113,7 @@ def fit_silu_chebyshev_basis(domain, deg, n_samples=4001):
 
 
 def silu_clenshaw(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
-                   ul_max=10, max_abs_intermediate=None):
+                   ul_max=10, max_abs_intermediate=None, galois_key=None):
     """Evaluate silu(x) on encrypted ct via Chebyshev Clenshaw recurrence.
 
     silu(x) ≈ Σ_{k=0}^{N} t_k · T_k(z), z = x/D ∈ [-1, 1].
@@ -162,14 +162,25 @@ def silu_clenshaw(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
 
     def _maybe_bootstrap(b_curr, b_prev, ct_z):
         if engine.user_level(b_curr) >= ul_max:
-            b_curr = bootstrap_safe(engine, ctx, encoder, b_curr,
-                                      max_abs=max_abs_intermediate, slot_count=slot_count)
-            if not isinstance(b_prev, (int, float)) and \
-               b_prev.chain_index() > b_curr.chain_index():
-                b_prev = bootstrap_safe(engine, ctx, encoder, b_prev,
+            # When b_curr bootstraps it drops to fresh chain; b_prev (if a ct)
+            # is at b_curr.chain - 1 typically, which is then too deep to
+            # mod_switch forward to b_curr's post-boot+1 chain in the next
+            # multiply. So always bootstrap b_prev too when b_curr bootstraps.
+            need_b_prev = not isinstance(b_prev, (int, float))
+            if need_b_prev and galois_key is not None:
+                # Merge b_curr and b_prev into one bootstrap (saves ~163ms).
+                from blocks.bootstrap import merge_bootstrap as _mb
+                b_curr, b_prev = _mb(engine, ctx, encoder, b_curr, b_prev,
+                                       max_abs=max_abs_intermediate,
+                                       slot_count=slot_count, galois_key=galois_key)
+            else:
+                b_curr = bootstrap_safe(engine, ctx, encoder, b_curr,
                                           max_abs=max_abs_intermediate, slot_count=slot_count)
-            # ct_z needs to be at chain_index >= b_curr.chain_index() for mod_switch.
-            # bootstrap_safe ct_z to fresh chain (max_abs<=1 so no scale needed)
+                if need_b_prev:
+                    b_prev = bootstrap_safe(engine, ctx, encoder, b_prev,
+                                              max_abs=max_abs_intermediate, slot_count=slot_count)
+            # ct_z is at the deepest chain (carried through all iters). Bootstrap
+            # it too if it now sits past b_curr's fresh chain.
             if ct_z.chain_index() > b_curr.chain_index():
                 ct_z = bootstrap_safe(engine, ctx, encoder, ct_z,
                                        max_abs=1.0, slot_count=slot_count)

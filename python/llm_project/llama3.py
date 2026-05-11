@@ -895,7 +895,8 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     if silu_t_coeffs is not None and silu_D is not None:
         from blocks.silu import silu_clenshaw
         silu_gate = silu_clenshaw(engine, ctx, encoder, relin_key, gate_ct,
-                                    silu_D, silu_t_coeffs, NUM_SLOTS)
+                                    silu_D, silu_t_coeffs, NUM_SLOTS,
+                                    galois_key=galois_key)
     else:
         silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs,
                          norm_factor=silu_norm_factor,
