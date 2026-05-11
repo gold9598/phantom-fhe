@@ -794,6 +794,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
                             sub_mask_wide_pt, sub_mask_tall_pt, input_mask_pt,
                             stage_times=None, max_abs_calib=None,
                             silu_coeffs=None, silu_norm_factor=None,
+                            silu_t_coeffs=None, silu_D=None,
                             probe_np=None, sk=None,
                             verbose_mag=False):
     """MLP (SwiGLU) forward.
@@ -866,9 +867,14 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
 
     # ---- silu(gate). ----
     t0 = _t()
-    silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs,
-                     norm_factor=silu_norm_factor,
-                     slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
+    if silu_t_coeffs is not None and silu_D is not None:
+        from blocks.silu import silu_clenshaw
+        silu_gate = silu_clenshaw(engine, ctx, encoder, relin_key, gate_ct,
+                                    silu_D, silu_t_coeffs, NUM_SLOTS)
+    else:
+        silu_gate = silu(ctx, encoder, relin_key, gate_ct, coeffs=silu_coeffs,
+                         norm_factor=silu_norm_factor,
+                         slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
     _rec("mlp_silu", t0)
     _vp("post_silu", silu_gate)
     if probe_np is not None and sk is not None:

@@ -41,7 +41,7 @@ from blocks.rmsnorm import (
     rmsnorm_forward_stride_t, rmsnorm_required_steps_stride_t,
     setup_rmsnorm_weights,
 )
-from blocks.silu import silu, fit_silu_coeffs
+from blocks.silu import silu, fit_silu_coeffs, fit_silu_chebyshev_basis
 from blocks.softmax import softmax_damping_schedule
 from llama3 import (
     LOG_N, N, NUM_SLOTS, SCALE, SPARSE_HW,
@@ -622,6 +622,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
         silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN
         silu_domain = (-silu_max * 1.2, silu_max * 1.2)
+        # Chebyshev BASIS coefficients for Clenshaw evaluation (deg=32 gives
+        # FHE max|err| ~3e-3 on D=16 — matches numpy Linf because Clenshaw
+        # keeps intermediates bounded by max|t_k| ~ silu_max, vs monomial PS
+        # whose intermediates scale with c_top ~ silu_max·D^N).
+        silu_D = silu_domain[1]
+        silu_t_coeffs = fit_silu_chebyshev_basis(silu_domain, deg=32)
         # Use NORMALIZED Chebyshev fit: coeffs are for the polynomial in
         # z = x/D where D = silu_domain[1]. Equivalent to scaling all
         # coeffs by D^i, which lifts the high-order coefficients above
@@ -717,6 +723,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
             max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
             silu_norm_factor=silu_norm_factor,
+            silu_t_coeffs=silu_t_coeffs, silu_D=silu_D,
             sk=sk if verbose else None, verbose_mag=verbose)
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
         # residual2

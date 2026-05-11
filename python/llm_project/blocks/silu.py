@@ -99,6 +99,126 @@ SILU_COEFFS_DEG14_R6 = [
 ]
 
 
+def fit_silu_chebyshev_basis(domain, deg, n_samples=4001):
+    """Return Chebyshev BASIS coefficients t_0..t_N of silu on the given
+    symmetric domain. Used by silu_clenshaw which evaluates Σ t_k T_k(z),
+    z = x/D, in Clenshaw recurrence — bounded intermediates ≤ max|t_k|,
+    so per-mul CKKS noise stays small even at high degree (vs monomial PS
+    where intermediates scale with c_top ~ silu_max·D^N).
+    """
+    x = np.linspace(domain[0], domain[1], n_samples)
+    y = _silu(x)
+    cheb = Chebyshev.fit(x, y, deg, domain=domain)
+    return cheb.coef.tolist()
+
+
+def silu_clenshaw(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
+                   ul_max=10, max_abs_intermediate=None):
+    """Evaluate silu(x) on encrypted ct via Chebyshev Clenshaw recurrence.
+
+    silu(x) ≈ Σ_{k=0}^{N} t_k · T_k(z), z = x/D ∈ [-1, 1].
+    Clenshaw recurrence: b_{N+1}=b_{N+2}=0; b_k = 2z·b_{k+1} - b_{k+2} + t_k;
+    silu(x) = t_0 + z·b_1 - b_2.
+
+    Each iteration: 1 ct·ct mul (1 chain level). Mid-flow bootstrap when
+    user_level(b_curr) ≥ ul_max so the recurrence fits in NSL-1 chain budget.
+
+    Args:
+      D: half-width of silu domain (caller's silu_max·1.2).
+      t_coeffs: Chebyshev basis coefficients of silu on [-D, D], from
+                fit_silu_chebyshev_basis.
+      ul_max: user_level threshold for bootstrap.
+      max_abs_intermediate: bound on Chebyshev intermediate magnitudes
+                            for bootstrap_safe scaling. Defaults to max|t_k|.
+    """
+    import sys as _sys
+    _sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
+    from blocks.bootstrap import bootstrap_safe
+
+    N = len(t_coeffs) - 1
+    if N < 2:
+        raise ValueError("silu_clenshaw: degree must be >= 2")
+    user_scale = ct.scale()
+    if max_abs_intermediate is None:
+        max_abs_intermediate = float(np.abs(t_coeffs).max() * 2.0)
+
+    # z = x / D
+    norm_pt = encoder.encode_double_vector(
+        ctx, [1.0 / D] * slot_count, user_scale, ct.chain_index())
+    ct_z = phantom.multiply_plain(ctx, ct, norm_pt)
+    ct_z = phantom.rescale_to_next(ctx, ct_z)
+    ct_z.set_scale(user_scale)
+
+    # Init: b_{N-1} = 2 t_N · z + t_{N-1}, b_prev_value = t_N (scalar)
+    sc_pt = encoder.encode_double_vector(
+        ctx, [2.0 * t_coeffs[N]] * slot_count, ct_z.scale(), ct_z.chain_index())
+    b_curr = phantom.multiply_plain(ctx, ct_z, sc_pt)
+    b_curr = phantom.rescale_to_next(ctx, b_curr)
+    b_curr.set_scale(user_scale)
+    tp_pt = encoder.encode_double_vector(
+        ctx, [t_coeffs[N - 1]] * slot_count, b_curr.scale(), b_curr.chain_index())
+    b_curr = phantom.add_plain(ctx, b_curr, tp_pt)
+    b_prev = t_coeffs[N]  # scalar
+
+    def _maybe_bootstrap(b_curr, b_prev, ct_z):
+        if engine.user_level(b_curr) >= ul_max:
+            b_curr = bootstrap_safe(engine, ctx, encoder, b_curr,
+                                      max_abs=max_abs_intermediate, slot_count=slot_count)
+            if not isinstance(b_prev, (int, float)) and \
+               b_prev.chain_index() > b_curr.chain_index():
+                b_prev = bootstrap_safe(engine, ctx, encoder, b_prev,
+                                          max_abs=max_abs_intermediate, slot_count=slot_count)
+            # ct_z needs to be at chain_index >= b_curr.chain_index() for mod_switch.
+            # bootstrap_safe ct_z to fresh chain (max_abs<=1 so no scale needed)
+            if ct_z.chain_index() > b_curr.chain_index():
+                ct_z = bootstrap_safe(engine, ctx, encoder, ct_z,
+                                       max_abs=1.0, slot_count=slot_count)
+        return b_curr, b_prev, ct_z
+
+    for k in range(N - 2, 0, -1):
+        b_curr, b_prev, ct_z = _maybe_bootstrap(b_curr, b_prev, ct_z)
+        # b_k = 2z · b_{k+1} - b_{k+2} + t_k
+        z_aligned = phantom.mod_switch_to(ctx, ct_z, b_curr.chain_index())
+        z_aligned.set_scale(b_curr.scale())
+        m = phantom.multiply_and_relin(ctx, z_aligned, b_curr, relin_key)
+        m = phantom.rescale_to_next(ctx, m)
+        m.set_scale(user_scale)
+        m = phantom.add(ctx, m, m)  # ·2 (cheap doubling)
+        if isinstance(b_prev, (int, float)):
+            sub_pt = encoder.encode_double_vector(
+                ctx, [b_prev] * slot_count, m.scale(), m.chain_index())
+            b_new = phantom.sub_plain(ctx, m, sub_pt)
+        else:
+            b_prev_a = phantom.mod_switch_to(ctx, b_prev, m.chain_index())
+            b_prev_a.set_scale(m.scale())
+            b_new = phantom.sub(ctx, m, b_prev_a)
+        tk_pt = encoder.encode_double_vector(
+            ctx, [t_coeffs[k]] * slot_count, b_new.scale(), b_new.chain_index())
+        b_new = phantom.add_plain(ctx, b_new, tk_pt)
+        b_prev = b_curr
+        b_curr = b_new
+
+    b_curr, b_prev, ct_z = _maybe_bootstrap(b_curr, b_prev, ct_z)
+    # silu(x) = t_0 + z · b_1 - b_2
+    z_aligned = phantom.mod_switch_to(ctx, ct_z, b_curr.chain_index())
+    z_aligned.set_scale(b_curr.scale())
+    zb1 = phantom.multiply_and_relin(ctx, z_aligned, b_curr, relin_key)
+    zb1 = phantom.rescale_to_next(ctx, zb1)
+    zb1.set_scale(user_scale)
+    if isinstance(b_prev, (int, float)):
+        sub_pt = encoder.encode_double_vector(
+            ctx, [b_prev] * slot_count, zb1.scale(), zb1.chain_index())
+        result = phantom.sub_plain(ctx, zb1, sub_pt)
+    else:
+        b2_a = phantom.mod_switch_to(ctx, b_prev, zb1.chain_index())
+        b2_a.set_scale(zb1.scale())
+        result = phantom.sub(ctx, zb1, b2_a)
+    t0_pt = encoder.encode_double_vector(
+        ctx, [t_coeffs[0]] * slot_count, result.scale(), result.chain_index())
+    result = phantom.add_plain(ctx, result, t0_pt)
+    return result
+
+
 def silu(ctx, encoder, relin_key, ct, coeffs=None, norm_factor=None,
          slot_count=None):
     """Evaluate SiLU on ct using a Chebyshev polynomial. If `coeffs` is None
