@@ -68,6 +68,21 @@ SHARED_WQ_CACHE = {}
 SHARED_WQ_CACHE_EVENTS = {}
 SHARED_WQ_CACHE_LOCK = threading.Lock()
 
+# Opt 2: disk-persistent IRP caches. Survives process restarts so a
+# rerun doesn't re-encode the ~36 GB rp_indep_cache (~7.5 min from cold)
+# or re-encode any num_tokens whose wq IRPs were built in a previous
+# run. Disabled via --no-disk-cache; cleared on startup via
+# --clear-disk-cache.
+DISK_CACHE_ROOT_DEFAULT = "/tmp/phantom_irp_cache"
+# Per-run flags set by main() before threads start.
+_DISK_CACHE_ROOT = None
+_DISK_CACHE_ENABLED = False
+# Counters logged at end of each phase. Updated under SHARED_WQ_CACHE_LOCK
+# so concurrent workers don't lose updates.
+_WQ_DISK_HITS = 0
+_WQ_DISK_MISSES = 0
+_WQ_RAM_HITS = 0
+
 
 def _ensure_csv(path):
     if not os.path.exists(path):
@@ -161,8 +176,30 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
     SCP coeff buffers live in pinned host memory (device-agnostic via
     CUDA UVA), so all engines can read them during their forward passes.
     Main thread must be on device 0 here (set by _build_engines).
+
+    When the disk cache is enabled and a valid snapshot exists at
+    {DISK_CACHE_ROOT}/rp_indep, the on-disk SCPs are loaded instead
+    of re-encoded. After a fresh build, the cache is saved back to
+    disk for the next process restart.
     """
+    from blocks.scp_disk_cache import (save_scp_dict_to_disk,
+                                          load_scp_dict_from_disk, has_cache)
     phantom.set_cuda_device(0)
+    rp_path = (os.path.join(_DISK_CACHE_ROOT, "rp_indep")
+               if _DISK_CACHE_ENABLED else None)
+    if rp_path and has_cache(rp_path):
+        t0 = time.perf_counter()
+        print(f"  loading rp_indep_cache from disk: {rp_path}", flush=True)
+        cache = load_scp_dict_from_disk(rp_path)
+        # Sanity check: must cover all expected layer indices.
+        missing = [L for L in range(num_decoders) if L not in cache]
+        if missing:
+            print(f"  disk cache incomplete (missing layers {missing[:5]}..); "
+                  f"rebuilding from scratch", flush=True)
+        else:
+            print(f"  rp_indep loaded from disk ({len(cache)} layers) in "
+                  f"{time.perf_counter() - t0:.1f}s", flush=True)
+            return cache
     ctx = engines[0].context()
     encoder = engines[0].encoder()
     cache = {}
@@ -171,7 +208,111 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
         w = load_layer_weights_fn(L)
         cache[L] = encode_layer_rp_indep_irps_fn(ctx, encoder, w, pack_gate_up=True)
         print(f"  cached layer {L:02d}  ({time.perf_counter() - t0:.1f}s)", flush=True)
+    if rp_path:
+        t_save0 = time.perf_counter()
+        print(f"  saving rp_indep_cache to disk: {rp_path}", flush=True)
+        save_scp_dict_to_disk(cache, rp_path)
+        print(f"  rp_indep saved in {time.perf_counter() - t_save0:.1f}s",
+              flush=True)
     return cache
+
+
+def _wq_disk_path(num_tokens):
+    if not _DISK_CACHE_ENABLED:
+        return None
+    return os.path.join(_DISK_CACHE_ROOT, "wq", f"nt_{num_tokens}")
+
+
+def _wq_extract_diagwq(wq_entry):
+    """Extract only the diag_wq_irp lists (one per layer) from a
+    shared_wq_cache[num_tokens] dict. The other tuple slots (Wq_baked,
+    diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp) are either
+    None or references into the rp_indep_cache and are NOT persisted —
+    saving them would duplicate the ~36 GB rp_indep on disk per
+    num_tokens (~1 TB across the sweep). On load they are rewired from
+    the in-memory rp_indep_cache."""
+    # wq_entry shape: {layer_idx: (None, diag_wq_irp, diag_wo_irp,
+    #                              diag_gate_irp, diag_up_irp, diag_down_irp)}
+    # We persist only {layer_idx: diag_wq_irp}.
+    return {L: tup[1] for L, tup in wq_entry.items()}
+
+
+def _wq_rebuild_full(diagwq_by_layer, rp_indep_cache):
+    """Inverse of _wq_extract_diagwq: re-assemble the 6-tuple by
+    splicing in rp_indep_cache entries. Mirrors the tuple layout produced
+    by encode_layer_irps + the (None,) prefix used in run_classifier_fhe."""
+    out = {}
+    for L, diag_wq_irp in diagwq_by_layer.items():
+        if L not in rp_indep_cache:
+            raise RuntimeError(
+                f"_wq_rebuild_full: layer {L} missing from rp_indep_cache; "
+                f"cannot reconstruct shared_wq_cache entry")
+        diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = rp_indep_cache[L]
+        out[L] = (None, diag_wq_irp, diag_wo_irp, diag_gate_irp,
+                  diag_up_irp, diag_down_irp)
+    return out
+
+
+def _wq_preload_from_disk(rp_indep_cache):
+    """Eagerly load every nt_*/ subdirectory under {DISK_CACHE_ROOT}/wq
+    into SHARED_WQ_CACHE before workers start. Each loaded num_tokens
+    becomes a HIT in run_classifier_fhe — no thread re-encodes Wq."""
+    if not _DISK_CACHE_ENABLED:
+        return
+    from blocks.scp_disk_cache import load_scp_dict_from_disk, has_cache
+    wq_root = os.path.join(_DISK_CACHE_ROOT, "wq")
+    if not os.path.isdir(wq_root):
+        return
+    loaded = 0
+    t0 = time.perf_counter()
+    for name in sorted(os.listdir(wq_root)):
+        if not name.startswith("nt_"):
+            continue
+        try:
+            nt = int(name[len("nt_"):])
+        except ValueError:
+            continue
+        path = os.path.join(wq_root, name)
+        if not has_cache(path):
+            continue
+        try:
+            diagwq = load_scp_dict_from_disk(path)
+            SHARED_WQ_CACHE[nt] = _wq_rebuild_full(diagwq, rp_indep_cache)
+            loaded += 1
+        except Exception as e:
+            print(f"  wq disk preload failed for {path}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+    if loaded:
+        print(f"  wq disk preload: {loaded} num_tokens loaded in "
+              f"{time.perf_counter() - t0:.1f}s", flush=True)
+
+
+def _wq_persist_if_new(num_tokens):
+    """If SHARED_WQ_CACHE[num_tokens] is populated and not yet on disk,
+    save it. Called from workers AFTER run_classifier_fhe returns, so
+    runtime cost is amortized into the per-example wall time. Only the
+    diag_wq_irp portion is persisted — see _wq_extract_diagwq."""
+    global _WQ_DISK_HITS, _WQ_DISK_MISSES, _WQ_RAM_HITS
+    if not _DISK_CACHE_ENABLED:
+        return
+    path = _wq_disk_path(num_tokens)
+    from blocks.scp_disk_cache import save_scp_dict_to_disk, has_cache
+    # has_cache is a cheap file stat; OK to do without the lock since
+    # the worst case is two threads both deciding to save (atomic rename
+    # makes that safe; the second save just replaces the first).
+    if has_cache(path):
+        return
+    entry = SHARED_WQ_CACHE.get(num_tokens)
+    if entry is None:
+        return
+    try:
+        save_scp_dict_to_disk(_wq_extract_diagwq(entry), path)
+        with SHARED_WQ_CACHE_LOCK:
+            _WQ_DISK_MISSES += 1
+        print(f"  wq saved to disk: nt={num_tokens} -> {path}", flush=True)
+    except Exception as e:
+        print(f"  wq disk save failed for nt={num_tokens}: "
+              f"{type(e).__name__}: {e}", flush=True)
 
 
 def _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref_fn,
@@ -289,6 +430,10 @@ def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
         shared_wq_cache_events=SHARED_WQ_CACHE_EVENTS,
         shared_wq_cache_lock=SHARED_WQ_CACHE_LOCK)
     elapsed = time.perf_counter() - t0
+    # Persist the wq entry for this num_tokens if it isn't already on
+    # disk. Cheap fast path when the entry exists; ~few-second save on
+    # the first encounter per num_tokens.
+    _wq_persist_if_new(num_tokens)
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     return {
         "idx": idx, "num_tokens": num_tokens, "label": int(row["label"]),
@@ -324,6 +469,7 @@ def _worker(gpu_id, engine, chunk, shared_cache, tok, ds,
 
 
 def main():
+    global _DISK_CACHE_ROOT, _DISK_CACHE_ENABLED
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=408)
@@ -333,11 +479,30 @@ def main():
                     help="Number of GPUs to use (0 = auto-detect via "
                          "phantom.get_cuda_device_count()).")
     ap.add_argument("--csv-path", default=CSV_PATH_DEFAULT)
+    ap.add_argument("--disk-cache-root", default=DISK_CACHE_ROOT_DEFAULT,
+                    help="Directory where rp_indep + wq IRP caches are "
+                         "persisted across process restarts.")
+    ap.add_argument("--no-disk-cache", action="store_true",
+                    help="Skip the disk-persistent IRP cache (debug/testing).")
+    ap.add_argument("--clear-disk-cache", action="store_true",
+                    help="Wipe --disk-cache-root before starting.")
     args = ap.parse_args()
 
     if args.summary:
         _compute_metrics(args.csv_path)
         return
+
+    _DISK_CACHE_ROOT = args.disk_cache_root
+    _DISK_CACHE_ENABLED = not args.no_disk_cache
+    if args.clear_disk_cache and os.path.isdir(_DISK_CACHE_ROOT):
+        import shutil
+        print(f"  --clear-disk-cache: removing {_DISK_CACHE_ROOT}", flush=True)
+        shutil.rmtree(_DISK_CACHE_ROOT)
+    if _DISK_CACHE_ENABLED:
+        os.makedirs(_DISK_CACHE_ROOT, exist_ok=True)
+        print(f"  disk cache: {_DISK_CACHE_ROOT}", flush=True)
+    else:
+        print(f"  disk cache: DISABLED", flush=True)
 
     num_gpus = args.num_gpus or phantom.get_cuda_device_count()
     if num_gpus <= 0:
@@ -381,12 +546,22 @@ def main():
           flush=True)
 
     # ---- Phase 2: shared rp_indep cache (one-time, ~7.5 min on first run) ----
+    # With --disk-cache (default), this is loaded from disk after the
+    # first run completes; subsequent process restarts skip the encode.
     print(f"Building shared rp_indep_cache ({NUM_DECODERS} layers)...",
           flush=True)
     t_cache0 = time.perf_counter()
     shared_cache = _build_shared_rp_indep_cache(
         engines, NUM_DECODERS, load_layer_weights, encode_layer_rp_indep_irps)
     print(f"  cache built in {time.perf_counter() - t_cache0:.1f}s", flush=True)
+
+    # ---- Phase 2b: preload wq IRP entries from disk into SHARED_WQ_CACHE ----
+    # Each loaded num_tokens becomes a HIT in run_classifier_fhe so no
+    # worker re-encodes Wq for it. Misses (new num_tokens) are encoded
+    # at runtime and saved back to disk by _wq_persist_if_new.
+    if _DISK_CACHE_ENABLED:
+        print(f"Preloading wq disk cache...", flush=True)
+        _wq_preload_from_disk(shared_cache)
 
     # ---- Phase 3: pre-warm PT-ref disk cache on main thread (cuda:0) ----
     # Avoids N threads racing on cuda:0 with concurrent 8B model loads.
@@ -423,6 +598,9 @@ def main():
             t.join()
 
     print()
+    print(f"=== Cache summary ===")
+    print(f"  wq num_tokens in RAM at exit: {len(SHARED_WQ_CACHE)}")
+    print(f"  wq disk misses encoded this run: {_WQ_DISK_MISSES}")
     _compute_metrics(args.csv_path)
 
 
