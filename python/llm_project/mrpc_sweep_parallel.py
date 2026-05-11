@@ -171,11 +171,14 @@ def _build_engines(num_gpus, setup_engine_fn, user_steps, step_categories):
 def _build_shared_rp_indep_cache(engines, num_decoders,
                                   load_layer_weights_fn,
                                   encode_layer_rp_indep_irps_fn):
-    """Build the R_P-independent IRP cache once using engine[0]'s ctx/encoder.
+    """Build the R_P-independent IRP cache once, spreading the encode work
+    round-robin across all engines (and thus all GPUs).
 
-    SCP coeff buffers live in pinned host memory (device-agnostic via
-    CUDA UVA), so all engines can read them during their forward passes.
-    Main thread must be on device 0 here (set by _build_engines).
+    Encoding only one layer per GPU keeps Phantom's per-device
+    cudaMallocAsync pool small on each GPU, instead of concentrating
+    ~15 GB of pool retention on GPU 0. SCPs end up in pinned host
+    memory regardless of which GPU did the NTT, so the resulting cache
+    is device-agnostic and shareable by all worker engines.
 
     When the disk cache is enabled and a valid snapshot exists at
     {DISK_CACHE_ROOT}/rp_indep, the on-disk SCPs are loaded instead
@@ -184,7 +187,6 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
     """
     from blocks.scp_disk_cache import (save_scp_dict_to_disk,
                                           load_scp_dict_from_disk, has_cache)
-    phantom.set_cuda_device(0)
     rp_path = (os.path.join(_DISK_CACHE_ROOT, "rp_indep")
                if _DISK_CACHE_ENABLED else None)
     if rp_path and has_cache(rp_path):
@@ -200,14 +202,24 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
             print(f"  rp_indep loaded from disk ({len(cache)} layers) in "
                   f"{time.perf_counter() - t0:.1f}s", flush=True)
             return cache
-    ctx = engines[0].context()
-    encoder = engines[0].encoder()
     cache = {}
+    num_engines = len(engines)
     for L in range(num_decoders):
+        gpu_id = L % num_engines
+        # Phantom uses the active CUDA device for its encode kernels;
+        # bind the main thread to the engine we're about to use so the
+        # NTT runs on that engine's GPU and the pool retention stays
+        # there (not on GPU 0).
+        phantom.set_cuda_device(gpu_id)
+        ctx = engines[gpu_id].context()
+        encoder = engines[gpu_id].encoder()
         t0 = time.perf_counter()
         w = load_layer_weights_fn(L)
         cache[L] = encode_layer_rp_indep_irps_fn(ctx, encoder, w, pack_gate_up=True)
-        print(f"  cached layer {L:02d}  ({time.perf_counter() - t0:.1f}s)", flush=True)
+        print(f"  cached layer {L:02d} on gpu{gpu_id}  "
+              f"({time.perf_counter() - t0:.1f}s)", flush=True)
+    # Restore main thread to device 0 for any later main-thread work.
+    phantom.set_cuda_device(0)
     if rp_path:
         t_save0 = time.perf_counter()
         print(f"  saving rp_indep_cache to disk: {rp_path}", flush=True)
