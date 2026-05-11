@@ -153,6 +153,22 @@ def load_layer_weights(layer_idx):
             "g1": L("g1"), "g2": L("g2")}
 
 
+def load_layer_weights_subset(layer_idx, keys=("Wq", "Wk", "Wv", "g1", "g2")):
+    """Load only a subset of per-layer weights. Returns a dict with just `keys`.
+
+    The default subset covers the weights touched on the per-example hot
+    path (Wq encoding, attention key/value baking, rmsnorm gains). The
+    R_P-independent weights (Wo/Wgate/Wup/Wdown) are intentionally omitted
+    because they are consumed exclusively inside encode_layer_rp_indep_irps,
+    which a parallel sweep now feeds from a disk-persistent cache. Skipping
+    them avoids 4 redundant np.load + .astype(float64) calls (~16 MB each)
+    per layer per worker, eliminating the disk + glibc-malloc contention
+    that py-spy showed serializing all worker threads in load_layer_weights.
+    """
+    ld = f"{PROBE_FULL}/layer_{layer_idx:02d}"
+    return {k: np.load(f"{ld}/{k}.npy").astype(np.float64) for k in keys}
+
+
 def encode_layer_rp_indep_irps(ctx, encoder, w, pack_gate_up=True):
     """Pre-encode R_P-INDEPENDENT IRPs for one layer (Wo, Wgate+Wup, Wdown).
     These are model parameters and don't depend on the query position, so a
@@ -228,6 +244,15 @@ def encode_layer_irps(ctx, encoder, w, R_P, pack_gate_up=True,
        layer_idx in rp_indep_cache:
         diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = rp_indep_cache[layer_idx]
     else:
+        # Cache-miss fallback. If `w` was sourced from a pre-loaded subset
+        # (see load_layer_weights_subset), it may be missing the R_P-indep
+        # keys (Wo/Wgate/Wup/Wdown) — re-load the full weight set on demand
+        # so this code path stays correct for legacy single-GPU callers.
+        if not all(k in w for k in ("Wo", "Wgate", "Wup", "Wdown")):
+            assert layer_idx is not None, (
+                "encode_layer_irps: weight subset missing R_P-indep keys but "
+                "no layer_idx provided to reload from disk")
+            w = load_layer_weights(layer_idx)
         diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
             encode_layer_rp_indep_irps(ctx, encoder, w, pack_gate_up=pack_gate_up)
         if rp_indep_cache is not None and layer_idx is not None:

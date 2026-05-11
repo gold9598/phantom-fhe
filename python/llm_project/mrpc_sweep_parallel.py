@@ -473,7 +473,8 @@ def _ptref_load(idx, token_ids, capture_pytorch_ref_fn):
 
 
 def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
-              shared_cache, engine, run_classifier_fhe_fn, capture_pytorch_ref_fn):
+              shared_cache, engine, run_classifier_fhe_fn, capture_pytorch_ref_fn,
+              shared_layer_weights=None):
     """Process a single MRPC example on the engine bound to gpu_id."""
     row = ds[idx]
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
@@ -502,7 +503,8 @@ def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
         rp_indep_cache=shared_cache, engine=engine,
         shared_wq_cache=SHARED_WQ_CACHE,
         shared_wq_cache_events=SHARED_WQ_CACHE_EVENTS,
-        shared_wq_cache_lock=SHARED_WQ_CACHE_LOCK)
+        shared_wq_cache_lock=SHARED_WQ_CACHE_LOCK,
+        preloaded_weights=shared_layer_weights)
     elapsed = time.perf_counter() - t0
     # Persist the wq entry for this num_tokens if it isn't already on
     # disk. Cheap fast path when the entry exists; ~few-second save on
@@ -519,7 +521,8 @@ def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
 
 def _worker(gpu_id, engine, chunk, shared_cache, tok, ds,
              cos_all_full, sin_all_full, csv_path,
-             run_classifier_fhe_fn, capture_pytorch_ref_fn):
+             run_classifier_fhe_fn, capture_pytorch_ref_fn,
+             shared_layer_weights=None):
     """Worker thread: process one chunk of example indices on one GPU.
 
     cudaSetDevice MUST be called inside the thread — CUDA device binding
@@ -530,7 +533,8 @@ def _worker(gpu_id, engine, chunk, shared_cache, tok, ds,
         try:
             row = _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
                             shared_cache, engine,
-                            run_classifier_fhe_fn, capture_pytorch_ref_fn)
+                            run_classifier_fhe_fn, capture_pytorch_ref_fn,
+                            shared_layer_weights=shared_layer_weights)
             _append_row(csv_path, row)
             agree = " (agree)" if row["fhe_pred"] == row["pt_pred"] else " (DISAGREE)"
             print(f"  [gpu{gpu_id}] idx={idx}: PT={row['pt_pred']} "
@@ -588,6 +592,7 @@ def main():
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from llama3 import (PROBE_FULL, load_layer_weights,
+                          load_layer_weights_subset,
                           encode_layer_rp_indep_irps)
     from llama3_mrpc import (run_classifier_fhe, capture_pytorch_ref,
                               capture_pytorch_ref_with_model,
@@ -629,6 +634,24 @@ def main():
         engines, NUM_DECODERS, load_layer_weights, encode_layer_rp_indep_irps)
     print(f"  cache built in {time.perf_counter() - t_cache0:.1f}s", flush=True)
 
+    # ---- Phase 2.5: pre-load per-example layer weights ONCE on main thread ----
+    # py-spy showed all 4 workers concurrently stuck in load_layer_weights at
+    # llama3.py:150-152 — 9× np.load + .astype(float64), ~128 MB allocations
+    # per matrix, fighting on a single disk and the glibc malloc/mmap lock.
+    # That serialized the workers despite no GIL issue. Of the 9 weights,
+    # only 5 (Wq/Wk/Wv/g1/g2) are touched on the per-example hot path; the
+    # other 4 (Wo/Wgate/Wup/Wdown) are R_P-independent and are now served
+    # from the disk-persistent rp_indep_cache. Pre-loading just the subset
+    # once costs ~5s instead of ~30s × per-example wall-clock contention.
+    print("Pre-loading per-example layer weights (Wq/Wk/Wv/g1/g2)...",
+          flush=True)
+    t_pw0 = time.perf_counter()
+    shared_layer_weights = {
+        L: load_layer_weights_subset(L) for L in range(NUM_DECODERS)
+    }
+    print(f"  weights loaded in {time.perf_counter() - t_pw0:.1f}s",
+          flush=True)
+
     # ---- Phase 2b: preload wq IRP entries from disk into SHARED_WQ_CACHE ----
     # Each loaded num_tokens becomes a HIT in run_classifier_fhe so no
     # worker re-encodes Wq for it. Misses (new num_tokens) are encoded
@@ -658,7 +681,8 @@ def main():
             target=_worker, name=f"worker-gpu{gpu_id}", args=(
                 gpu_id, engines[gpu_id], chunks[gpu_id], shared_cache,
                 tok, ds, cos_all_full, sin_all_full, args.csv_path,
-                run_classifier_fhe, capture_pytorch_ref))
+                run_classifier_fhe, capture_pytorch_ref,
+                shared_layer_weights))
         threads.append(t)
         t.start()
 

@@ -577,7 +577,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                          debug_layer=None, max_layer=None, min_layer=None,
                          rp_indep_cache=None, engine=None,
                          shared_wq_cache=None, shared_wq_cache_events=None,
-                         shared_wq_cache_lock=None):
+                         shared_wq_cache_lock=None,
+                         preloaded_weights=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -597,6 +598,18 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     final_norm_g = np.load(f"{PROBE_FULL}/final_norm_g.npy").astype(np.float64)
     lm_head_yesno = np.load(f"{PROBE_FULL}/lm_head_yesno.npy").astype(np.float64)
     meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
+
+    # Per-layer weight accessor. The parallel sweep pre-loads the per-example
+    # subset (Wq/Wk/Wv/g1/g2) ONCE on the main thread and passes the dict
+    # here via preloaded_weights; serial / legacy callers leave it None and
+    # fall back to the original per-call np.load. py-spy showed concurrent
+    # workers stuck on disk I/O + glibc malloc contention inside
+    # load_layer_weights (~128 MB allocations × 9 keys × 4 threads); the
+    # pre-load eliminates that contention entirely.
+    def _get_layer_w(layer_idx):
+        if preloaded_weights is not None:
+            return preloaded_weights[layer_idx]
+        return load_layer_weights(layer_idx)
 
     # ---- Engine. If caller supplies one, reuse it (required when sharing
     # an rp_indep_cache of plaintexts across calls — plaintexts are bound to
@@ -719,7 +732,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                     continue
                 if max_layer is not None and _li > max_layer:
                     break
-                _w = load_layer_weights(_li)
+                _w = _get_layer_w(_li)
                 layer_weights[_li] = _w
                 _tup = encode_layer_irps(
                     ctx, encoder, _w, R_P,
@@ -738,7 +751,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 continue
             if max_layer is not None and _li > max_layer:
                 break
-            _w = load_layer_weights(_li)
+            _w = _get_layer_w(_li)
             layer_weights[_li] = _w
             wq_cache[_li] = encode_layer_irps(
                 ctx, encoder, _w, R_P,
@@ -752,7 +765,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             if max_layer is not None and _li > max_layer:
                 break
             if _li not in layer_weights:
-                layer_weights[_li] = load_layer_weights(_li)
+                layer_weights[_li] = _get_layer_w(_li)
     t_wq_encode = time.perf_counter() - t_wq_encode0
     print(f"[wq encode: {t_wq_encode:.1f}s]")
 
