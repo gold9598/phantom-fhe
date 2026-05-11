@@ -563,7 +563,8 @@ def _probe(tag, ctx, encoder, sk, ct):
 
 def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
                          cos_all_full, sin_all_full, label="prompt",
-                         debug_layer=None, max_layer=None, min_layer=None):
+                         debug_layer=None, max_layer=None, min_layer=None,
+                         rp_indep_cache=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -648,7 +649,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # Per-layer real weights + IRP encoding
         w = load_layer_weights(layer_idx)
         Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
-            encode_layer_irps(ctx, encoder, w, R_P)
+            encode_layer_irps(ctx, encoder, w, R_P,
+                                rp_indep_cache=rp_indep_cache, layer_idx=layer_idx)
 
         # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware)
         z1_l, z2_l, max_abs_calib = compute_layer_calib_n(

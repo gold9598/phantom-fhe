@@ -153,25 +153,18 @@ def load_layer_weights(layer_idx):
             "g1": L("g1"), "g2": L("g2")}
 
 
-def encode_layer_irps(ctx, encoder, w, R_P, pack_gate_up=True):
-    """Pre-encode IRP plaintexts for one layer's projection weights.
-    Returns (Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp,
-             diag_up_irp, diag_down_irp).
+def encode_layer_rp_indep_irps(ctx, encoder, w, pack_gate_up=True):
+    """Pre-encode R_P-INDEPENDENT IRPs for one layer (Wo, Wgate+Wup, Wdown).
+    These are model parameters and don't depend on the query position, so a
+    sweep over many MRPC examples can encode them ONCE and reuse them across
+    all examples. Wq is R_P-dependent and must be re-encoded per example —
+    handled by encode_layer_wq_irp below.
 
-    If pack_gate_up=True (default): Wgate and Wup are packed into a single
-    complex IRP (Wgate in real, Wup in imag). diag_gate_irp holds the
-    packed plaintexts and diag_up_irp is None. The downstream
-    fhe_mlp_irp_bootstrap detects None and uses one matvec + a conjugation-
-    based extract to recover gate_ct and up_ct. Halves the MLP IRP
-    encoding time (~4s/layer saved) and the gate+up matvec count.
+    Returns (diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp).
+    With pack_gate_up=True (default), diag_gate_irp is the packed complex
+    plaintext set and diag_up_irp is None (sentinel for the downstream
+    packed-matvec path).
     """
-    Wq_baked = w["Wq"].copy()
-    for h in range(N_HEADS):
-        s, e = h*D_HEAD, (h+1)*D_HEAD
-        Wq_baked[s:e, :] = R_P @ w["Wq"][s:e, :]
-    diag_wq_irp = encode_irp_diagonals_host(
-        ctx, encoder, Wq_baked.T, NUM_SLOTS, D_TOTAL, SCALE,
-        baby_steps=BABY_STEPS_IRP_SQUARE)
     diag_wo_irp = encode_irp_diagonals_host(
         ctx, encoder, w["Wo"].T, NUM_SLOTS, D_TOTAL, SCALE,
         baby_steps=BABY_STEPS_IRP_SQUARE)
@@ -198,6 +191,48 @@ def encode_layer_irps(ctx, encoder, w, R_P, pack_gate_up=True):
     diag_down_irp = encode_irp_diagonals_rect_host(
         ctx, encoder, Wdown_pad, NUM_SLOTS, D_PAD_MLP, D_MODEL, SCALE,
         baby_steps=BABY_STEPS_IRP_MLP)
+    return diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp
+
+
+def encode_layer_wq_irp(ctx, encoder, w, R_P):
+    """Encode the R_P-DEPENDENT Wq IRP for one layer's query position.
+    Returns (Wq_baked, diag_wq_irp). Must be re-encoded per-example in a
+    sweep where the query position (and thus R_P) changes."""
+    Wq_baked = w["Wq"].copy()
+    for h in range(N_HEADS):
+        s, e = h*D_HEAD, (h+1)*D_HEAD
+        Wq_baked[s:e, :] = R_P @ w["Wq"][s:e, :]
+    diag_wq_irp = encode_irp_diagonals_host(
+        ctx, encoder, Wq_baked.T, NUM_SLOTS, D_TOTAL, SCALE,
+        baby_steps=BABY_STEPS_IRP_SQUARE)
+    return Wq_baked, diag_wq_irp
+
+
+def encode_layer_irps(ctx, encoder, w, R_P, pack_gate_up=True,
+                       rp_indep_cache=None, layer_idx=None):
+    """Pre-encode IRP plaintexts for one layer's projection weights.
+    Returns (Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp,
+             diag_up_irp, diag_down_irp).
+
+    If `rp_indep_cache` is a dict and `layer_idx` is provided, reuse the
+    R_P-independent IRPs (Wo, gate+up packed, Wdown) from cache. Useful
+    for multi-example sweeps: encoding all 32 layers' R_P-indep IRPs
+    once (~4-5 min) avoids re-doing ~14s of encoding work per example.
+
+    pack_gate_up=True (default): Wgate and Wup are packed into a single
+    complex IRP (Wgate in real, Wup in imag). diag_up_irp returned as
+    None to signal the packed-matvec path downstream.
+    """
+    Wq_baked, diag_wq_irp = encode_layer_wq_irp(ctx, encoder, w, R_P)
+    if rp_indep_cache is not None and layer_idx is not None and \
+       layer_idx in rp_indep_cache:
+        diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = rp_indep_cache[layer_idx]
+    else:
+        diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
+            encode_layer_rp_indep_irps(ctx, encoder, w, pack_gate_up=pack_gate_up)
+        if rp_indep_cache is not None and layer_idx is not None:
+            rp_indep_cache[layer_idx] = (
+                diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp)
     return Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp
 
 

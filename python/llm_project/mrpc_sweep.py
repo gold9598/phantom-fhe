@@ -97,7 +97,8 @@ def _compute_metrics():
 
 
 def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
-              run_classifier_fhe, capture_pytorch_ref_cached, P_local_fn):
+              run_classifier_fhe, capture_pytorch_ref_cached, P_local_fn,
+              rp_indep_cache):
     row = ds[idx]
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
                   "Sentence 1: {s1}\nSentence 2: {s2}\n"
@@ -115,7 +116,8 @@ def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
     yes_logit, no_logit = run_classifier_fhe(
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}",
-        debug_layer=None, max_layer=None, min_layer=None)
+        debug_layer=None, max_layer=None, min_layer=None,
+        rp_indep_cache=rp_indep_cache)
     elapsed = time.perf_counter() - t0
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     return {
@@ -165,11 +167,18 @@ def main():
     print(f"=== MRPC sweep [{args.start},{args.end}): {len(todo)} examples remaining "
           f"({len(done & set(range(args.start, args.end)))} already done)", flush=True)
 
+    # Per-layer R_P-independent IRP cache (Wo, gate+up packed, Wdown). First
+    # example populates it (~14s/layer × 32 = ~7.5 min one-time cost);
+    # subsequent examples skip re-encoding (~14s/layer = ~7.5 min saved).
+    # Total host RAM: ~3GB/layer × 32 = ~96GB. Requires 128GB+ RAM box.
+    rp_indep_cache = {}
+
     for k, idx in enumerate(todo):
         try:
             print(f"\n[{k+1}/{len(todo)}] idx={idx}...", flush=True)
             row = _run_one(idx, tok, ds, None, cos_all_full, sin_all_full,
-                            run_classifier_fhe, _ptref_cached, None)
+                            run_classifier_fhe, _ptref_cached, None,
+                            rp_indep_cache)
             _append_row(row)
             agree_str = " (agree)" if row["fhe_pred"] == row["pt_pred"] else " (DISAGREE)"
             print(f"  idx={idx}: PT={row['pt_pred']} FHE={row['fhe_pred']}"
