@@ -327,72 +327,110 @@ def _wq_persist_if_new(num_tokens):
               f"{type(e).__name__}: {e}", flush=True)
 
 
-def _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref_fn,
-                          capture_pytorch_ref_with_model_fn=None):
-    """Sequentially pre-warm the per-idx PT-reference disk cache.
+def _ptref_prewarm_subprocess_main(miss_specs, gpu_id):
+    """Subprocess entry point for the PT-ref pre-warm pass.
 
-    The HF model is loaded ONCE for the whole loop and reused across all
-    missing indices, then deleted. Done sequentially before worker threads
-    start to avoid N threads contending for cuda:0 memory with concurrent
-    model loads. After this pass, every worker call to _ptref_cached hits
-    the /tmp/mrpc_ptref_idx{idx}_n{n}.npz disk cache (just np.load, no GPU).
+    Runs in a child process so the HF model's ~15 GB of PyTorch caching
+    allocator state is reclaimed by the OS at exit — the parent process
+    (which goes on to build CKKS engines and run FHE) starts with a clean
+    GPU 0 instead of competing with retained PyTorch memory.
+
+    `miss_specs` is a list of (idx, token_ids, out_path) tuples already
+    prepared by the parent (so the child doesn't need to re-load the
+    dataset or re-tokenize).
     """
-    import torch
-    from transformers import AutoModelForCausalLM
+    # Pin this child to one GPU. The parent passed `gpu_id` separately
+    # from CUDA_VISIBLE_DEVICES because we set CVD before importing torch.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    import torch  # noqa: F401 — needed so device_map="cuda:0" works
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    # Re-import the capture helper inside the child. We can't pickle
+    # closures through spawn, so we rebuild the path locally.
+    sys.path.insert(0, _THIS_DIR)
+    from llama3_mrpc import capture_pytorch_ref_with_model
 
-    PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
-                  "Sentence 1: {s1}\nSentence 2: {s2}\n"
-                  "Answer (Yes or No):")
-    phantom.set_cuda_device(0)
-
-    # Determine which indices are cache misses before touching the GPU.
-    miss_indices = []
-    for idx in todo:
-        row = ds[idx]
-        prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
-        token_ids = tok(prompt).input_ids
-        path = f"/tmp/mrpc_ptref_idx{idx}_n{len(token_ids)}.npz"
-        if not os.path.exists(path):
-            miss_indices.append(idx)
-
-    if not miss_indices:
-        print(f"  PT-ref cache: all {len(todo)} indices already on disk", flush=True)
-        return
-
-    # Load the HF model once for all misses.
-    print(f"  loading HF model once for pre-warm ({len(miss_indices)} misses)...",
-          flush=True)
+    tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
     t_load0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
         "NousResearch/Meta-Llama-3.1-8B",
         torch_dtype=torch.float16, device_map="cuda:0")
     model.eval()
     t_load = time.perf_counter() - t_load0
-    print(f"  HF model loaded in {t_load:.1f}s", flush=True)
+    print(f"  [ptref-subproc] HF model loaded in {t_load:.1f}s", flush=True)
 
-    for idx in miss_indices:
+    for idx, token_ids, path in miss_specs:
+        print(f"  [ptref-subproc] miss: idx={idx} num_tokens={len(token_ids)}  "
+              f"(running PyTorch)...", flush=True)
+        ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_with_model(
+            model, tok, list(token_ids))
+        np.savez(path, ref=ref, prenorm=prenorm,
+                 yes=np.float64(yes_pt), no=np.float64(no_pt))
+
+    t_total = time.perf_counter() - t_load0
+    t_forwards = t_total - t_load
+    print(f"  [ptref-subproc] pre-warmed {len(miss_specs)} new indices "
+          f"in {t_total:.1f}s (model load {t_load:.1f}s + "
+          f"forwards {t_forwards:.1f}s)", flush=True)
+
+
+def _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref_fn,
+                          capture_pytorch_ref_with_model_fn=None,
+                          gpu_id=0):
+    """Pre-warm the per-idx PT-reference disk cache in a CHILD process.
+
+    PyTorch's caching allocator retains ~15 GB on GPU 0 after the HF model
+    is `del`'d, which on a 40 GB A100 leaves only ~25 GB for the worker
+    engine + FHE compute. Running the pre-warm in a subprocess means the
+    OS reclaims ALL GPU memory when the child exits, so the parent
+    process starts with a clean GPU 0.
+
+    After this pass, every worker call to _ptref_load hits the disk cache
+    (just np.load, no GPU).
+
+    `capture_pytorch_ref_fn` / `capture_pytorch_ref_with_model_fn` are
+    accepted for backward-compat with the call sites but only the
+    `with_model` variant is used inside the child (re-imported there).
+    """
+    PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
+                  "Sentence 1: {s1}\nSentence 2: {s2}\n"
+                  "Answer (Yes or No):")
+
+    # Determine misses in the parent (cheap: just tokenize + os.path.exists).
+    miss_specs = []
+    for idx in todo:
         row = ds[idx]
         prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
         token_ids = tok(prompt).input_ids
         path = f"/tmp/mrpc_ptref_idx{idx}_n{len(token_ids)}.npz"
-        print(f"  PT-ref miss: idx={idx} num_tokens={len(token_ids)}  "
-              f"(running PyTorch)...", flush=True)
-        if capture_pytorch_ref_with_model_fn is not None:
-            ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_with_model_fn(
-                model, tok, token_ids)
-        else:
-            ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_fn(token_ids)
-        np.savez(path, ref=ref, prenorm=prenorm,
-                 yes=np.float64(yes_pt), no=np.float64(no_pt))
+        if not os.path.exists(path):
+            miss_specs.append((idx, list(token_ids), path))
 
-    del model
-    torch.cuda.empty_cache()
-    t_total = time.perf_counter() - t_load0
-    t_forwards = t_total - t_load
-    print(f"  PT-ref cache: pre-warmed {len(miss_indices)} new indices "
-          f"in {t_total:.1f}s (model load {t_load:.1f}s + "
-          f"forwards {t_forwards:.1f}s)",
-          flush=True)
+    if not miss_specs:
+        print(f"  PT-ref cache: all {len(todo)} indices already on disk",
+              flush=True)
+        return
+
+    # Spawn a child to run the HF forwards. `spawn` (not `fork`) is
+    # required because the parent has already imported CUDA via Phantom —
+    # fork-after-CUDA is unsafe and will deadlock.
+    import multiprocessing as mp
+    print(f"  spawning PT-ref subprocess for {len(miss_specs)} misses "
+          f"(gpu_id={gpu_id})...", flush=True)
+    t0 = time.perf_counter()
+    ctx_mp = mp.get_context("spawn")
+    proc = ctx_mp.Process(
+        target=_ptref_prewarm_subprocess_main,
+        args=(miss_specs, gpu_id),
+        name="ptref-prewarm")
+    proc.start()
+    proc.join()
+    elapsed = time.perf_counter() - t0
+    if proc.exitcode != 0:
+        raise RuntimeError(
+            f"PT-ref pre-warm subprocess failed with exit code "
+            f"{proc.exitcode} after {elapsed:.1f}s")
+    print(f"  PT-ref subprocess completed in {elapsed:.1f}s "
+          f"(GPU memory fully released)", flush=True)
 
 
 def _ptref_load(idx, token_ids, capture_pytorch_ref_fn):
