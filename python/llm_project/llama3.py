@@ -153,10 +153,18 @@ def load_layer_weights(layer_idx):
             "g1": L("g1"), "g2": L("g2")}
 
 
-def encode_layer_irps(ctx, encoder, w, R_P):
+def encode_layer_irps(ctx, encoder, w, R_P, pack_gate_up=True):
     """Pre-encode IRP plaintexts for one layer's projection weights.
     Returns (Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp,
-             diag_up_irp, diag_down_irp)."""
+             diag_up_irp, diag_down_irp).
+
+    If pack_gate_up=True (default): Wgate and Wup are packed into a single
+    complex IRP (Wgate in real, Wup in imag). diag_gate_irp holds the
+    packed plaintexts and diag_up_irp is None. The downstream
+    fhe_mlp_irp_bootstrap detects None and uses one matvec + a conjugation-
+    based extract to recover gate_ct and up_ct. Halves the MLP IRP
+    encoding time (~4s/layer saved) and the gate+up matvec count.
+    """
     Wq_baked = w["Wq"].copy()
     for h in range(N_HEADS):
         s, e = h*D_HEAD, (h+1)*D_HEAD
@@ -173,12 +181,20 @@ def encode_layer_irps(ctx, encoder, w, R_P):
     Wup_pad[:, :D_HIDDEN] = w["Wup"].T
     Wdown_pad = np.zeros((D_PAD_MLP, D_MODEL), dtype=np.float64)
     Wdown_pad[:D_HIDDEN, :] = w["Wdown"].T
-    diag_gate_irp = encode_irp_diagonals_rect_host(
-        ctx, encoder, Wgate_pad, NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE,
-        baby_steps=BABY_STEPS_IRP_MLP)
-    diag_up_irp = encode_irp_diagonals_rect_host(
-        ctx, encoder, Wup_pad, NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE,
-        baby_steps=BABY_STEPS_IRP_MLP)
+    if pack_gate_up:
+        from blocks.irp import encode_irp_diagonals_rect_pair_host
+        diag_gate_irp = encode_irp_diagonals_rect_pair_host(
+            ctx, encoder, Wgate_pad, Wup_pad,
+            NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE,
+            baby_steps=BABY_STEPS_IRP_MLP)
+        diag_up_irp = None
+    else:
+        diag_gate_irp = encode_irp_diagonals_rect_host(
+            ctx, encoder, Wgate_pad, NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE,
+            baby_steps=BABY_STEPS_IRP_MLP)
+        diag_up_irp = encode_irp_diagonals_rect_host(
+            ctx, encoder, Wup_pad, NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE,
+            baby_steps=BABY_STEPS_IRP_MLP)
     diag_down_irp = encode_irp_diagonals_rect_host(
         ctx, encoder, Wdown_pad, NUM_SLOTS, D_PAD_MLP, D_MODEL, SCALE,
         baby_steps=BABY_STEPS_IRP_MLP)
@@ -838,47 +854,72 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     # alpha = D_PAD_MLP // D_MODEL = 4. Comparison done orderless (sorted magnitudes).
     _T_PRIME_WIDE = NUM_SLOTS // D_PAD_MLP   # = 2
 
-    # ---- gate = Wgate @ x  (rect wide; output in PERMUTED stride-t' layout). ----
-    t0 = _t()
-    gate_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_gate_irp,
-                                NUM_SLOTS, D_MODEL, D_PAD_MLP,
-                                baby_steps=BABY_STEPS_IRP_MLP,
-                                sub_mask_pt=sub_mask_wide_pt)
-    _rec("mlp_gate", t0)
+    if diag_up_irp is None:
+        # ---- Packed gate+up matvec: Wgate is in real, Wup in imag of the same
+        # IRP plaintext set. One matvec produces a complex ct with
+        # gate=re, up=im. We DEFER the real/imag extract until AFTER the
+        # bootstrap (gate_up_ct is already the merged form merge_bootstrap
+        # would construct; bootstrapping it directly saves the merge step).
+        # Halves matvec time + halves IRP encoding time.
+        t0 = _t()
+        gate_up_ct = irp_matvec_rect_host(
+            ctx, encoder, galois_key, x_irp, diag_gate_irp,
+            NUM_SLOTS, D_MODEL, D_PAD_MLP,
+            baby_steps=BABY_STEPS_IRP_MLP,
+            sub_mask_pt=sub_mask_wide_pt)
+        _rec("mlp_gate_up_packed", t0)
+        gate_up_ct = phantom.rescale_to_next(ctx, gate_up_ct)
+        gate_up_ct.set_scale(SCALE)
+        # Mark gate_ct / up_ct as None — handled by the bootstrap block below.
+        gate_ct = gate_up_ct
+        up_ct = None  # signals "packed, in gate_ct's real+imag"
+    else:
+        # Separate gate, up matvecs (legacy path).
+        t0 = _t()
+        gate_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_gate_irp,
+                                    NUM_SLOTS, D_MODEL, D_PAD_MLP,
+                                    baby_steps=BABY_STEPS_IRP_MLP,
+                                    sub_mask_pt=sub_mask_wide_pt)
+        _rec("mlp_gate", t0)
+        gate_ct = phantom.rescale_to_next(ctx, gate_ct)
+        gate_ct.set_scale(SCALE)
+        _vp("post_Wgate", gate_ct)
+        if probe_np is not None and sk is not None:
+            _probe_diff("17.post_Wgate", ctx, encoder, sk, gate_ct,
+                        probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                        orderless=True)
+        t0 = _t()
+        up_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_up_irp,
+                                  NUM_SLOTS, D_MODEL, D_PAD_MLP,
+                                  baby_steps=BABY_STEPS_IRP_MLP,
+                                  sub_mask_pt=sub_mask_wide_pt)
+        _rec("mlp_up", t0)
+        up_ct = phantom.rescale_to_next(ctx, up_ct)
+        up_ct.set_scale(SCALE)
+        _vp("post_Wup", up_ct)
+        if probe_np is not None and sk is not None:
+            _probe_diff("20.post_Wup", ctx, encoder, sk, up_ct,
+                        probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                        orderless=True)
 
-    # gate_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
-    gate_ct = phantom.rescale_to_next(ctx, gate_ct)
-    gate_ct.set_scale(SCALE)
-    _vp("post_Wgate", gate_ct)
-    if probe_np is not None and sk is not None:
-        _probe_diff("17.post_Wgate", ctx, encoder, sk, gate_ct,
-                    probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
-                    orderless=True)
-
-    # ---- up = Wup @ x. Compute BEFORE bootstrap so we can merge-bootstrap
-    # gate_ct and up_ct as a complex pair (one bootstrap instead of two,
-    # saves ~163ms/layer).
-    t0 = _t()
-    up_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_up_irp,
-                              NUM_SLOTS, D_MODEL, D_PAD_MLP,
-                              baby_steps=BABY_STEPS_IRP_MLP,
-                              sub_mask_pt=sub_mask_wide_pt)
-    _rec("mlp_up", t0)
-    up_ct = phantom.rescale_to_next(ctx, up_ct)
-    up_ct.set_scale(SCALE)
-    _vp("post_Wup", up_ct)
-    if probe_np is not None and sk is not None:
-        _probe_diff("20.post_Wup", ctx, encoder, sk, up_ct,
-                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
-                    orderless=True)
-
-    # ---- Merge-bootstrap gate_ct + up_ct via complex pair. ----
-    from blocks.bootstrap import merge_bootstrap
+    # ---- Bootstrap and split (gate, up). ----
     t0 = _t()
     pair_max_abs = max(_calib["gate"], _calib["up"])
-    gate_ct, up_ct = merge_bootstrap(
-        engine, ctx, encoder, gate_ct, up_ct,
-        max_abs=pair_max_abs, slot_count=NUM_SLOTS, galois_key=galois_key)
+    if up_ct is None:
+        # Packed path: gate_ct already holds gate+i·up. Just bootstrap (use
+        # sqrt(2)*max_abs for the complex magnitude bound), then extract
+        # via conjugation.
+        gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
+                                   max_abs=pair_max_abs * 1.42,
+                                   slot_count=NUM_SLOTS)
+        from blocks.irp import extract_real_imag_pair
+        gate_ct, up_ct = extract_real_imag_pair(
+            ctx, encoder, galois_key, gate_ct, NUM_SLOTS, SCALE)
+    else:
+        from blocks.bootstrap import merge_bootstrap
+        gate_ct, up_ct = merge_bootstrap(
+            engine, ctx, encoder, gate_ct, up_ct,
+            max_abs=pair_max_abs, slot_count=NUM_SLOTS, galois_key=galois_key)
     _rec("bootstrap", t0)
     _vp("post_gate_boot", gate_ct)
     _vp("post_up_boot", up_ct)

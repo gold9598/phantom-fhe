@@ -821,3 +821,92 @@ def irp_matvec_rect(
         else:
             out = phantom.add(ctx, out, sub_q)
     return out
+
+
+def encode_irp_diagonals_rect_pair_host(
+    ctx,
+    encoder,
+    matrix_real: np.ndarray,
+    matrix_imag: np.ndarray,
+    N: int,
+    d_in: int,
+    d_out: int,
+    scale: float,
+    baby_steps: int = 1,
+) -> List:
+    """Pack two real rect matrices into one complex IRP plaintext set.
+
+    `matrix_real` becomes the real part, `matrix_imag` the imag part of
+    each slot. A subsequent irp_matvec_host call multiplies a real-only
+    ciphertext by these complex plaintexts and accumulates a complex-
+    valued result: re(result) = matrix_real @ x, im(result) = matrix_imag @ x.
+
+    Halves the number of plaintexts vs encoding the two matrices
+    separately (since both share the same diagonal indexing). Halves
+    the matvec multiplication count for the pair.
+
+    Both matrices must have the same (d_in, d_out) shape; alpha sub-blocks
+    are folded by the rect encoder identically for both.
+    """
+    if matrix_real.shape != matrix_imag.shape:
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: shape mismatch "
+                         f"{matrix_real.shape} vs {matrix_imag.shape}")
+    if matrix_real.shape != (d_in, d_out):
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: matrices must be "
+                         f"({d_in}, {d_out}), got {matrix_real.shape}")
+    if d_in == d_out:
+        raise ValueError("encode_irp_diagonals_rect_pair_host: d_in == d_out -- use "
+                         "square pair variant instead")
+    d = min(d_in, d_out)
+    alpha = max(d_in, d_out) // d
+    _check_rect_dims(N, d, alpha)
+    t, K = _check_dims(N, d)
+    M = baby_steps
+    if not _is_pow2(M):
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: baby_steps must be power of 2, got {M}")
+    if K % M != 0:
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: baby_steps={M} must divide K={K}")
+    G = K // M
+
+    plaintexts = []
+    for q in range(alpha):
+        slice_axis = slice(None, None)
+        if d_in < d_out:
+            W_q_real = matrix_real[:, q * d:(q + 1) * d]
+            W_q_imag = matrix_imag[:, q * d:(q + 1) * d]
+        else:
+            W_q_real = matrix_real[q * d:(q + 1) * d, :]
+            W_q_imag = matrix_imag[q * d:(q + 1) * d, :]
+        slots_real = _build_irp_slots(W_q_real, N, d, t, K, M, G, dtype=complex)
+        slots_imag = _build_irp_slots(W_q_imag, N, d, t, K, M, G, dtype=complex)
+        for sr, si in zip(slots_real, slots_imag):
+            # Combine: real part from sr (already real-only), imag from si.real.
+            combined = sr.real + 1j * si.real
+            plaintexts.append(phantom.encode_single_chain_plaintext(
+                ctx, encoder, combined.tolist(), scale))
+    return plaintexts
+
+
+def extract_real_imag_pair(ctx, encoder, galois_key, ct_complex,
+                            slot_count, user_scale):
+    """Split a complex ct (= ct_re + i·ct_im) into ct_re, ct_im via
+    conjugation. Uses Phantom's auto-generated step=0 galois key.
+    Costs 1 chain level (the *0.5 / -0.5i multiply)."""
+    ct_conj = phantom.rotate(ctx, ct_complex, 0, galois_key)
+    half_scpt = phantom.encode_single_chain_plaintext(
+        ctx, encoder, [0.5 + 0j] * slot_count, user_scale)
+    neg_half_i_scpt = phantom.encode_single_chain_plaintext(
+        ctx, encoder, [-0.5j] * slot_count, user_scale)
+    half_pt = phantom.expand_single_chain_to_full(
+        ctx, half_scpt, ct_complex.chain_index())
+    neg_half_i_pt = phantom.expand_single_chain_to_full(
+        ctx, neg_half_i_scpt, ct_complex.chain_index())
+    s = phantom.add(ctx, ct_complex, ct_conj)
+    ct_re = phantom.multiply_plain(ctx, s, half_pt)
+    ct_re = phantom.rescale_to_next(ctx, ct_re)
+    ct_re.set_scale(user_scale)
+    d = phantom.sub(ctx, ct_complex, ct_conj)
+    ct_im = phantom.multiply_plain(ctx, d, neg_half_i_pt)
+    ct_im = phantom.rescale_to_next(ctx, ct_im)
+    ct_im.set_scale(user_scale)
+    return ct_re, ct_im
