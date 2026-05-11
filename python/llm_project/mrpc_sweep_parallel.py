@@ -634,17 +634,44 @@ def main():
         engines, NUM_DECODERS, load_layer_weights, encode_layer_rp_indep_irps)
     print(f"  cache built in {time.perf_counter() - t_cache0:.1f}s", flush=True)
 
-    # ---- Phase 2.5: pre-load per-example layer weights ONCE on main thread ----
-    # py-spy showed all 4 workers concurrently stuck in load_layer_weights at
-    # llama3.py:150-152 — 9× np.load + .astype(float64), ~128 MB allocations
-    # per matrix, fighting on a single disk and the glibc malloc/mmap lock.
-    # That serialized the workers despite no GIL issue. Of the 9 weights,
-    # only 5 (Wq/Wk/Wv/g1/g2) are touched on the per-example hot path; the
-    # other 4 (Wo/Wgate/Wup/Wdown) are R_P-independent and are now served
-    # from the disk-persistent rp_indep_cache. Pre-loading just the subset
-    # once costs ~5s instead of ~30s × per-example wall-clock contention.
-    print("Pre-loading per-example layer weights (Wq/Wk/Wv/g1/g2)...",
-          flush=True)
+    # ---- Phase 2.5: pre-load ALL 9 per-layer weights ONCE on main thread ----
+    # An earlier revision pre-loaded only the 5-key per-example hot-path
+    # subset (Wq/Wk/Wv/g1/g2). But compute_layer_calib_n in llama3_mrpc.py
+    # reads Wo/Wgate/Wup/Wdown directly for the per-example shadow forward
+    # pass — those missed the subset and fell into _LazyLayerWeights._full,
+    # which serializes ALL worker threads on a single global lock. py-spy
+    # confirmed 3 of 4 GPU workers blocked at PyThread_acquire_lock_timed
+    # while one worker did fread + .astype(float64) on Wgate/Wup/Wdown
+    # (~469 MB each, ~10s combined per first-visit per (worker, layer) pair).
+    # Pre-loading all 9 keys upfront costs ~60 GB of host RAM but converts
+    # every per-example weight access into a pure dict lookup.
+    #
+    # Memory check: warn (don't crash) if available RAM looks tight. With
+    # rp_indep cache (~36 GB) + wq cache (worst-case ~160 GB at 40 unique
+    # num_tokens) + this preload (~60 GB), peak host RAM ~= 256 GB.
+    est_preload_gb = NUM_DECODERS * 1.9  # ~60 GB for fp64 9-weights × 32 layers
+    avail_gb = None
+    try:
+        import psutil
+        avail_gb = psutil.virtual_memory().available / 1e9
+    except Exception:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        # value in kB
+                        avail_gb = int(line.split()[1]) / 1e6
+                        break
+        except Exception:
+            avail_gb = None
+    if avail_gb is not None and est_preload_gb > avail_gb * 0.8:
+        print(f"[WARN] Estimated preload {est_preload_gb:.0f} GB may exceed "
+              f"available RAM ({avail_gb:.0f} GB). wq_cache will compete for "
+              f"memory; consider running fewer GPUs or a smaller --end range.",
+              flush=True)
+
+    print("Pre-loading per-layer weights (all 9 keys: "
+          "Wq/Wk/Wv/Wo/Wgate/Wup/Wdown/g1/g2)...", flush=True)
     t_pw0 = time.perf_counter()
     shared_layer_weights = {
         L: load_layer_weights_subset(L) for L in range(NUM_DECODERS)

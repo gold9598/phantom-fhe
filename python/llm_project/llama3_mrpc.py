@@ -572,20 +572,29 @@ def _probe(tag, ctx, encoder, sk, ct):
           f"max|.|={np.abs(v).max():.4e} mean|.|={np.abs(v).mean():.4e}")
 
 
-# Module-level full-weight cache shared across all run_classifier_fhe calls.
-# Populated lazily by _LazyLayerWeights on the first miss for each layer
-# (typically the first example's compute_layer_calib_n on layer 0). Per layer
-# this is a 9-key dict (~1.1 GB), but only the layers actually visited by
-# `min_layer..max_layer` will ever be loaded, and they are shared across all
-# subsequent examples and all worker threads — so the 4 GPU workers
-# collectively pay the disk + glibc malloc cost ONCE per layer over the
-# entire sweep, not once per example.
+# Module-level full-weight cache + lock used as a defensive fallback by
+# _LazyLayerWeights. As of the "preload all 9 weights" fix, the parallel
+# sweep pre-loads every key per layer up front, so the lazy fallback path
+# is normally never taken — `w[k]` always hits the subset dict and returns
+# without touching this lock. We keep the machinery in place purely as a
+# safety net: if a future caller passes a partial `preloaded_weights` dict
+# (only some keys), the lazy path will still satisfy the missing accesses
+# correctly (at the cost of the global-lock serialization that motivated
+# the preload-all fix). Cost when unused: zero.
 _LAZY_FULL_WEIGHT_CACHE = {}
 _LAZY_FULL_WEIGHT_LOCK = threading.Lock()
 
 
 class _LazyLayerWeights:
-    """Dict-like wrapper around a pre-loaded per-layer weight SUBSET.
+    """Dict-like wrapper around a pre-loaded per-layer weight subset.
+
+    DEFENSIVE FALLBACK ONLY. The parallel sweep now pre-loads all 9
+    weights per layer, so the subset is the full set and every
+    `__getitem__` returns from `self._subset` without entering `_full()`.
+    If a caller ever passes a partial subset, missed keys trigger a
+    one-shot `load_layer_weights(layer_idx)` cached in `full_cache`
+    under `lock` — note this serializes ALL worker threads on the lock,
+    which is why we now avoid it via the preload-all default.
 
     Returns values directly from the subset when present; on a miss
     (Wo/Wgate/Wup/Wdown for the per-example hot path), falls back to a

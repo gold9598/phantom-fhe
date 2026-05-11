@@ -153,17 +153,26 @@ def load_layer_weights(layer_idx):
             "g1": L("g1"), "g2": L("g2")}
 
 
-def load_layer_weights_subset(layer_idx, keys=("Wq", "Wk", "Wv", "g1", "g2")):
-    """Load only a subset of per-layer weights. Returns a dict with just `keys`.
+def load_layer_weights_subset(layer_idx, keys=("Wq", "Wk", "Wv", "Wo",
+                                                  "Wgate", "Wup", "Wdown",
+                                                  "g1", "g2")):
+    """Load a subset of per-layer weights. Returns a dict with just `keys`.
 
-    The default subset covers the weights touched on the per-example hot
-    path (Wq encoding, attention key/value baking, rmsnorm gains). The
-    R_P-independent weights (Wo/Wgate/Wup/Wdown) are intentionally omitted
-    because they are consumed exclusively inside encode_layer_rp_indep_irps,
-    which a parallel sweep now feeds from a disk-persistent cache. Skipping
-    them avoids 4 redundant np.load + .astype(float64) calls (~16 MB each)
-    per layer per worker, eliminating the disk + glibc-malloc contention
-    that py-spy showed serializing all worker threads in load_layer_weights.
+    DEFAULT IS NOW ALL 9 KEYS. An earlier revision defaulted to the
+    5-key per-example hot-path subset (Wq/Wk/Wv/g1/g2), omitting the
+    R_P-independent weights (Wo/Wgate/Wup/Wdown) on the theory that the
+    rp_indep_cache served them. However `compute_layer_calib_n` in
+    llama3_mrpc.py performs a per-example shadow forward pass that reads
+    Wo/Wgate/Wup/Wdown directly from the dict, so the subset triggered a
+    lazy fallback (_LazyLayerWeights._full) that serialized all worker
+    threads on a single global lock — py-spy confirmed 3 of 4 GPU workers
+    blocked at PyThread_acquire_lock_timed while one worker did fread +
+    .astype(float64) on Wgate/Wup/Wdown (~469 MB each, ~10s combined).
+
+    Defaulting to all 9 keys costs ~60 GB of host RAM across 32 layers
+    but eliminates the lock contention entirely: every per-example
+    `w[k]` becomes a pure dict lookup. Callers that explicitly want a
+    smaller subset can still pass `keys=(...)`.
     """
     ld = f"{PROBE_FULL}/layer_{layer_idx:02d}"
     return {k: np.load(f"{ld}/{k}.npy").astype(np.float64) for k in keys}
