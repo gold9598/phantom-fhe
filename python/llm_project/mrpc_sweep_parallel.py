@@ -699,21 +699,38 @@ def main():
           flush=True)
 
     import gc as _gc
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from llama3_mrpc import compute_layer_calib_n, BOOT_CALIB_MARGIN
     ref_cos = cos_all_full[:ref_n]
     ref_sin = sin_all_full[:ref_n]
-    precomputed_calib = {}
-    for L in range(NUM_DECODERS):
+
+    def _calib_one_layer(L):
+        """Compute calibration for a single layer in a worker thread."""
         w_full = load_layer_weights(L)
         x_btd = ref_pytorch_ref[L]  # input to layer L
-        precomputed_calib[L] = compute_layer_calib_n(
+        result = compute_layer_calib_n(
             x_btd, w_full, ref_cos, ref_sin,
             num_tokens=ref_n, query_position=ref_n - 1,
             margin=BOOT_CALIB_MARGIN)
         del w_full
-        if L % 8 == 0 or L == NUM_DECODERS - 1:
-            _gc.collect()
-            print(f"  [calib] layer {L:02d}/{NUM_DECODERS}", flush=True)
+        return L, result
+
+    precomputed_calib = {}
+    done_count = [0]
+    done_lock = threading.Lock()
+
+    print(f"Precomputing layer calibration (representative example, parallel)...",
+          flush=True)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_calib_one_layer, L) for L in range(NUM_DECODERS)]
+        for fut in as_completed(futures):
+            L, calib = fut.result()
+            precomputed_calib[L] = calib
+            with done_lock:
+                done_count[0] += 1
+                if done_count[0] % 4 == 0 or done_count[0] == NUM_DECODERS:
+                    print(f"  [calib] {done_count[0]:2d}/{NUM_DECODERS} layers done "
+                          f"(elapsed={time.perf_counter() - t_calib0:.1f}s)", flush=True)
     print(f"  calib precomputed in "
           f"{time.perf_counter() - t_calib0:.1f}s", flush=True)
 
