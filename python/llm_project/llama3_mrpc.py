@@ -564,7 +564,7 @@ def _probe(tag, ctx, encoder, sk, ct):
 def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
                          cos_all_full, sin_all_full, label="prompt",
                          debug_layer=None, max_layer=None, min_layer=None,
-                         rp_indep_cache=None):
+                         rp_indep_cache=None, engine=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -585,10 +585,13 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     lm_head_yesno = np.load(f"{PROBE_FULL}/lm_head_yesno.npy").astype(np.float64)
     meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
 
-    # ---- Engine
-    user_steps, step_categories = build_user_steps_mrpc()
-    print(f"User steps ({len(user_steps)}): first 10 = {user_steps[:10]}")
-    engine = setup_engine(user_steps, step_categories=step_categories)
+    # ---- Engine. If caller supplies one, reuse it (required when sharing
+    # an rp_indep_cache of plaintexts across calls — plaintexts are bound to
+    # the engine's (ctx, encoder) and become invalid if the engine is rebuilt).
+    if engine is None:
+        user_steps, step_categories = build_user_steps_mrpc()
+        print(f"User steps ({len(user_steps)}): first 10 = {user_steps[:10]}")
+        engine = setup_engine(user_steps, step_categories=step_categories)
     ctx = engine.context()
     encoder = engine.encoder()
     sk = engine.secret_key()

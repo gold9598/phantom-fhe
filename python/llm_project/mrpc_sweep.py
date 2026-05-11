@@ -102,7 +102,7 @@ def _compute_metrics():
 
 def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
               run_classifier_fhe, capture_pytorch_ref_cached, P_local_fn,
-              rp_indep_cache):
+              rp_indep_cache, engine):
     row = ds[idx]
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
                   "Sentence 1: {s1}\nSentence 2: {s2}\n"
@@ -121,7 +121,7 @@ def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}",
         debug_layer=None, max_layer=None, min_layer=None,
-        rp_indep_cache=rp_indep_cache)
+        rp_indep_cache=rp_indep_cache, engine=engine)
     elapsed = time.perf_counter() - t0
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     return {
@@ -171,6 +171,16 @@ def main():
     print(f"=== MRPC sweep [{args.start},{args.end}): {len(todo)} examples remaining "
           f"({len(done & set(range(args.start, args.end)))} already done)", flush=True)
 
+    # Build the CKKS engine ONCE for the whole sweep. The rp_indep_cache
+    # holds plaintexts bound to this engine's (ctx, encoder) — rebuilding
+    # the engine per-example would invalidate cached plaintexts and produce
+    # zeroed / wrong outputs.
+    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    user_steps, step_categories = build_user_steps_mrpc()
+    print(f"Building shared CKKS engine ({len(user_steps)} rotation steps)...",
+          flush=True)
+    engine = setup_engine(user_steps, step_categories=step_categories)
+
     # Per-layer R_P-independent IRP cache (Wo, gate+up packed, Wdown). First
     # example populates it (~14s/layer × 32 = ~7.5 min one-time cost);
     # subsequent examples skip re-encoding (~14s/layer = ~7.5 min saved).
@@ -182,7 +192,7 @@ def main():
             print(f"\n[{k+1}/{len(todo)}] idx={idx}...", flush=True)
             row = _run_one(idx, tok, ds, None, cos_all_full, sin_all_full,
                             run_classifier_fhe, _ptref_cached, None,
-                            rp_indep_cache)
+                            rp_indep_cache, engine)
             _append_row(row)
             agree_str = " (agree)" if row["fhe_pred"] == row["pt_pred"] else " (DISAGREE)"
             print(f"  idx={idx}: PT={row['pt_pred']} FHE={row['fhe_pred']}"
