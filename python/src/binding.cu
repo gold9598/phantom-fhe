@@ -2,6 +2,7 @@
 #include <pybind11/complex.h>
 #include <pybind11/stl.h>
 
+#include <cstring>
 #include <cuda_runtime.h>
 
 #include "phantom.h"
@@ -366,7 +367,24 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def_property_readonly("scale",
                                    [](const phantom::SingleChainPlaintext &p) { return p.scale; })
             .def_property_readonly("nbytes",
-                                   [](const phantom::SingleChainPlaintext &p) { return p.coeffs.nbytes(); });
+                                   [](const phantom::SingleChainPlaintext &p) { return p.coeffs.nbytes(); })
+            .def_property_readonly("N",
+                                   [](const phantom::SingleChainPlaintext &p) { return p.coeffs.size(); })
+            // Raw int64 coeffs as py::bytes. Releases the GIL during the
+            // copy so concurrent workers can serialize cache entries in
+            // parallel; the SCP buffer is in pinned host memory and is
+            // safe to read while other threads run.
+            .def("coeffs_bytes",
+                 [](const phantom::SingleChainPlaintext &p) {
+                     return py::bytes(reinterpret_cast<const char *>(p.coeffs.data()),
+                                      p.coeffs.nbytes());
+                 },
+                 "Return the SCP's int64 coefficient buffer as raw bytes "
+                 "(length N * 8). Pair with scp_from_bytes to round-trip "
+                 "an SCP to/from disk.")
+            .def("get_scale",
+                 [](const phantom::SingleChainPlaintext &p) { return p.scale; },
+                 "Return the SCP's encoding scale.");
 
     m.def("encode_single_chain_plaintext",
           [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
@@ -374,6 +392,30 @@ PYBIND11_MODULE(pyPhantom, m) {
               return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
           },
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
+
+    // Reconstruct a SingleChainPlaintext from raw coeff bytes + scale.
+    // Allocates pinned host memory and memcpy's the bytes in. Used by the
+    // disk-persistent IRP cache to avoid re-encoding plaintexts across
+    // process restarts. No target_chain_index needed: SCPs are
+    // level-agnostic, the chain index is supplied at expand-time only.
+    m.def("scp_from_bytes",
+          [](py::bytes data, double scale, std::size_t N) {
+              std::string s(data);  // ref to bytes; pybind11 keeps it alive
+              if (s.size() != N * sizeof(std::int64_t)) {
+                  throw std::runtime_error(
+                      "scp_from_bytes: byte length mismatch (got " +
+                      std::to_string(s.size()) + ", expected " +
+                      std::to_string(N * sizeof(std::int64_t)) + ")");
+              }
+              phantom::SingleChainPlaintext out;
+              out.scale = scale;
+              out.coeffs = phantom::PinnedHostInt64Buffer(N);
+              std::memcpy(out.coeffs.data(), s.data(), s.size());
+              return out;
+          },
+          py::arg("data"), py::arg("scale"), py::arg("N"),
+          "Reconstruct a SingleChainPlaintext from raw int64 coefficient "
+          "bytes (length N * 8) and a scale. Inverse of coeffs_bytes().");
 
     m.def("expand_single_chain_to_full", &phantom::expand_single_chain_to_full,
           py::arg("context"), py::arg("scp"), py::arg("target_chain_index"),
