@@ -48,7 +48,7 @@ def main():
     print(f"  Loading PyTorch model for reference...")
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained("NousResearch/Meta-Llama-3.1-8B",
-                                                  dtype=torch.float16, device_map="cuda:0")
+                                                  torch_dtype=torch.float16, device_map="cuda:0")
     model.eval()
     ids = [128000, 791, 4062, 14198]  # [BOS, "The", " quick", " brown"]
     input_ids = torch.tensor([ids], device="cuda:0")

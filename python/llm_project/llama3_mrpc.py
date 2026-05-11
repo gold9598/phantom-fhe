@@ -810,7 +810,7 @@ def capture_pytorch_ref(token_ids):
     print(f"  Loading PyTorch model (fp16)...")
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained("NousResearch/Meta-Llama-3.1-8B",
-                                                  dtype=torch.float16, device_map="cuda:0")
+                                                  torch_dtype=torch.float16, device_map="cuda:0")
     model.eval()
     print(f"  loaded in {time.perf_counter()-t0:.1f}s")
     input_ids = torch.tensor([token_ids], device="cuda:0")
