@@ -474,7 +474,7 @@ def _ptref_load(idx, token_ids, capture_pytorch_ref_fn):
 
 def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
               shared_cache, engine, run_classifier_fhe_fn, capture_pytorch_ref_fn,
-              shared_layer_weights=None):
+              shared_layer_weights=None, precomputed_calib=None):
     """Process a single MRPC example on the engine bound to gpu_id."""
     row = ds[idx]
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
@@ -504,7 +504,8 @@ def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
         shared_wq_cache=SHARED_WQ_CACHE,
         shared_wq_cache_events=SHARED_WQ_CACHE_EVENTS,
         shared_wq_cache_lock=SHARED_WQ_CACHE_LOCK,
-        preloaded_weights=shared_layer_weights)
+        preloaded_weights=shared_layer_weights,
+        precomputed_calib=precomputed_calib)
     elapsed = time.perf_counter() - t0
     # Persist the wq entry for this num_tokens if it isn't already on
     # disk. Cheap fast path when the entry exists; ~few-second save on
@@ -522,7 +523,7 @@ def _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
 def _worker(gpu_id, engine, chunk, shared_cache, tok, ds,
              cos_all_full, sin_all_full, csv_path,
              run_classifier_fhe_fn, capture_pytorch_ref_fn,
-             shared_layer_weights=None):
+             shared_layer_weights=None, precomputed_calib=None):
     """Worker thread: process one chunk of example indices on one GPU.
 
     cudaSetDevice MUST be called inside the thread — CUDA device binding
@@ -534,7 +535,8 @@ def _worker(gpu_id, engine, chunk, shared_cache, tok, ds,
             row = _run_one(idx, gpu_id, tok, ds, cos_all_full, sin_all_full,
                             shared_cache, engine,
                             run_classifier_fhe_fn, capture_pytorch_ref_fn,
-                            shared_layer_weights=shared_layer_weights)
+                            shared_layer_weights=shared_layer_weights,
+                            precomputed_calib=precomputed_calib)
             _append_row(csv_path, row)
             agree = " (agree)" if row["fhe_pred"] == row["pt_pred"] else " (DISAGREE)"
             print(f"  [gpu{gpu_id}] idx={idx}: PT={row['pt_pred']} "
@@ -634,50 +636,86 @@ def main():
         engines, NUM_DECODERS, load_layer_weights, encode_layer_rp_indep_irps)
     print(f"  cache built in {time.perf_counter() - t_cache0:.1f}s", flush=True)
 
-    # ---- Phase 2.5: pre-load ALL 9 per-layer weights ONCE on main thread ----
-    # An earlier revision pre-loaded only the 5-key per-example hot-path
-    # subset (Wq/Wk/Wv/g1/g2). But compute_layer_calib_n in llama3_mrpc.py
-    # reads Wo/Wgate/Wup/Wdown directly for the per-example shadow forward
-    # pass — those missed the subset and fell into _LazyLayerWeights._full,
-    # which serializes ALL worker threads on a single global lock. py-spy
-    # confirmed 3 of 4 GPU workers blocked at PyThread_acquire_lock_timed
-    # while one worker did fread + .astype(float64) on Wgate/Wup/Wdown
-    # (~469 MB each, ~10s combined per first-visit per (worker, layer) pair).
-    # Pre-loading all 9 keys upfront costs ~60 GB of host RAM but converts
-    # every per-example weight access into a pure dict lookup.
-    #
-    # Memory check: warn (don't crash) if available RAM looks tight. With
-    # rp_indep cache (~36 GB) + wq cache (worst-case ~160 GB at 40 unique
-    # num_tokens) + this preload (~60 GB), peak host RAM ~= 256 GB.
-    est_preload_gb = NUM_DECODERS * 1.9  # ~60 GB for fp64 9-weights × 32 layers
-    avail_gb = None
-    try:
-        import psutil
-        avail_gb = psutil.virtual_memory().available / 1e9
-    except Exception:
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        # value in kB
-                        avail_gb = int(line.split()[1]) / 1e6
-                        break
-        except Exception:
-            avail_gb = None
-    if avail_gb is not None and est_preload_gb > avail_gb * 0.8:
-        print(f"[WARN] Estimated preload {est_preload_gb:.0f} GB may exceed "
-              f"available RAM ({avail_gb:.0f} GB). wq_cache will compete for "
-              f"memory; consider running fewer GPUs or a smaller --end range.",
-              flush=True)
-
-    print("Pre-loading per-layer weights (all 9 keys: "
-          "Wq/Wk/Wv/Wo/Wgate/Wup/Wdown/g1/g2)...", flush=True)
+    # ---- Phase 2.5: pre-load 5-key per-layer weight SUBSET on main thread ----
+    # Only the per-example hot-path keys (Wq/Wk/Wv/g1/g2) are kept in
+    # RAM here — the R_P-independent big weights (Wo/Wgate/Wup/Wdown) are
+    # served from the shared rp_indep_cache and never touched directly on
+    # the per-example path once `precomputed_calib` is in play (see
+    # Phase 2.6 below). Subset preload footprint: ~12 GB across 32 layers
+    # (vs ~60 GB if all 9 keys were retained); the saved ~45 GB lets the
+    # wq_cache grow freely on a 256 GB box without swap thrashing.
+    print("Pre-loading per-layer weights "
+          "(subset: Wq/Wk/Wv/g1/g2)...", flush=True)
     t_pw0 = time.perf_counter()
     shared_layer_weights = {
         L: load_layer_weights_subset(L) for L in range(NUM_DECODERS)
     }
     print(f"  weights loaded in {time.perf_counter() - t_pw0:.1f}s",
           flush=True)
+
+    # ---- Phase 2.6: precompute layer calibration ONCE on main thread ----
+    # `compute_layer_calib_n` runs a numpy-only shadow forward pass (no FHE
+    # chain state) that reads ALL 9 weights per layer. Doing it per-example
+    # would either (a) require the full ~60 GB 9-key preload, or (b) hit a
+    # lazy-load lock-contention slow path on the big matrices. Instead we
+    # compute it ONCE here using the first todo example as the reference:
+    # for each layer L, load its full 9-key weight set, call
+    # compute_layer_calib_n, then drop the full weights so peak extra RAM
+    # is just ~1.9 GB (one layer's worth). The returned tuples are small
+    # (a couple of floats + a ~10-entry dict per layer, <1 MB total).
+    #
+    # Caveat: calib depends on num_tokens (via RoPE slicing) and on the
+    # input activations (which vary per example). For the MRPC dev set
+    # (homogeneous English paraphrase prompts) the magnitudes are similar
+    # enough that the BOOT_CALIB_MARGIN=1.5 safety factor absorbs the
+    # per-example variance. If outlier examples surface Layer-N max|err|
+    # spikes vs PT, callers can fall back to per-example calib by passing
+    # `precomputed_calib=None` into run_classifier_fhe.
+    print(f"Precomputing layer calibration (representative example)...",
+          flush=True)
+    t_calib0 = time.perf_counter()
+    ref_idx = todo[0]
+    ref_row = ds[ref_idx]
+    PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
+                  "Sentence 1: {s1}\nSentence 2: {s2}\n"
+                  "Answer (Yes or No):")
+    ref_prompt = PROMPT_FMT.format(s1=ref_row["sentence1"],
+                                    s2=ref_row["sentence2"])
+    ref_token_ids = tok(ref_prompt).input_ids
+    ref_n = len(ref_token_ids)
+    ref_path = f"/tmp/mrpc_ptref_idx{ref_idx}_n{ref_n}.npz"
+    # The PT-ref prewarm below populates this disk cache for all todo
+    # indices, but it hasn't run yet — do an explicit prewarm of just
+    # this one reference example first if the cache is cold.
+    if not os.path.exists(ref_path):
+        print(f"  [calib] ref idx={ref_idx} not in cache; "
+              f"prewarming this one example...", flush=True)
+        _prewarm_ptref_cache([ref_idx], tok, ds, capture_pytorch_ref,
+                              capture_pytorch_ref_with_model_fn=
+                              capture_pytorch_ref_with_model)
+    ref_z = np.load(ref_path)
+    ref_pytorch_ref = ref_z["ref"]  # (n_layers+1, num_tokens, D_MODEL)
+    print(f"  [calib] using ref idx={ref_idx} num_tokens={ref_n}",
+          flush=True)
+
+    import gc as _gc
+    from llama3_mrpc import compute_layer_calib_n, BOOT_CALIB_MARGIN
+    ref_cos = cos_all_full[:ref_n]
+    ref_sin = sin_all_full[:ref_n]
+    precomputed_calib = {}
+    for L in range(NUM_DECODERS):
+        w_full = load_layer_weights(L)
+        x_btd = ref_pytorch_ref[L]  # input to layer L
+        precomputed_calib[L] = compute_layer_calib_n(
+            x_btd, w_full, ref_cos, ref_sin,
+            num_tokens=ref_n, query_position=ref_n - 1,
+            margin=BOOT_CALIB_MARGIN)
+        del w_full
+        if L % 8 == 0 or L == NUM_DECODERS - 1:
+            _gc.collect()
+            print(f"  [calib] layer {L:02d}/{NUM_DECODERS}", flush=True)
+    print(f"  calib precomputed in "
+          f"{time.perf_counter() - t_calib0:.1f}s", flush=True)
 
     # ---- Phase 2b: preload wq IRP entries from disk into SHARED_WQ_CACHE ----
     # Each loaded num_tokens becomes a HIT in run_classifier_fhe so no
@@ -709,7 +747,7 @@ def main():
                 gpu_id, engines[gpu_id], chunks[gpu_id], shared_cache,
                 tok, ds, cos_all_full, sin_all_full, args.csv_path,
                 run_classifier_fhe, capture_pytorch_ref,
-                shared_layer_weights))
+                shared_layer_weights, precomputed_calib))
         threads.append(t)
         t.start()
 

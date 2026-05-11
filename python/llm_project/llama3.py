@@ -153,26 +153,21 @@ def load_layer_weights(layer_idx):
             "g1": L("g1"), "g2": L("g2")}
 
 
-def load_layer_weights_subset(layer_idx, keys=("Wq", "Wk", "Wv", "Wo",
-                                                  "Wgate", "Wup", "Wdown",
+def load_layer_weights_subset(layer_idx, keys=("Wq", "Wk", "Wv",
                                                   "g1", "g2")):
     """Load a subset of per-layer weights. Returns a dict with just `keys`.
 
-    DEFAULT IS NOW ALL 9 KEYS. An earlier revision defaulted to the
-    5-key per-example hot-path subset (Wq/Wk/Wv/g1/g2), omitting the
-    R_P-independent weights (Wo/Wgate/Wup/Wdown) on the theory that the
-    rp_indep_cache served them. However `compute_layer_calib_n` in
-    llama3_mrpc.py performs a per-example shadow forward pass that reads
-    Wo/Wgate/Wup/Wdown directly from the dict, so the subset triggered a
-    lazy fallback (_LazyLayerWeights._full) that serialized all worker
-    threads on a single global lock — py-spy confirmed 3 of 4 GPU workers
-    blocked at PyThread_acquire_lock_timed while one worker did fread +
-    .astype(float64) on Wgate/Wup/Wdown (~469 MB each, ~10s combined).
+    DEFAULT IS THE 5-KEY PER-EXAMPLE HOT-PATH SUBSET (Wq/Wk/Wv/g1/g2).
+    The R_P-independent weights (Wo/Wgate/Wup/Wdown) are NOT included
+    by default because they are served from the shared rp_indep_cache
+    on the per-example FHE path. The parallel sweep precomputes layer
+    calibration ONCE at startup (one representative example, full weights
+    loaded one layer at a time then freed) so per-example workers never
+    need the big weights and the in-RAM preload stays at ~12 GB total
+    (5 keys × 32 layers) instead of ~60 GB.
 
-    Defaulting to all 9 keys costs ~60 GB of host RAM across 32 layers
-    but eliminates the lock contention entirely: every per-example
-    `w[k]` becomes a pure dict lookup. Callers that explicitly want a
-    smaller subset can still pass `keys=(...)`.
+    Callers that want the full 9-key set can pass `keys=(...)` explicitly
+    or use `load_layer_weights` directly.
     """
     ld = f"{PROBE_FULL}/layer_{layer_idx:02d}"
     return {k: np.load(f"{ld}/{k}.npy").astype(np.float64) for k in keys}

@@ -655,7 +655,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                          rp_indep_cache=None, engine=None,
                          shared_wq_cache=None, shared_wq_cache_events=None,
                          shared_wq_cache_lock=None,
-                         preloaded_weights=None):
+                         preloaded_weights=None,
+                         precomputed_calib=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -876,9 +877,18 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
             wq_cache[layer_idx]
 
-        # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware)
-        z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
-            x_btd, w, cos_all, sin_all, num_tokens, P_local)
+        # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware).
+        # When `precomputed_calib` is supplied (parallel sweep), skip the
+        # per-example shadow forward pass entirely — calib was precomputed
+        # once at startup using a representative example, which also lets
+        # the worker preload drop the big Wo/Wgate/Wup/Wdown matrices
+        # (~45 GB across 32 layers) since the per-example hot path only
+        # touches Wq/Wk/Wv/g1/g2 directly.
+        if precomputed_calib is not None:
+            z1_l, z2_l, max_abs_calib = precomputed_calib[layer_idx]
+        else:
+            z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
+                x_btd, w, cos_all, sin_all, num_tokens, P_local)
         z1_min, z1_max = rms_z_window(z1_l)
         z2_min, z2_max = rms_z_window(z2_l)
         rms1_p = _make_rms_params_local(z1_min, z1_max)
