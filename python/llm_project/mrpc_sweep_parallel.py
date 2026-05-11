@@ -40,6 +40,18 @@ sys.path.insert(0, _THIS_DIR)
 # in run_classifier_fhe and llama3.main(); not module-exported there.
 NUM_DECODERS = 32
 
+# Calib precompute parallelism. Tuned for 128-core box: 8 outer threads
+# × 16 BLAS threads/worker = 128 total threads. Prevent BLAS oversubscription
+# (8 outer × 128 BLAS = 1024 threads = thrashing). Configurable via CALIB_THREADS env.
+CALIB_THREADS = int(os.environ.get("CALIB_THREADS", 8))
+CALIB_BLAS_THREADS = max(1, 128 // CALIB_THREADS)  # dynamically computed per box
+
+# Set BLAS thread limits BEFORE numpy heavy ops (if numpy not yet fully initialized).
+# These are fallback env vars for when threadpoolctl is unavailable.
+os.environ.setdefault("OMP_NUM_THREADS", str(CALIB_BLAS_THREADS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(CALIB_BLAS_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(CALIB_BLAS_THREADS))
+
 CSV_PATH_DEFAULT = "/tmp/mrpc_sweep_results.csv"
 CSV_HEADER = [
     "idx", "num_tokens", "label", "pt_yes", "pt_no", "pt_pred",
@@ -706,22 +718,38 @@ def main():
 
     def _calib_one_layer(L):
         """Compute calibration for a single layer in a worker thread."""
-        w_full = load_layer_weights(L)
-        x_btd = ref_pytorch_ref[L]  # input to layer L
-        result = compute_layer_calib_n(
-            x_btd, w_full, ref_cos, ref_sin,
-            num_tokens=ref_n, query_position=ref_n - 1,
-            margin=BOOT_CALIB_MARGIN)
-        del w_full
-        return L, result
+        # Cap BLAS threads to prevent oversubscription:
+        # 8 outer × (128 / 8) = 16 BLAS threads per worker = 128 total.
+        try:
+            import threadpoolctl
+            with threadpoolctl.threadpool_limits(limits=CALIB_BLAS_THREADS):
+                w_full = load_layer_weights(L)
+                x_btd = ref_pytorch_ref[L]  # input to layer L
+                result = compute_layer_calib_n(
+                    x_btd, w_full, ref_cos, ref_sin,
+                    num_tokens=ref_n, query_position=ref_n - 1,
+                    margin=BOOT_CALIB_MARGIN)
+                del w_full
+                return L, result
+        except ImportError:
+            # Fallback: threadpoolctl not installed, rely on env vars set at startup.
+            w_full = load_layer_weights(L)
+            x_btd = ref_pytorch_ref[L]  # input to layer L
+            result = compute_layer_calib_n(
+                x_btd, w_full, ref_cos, ref_sin,
+                num_tokens=ref_n, query_position=ref_n - 1,
+                margin=BOOT_CALIB_MARGIN)
+            del w_full
+            return L, result
 
     precomputed_calib = {}
     done_count = [0]
     done_lock = threading.Lock()
 
-    print(f"Precomputing layer calibration (representative example, parallel)...",
+    print(f"Precomputing layer calibration ({CALIB_THREADS} threads, "
+          f"~{NUM_DECODERS//CALIB_THREADS} layers/thread)...",
           flush=True)
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=CALIB_THREADS) as ex:
         futures = [ex.submit(_calib_one_layer, L) for L in range(NUM_DECODERS)]
         for fut in as_completed(futures):
             L, calib = fut.result()
