@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/complex.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
 #include <cstring>
@@ -131,12 +132,50 @@ PYBIND11_MODULE(pyPhantom, m) {
                          &PhantomCKKSEncoder::encode<cuDoubleComplex>),
                  py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
                  py::call_guard<py::gil_scoped_release>())
+            // numpy-array fast path: skips per-element Python iteration. Pybind11
+            // dispatches here when caller passes a numpy complex128 array.
+            .def("encode_complex_vector",
+                 [](PhantomCKKSEncoder &encoder, const PhantomContext &ctx,
+                    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> arr,
+                    double scale, size_t chain_index) {
+                     if (arr.ndim() != 1)
+                         throw std::runtime_error(
+                             "encode_complex_vector: array must be 1-D");
+                     const std::complex<double> *src = arr.data();
+                     const std::size_t n = static_cast<std::size_t>(arr.shape(0));
+                     std::vector<cuDoubleComplex> values(n);
+                     for (std::size_t i = 0; i < n; ++i) {
+                         values[i] = make_cuDoubleComplex(src[i].real(), src[i].imag());
+                     }
+                     py::gil_scoped_release release;
+                     return encoder.encode<cuDoubleComplex>(ctx, values, scale, chain_index);
+                 },
+                 py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
+                 "Encode a numpy complex128 1-D array (fast path — no Python "
+                 "object iteration).")
             .def("encode_double_vector",
                  py::overload_cast<const PhantomContext &, const std::vector<double> &, double, size_t>(
                          &PhantomCKKSEncoder::encode<double>),
                  py::arg(), py::arg(), py::arg(),
                  py::arg("chain_index") = 1,
                  py::call_guard<py::gil_scoped_release>())
+            // numpy-array fast path for double-precision real input.
+            .def("encode_double_vector",
+                 [](PhantomCKKSEncoder &encoder, const PhantomContext &ctx,
+                    py::array_t<double, py::array::c_style | py::array::forcecast> arr,
+                    double scale, size_t chain_index) {
+                     if (arr.ndim() != 1)
+                         throw std::runtime_error(
+                             "encode_double_vector: array must be 1-D");
+                     const double *src = arr.data();
+                     const std::size_t n = static_cast<std::size_t>(arr.shape(0));
+                     std::vector<double> values(src, src + n);
+                     py::gil_scoped_release release;
+                     return encoder.encode<double>(ctx, values, scale, chain_index);
+                 },
+                 py::arg(), py::arg(), py::arg(), py::arg("chain_index") = 1,
+                 "Encode a numpy float64 1-D array (fast path — no Python "
+                 "object iteration).")
             .def("decode_complex_vector",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
                          &PhantomCKKSEncoder::decode<cuDoubleComplex>),
@@ -399,6 +438,51 @@ PYBIND11_MODULE(pyPhantom, m) {
               return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
           },
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
+
+    // numpy-array fast path for encode_single_chain_plaintext: pybind11
+    // dispatches here when callers pass a numpy complex128 array directly.
+    // Avoids the GIL-held per-element marshalling of `.tolist()` -> std::vector
+    // of std::complex (~50 ms per call at N=65536). With 32 layers * 256 SCPs
+    // per Wq IRP pre-encode worker, this saves ~13 s of pure GIL-held time
+    // per worker, unblocking concurrent encode threads.
+    m.def("encode_single_chain_plaintext",
+          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
+             py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> arr,
+             double scale) {
+              if (arr.ndim() != 1)
+                  throw std::runtime_error(
+                      "encode_single_chain_plaintext: array must be 1-D");
+              const std::complex<double> *src = arr.data();
+              const std::size_t n = static_cast<std::size_t>(arr.shape(0));
+              std::vector<std::complex<double>> slots(src, src + n);
+              py::gil_scoped_release release;
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
+          },
+          py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"),
+          "Encode a numpy complex128 1-D array into a SingleChainPlaintext. "
+          "Faster than the list-based overload — no Python object iteration.");
+
+    // numpy-array fast path with real (float64) input. Promotes to complex
+    // inside the C++ boundary while the GIL is held only briefly.
+    m.def("encode_single_chain_plaintext",
+          [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
+             py::array_t<double, py::array::c_style | py::array::forcecast> arr,
+             double scale) {
+              if (arr.ndim() != 1)
+                  throw std::runtime_error(
+                      "encode_single_chain_plaintext: array must be 1-D");
+              const double *src = arr.data();
+              const std::size_t n = static_cast<std::size_t>(arr.shape(0));
+              std::vector<std::complex<double>> slots(n);
+              for (std::size_t i = 0; i < n; ++i) {
+                  slots[i] = std::complex<double>(src[i], 0.0);
+              }
+              py::gil_scoped_release release;
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
+          },
+          py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"),
+          "Encode a numpy float64 1-D array into a SingleChainPlaintext (real "
+          "values promoted to complex). Faster than the list-based overload.");
 
     // Reconstruct a SingleChainPlaintext from raw coeff bytes + scale.
     // Allocates pinned host memory and memcpy's the bytes in. Used by the
