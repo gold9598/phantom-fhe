@@ -17,8 +17,10 @@
 
 set -euo pipefail
 
-REPO=/home/yongwoo-oh/phantom-fhe
-PYTHON=${PYTHON:-/home/yongwoo-oh/llm/bin/python3}
+# Resolve REPO relative to this script so the launcher works on any host.
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+REPO=${REPO:-$SCRIPT_DIR}
+PYTHON=${PYTHON:-python3}
 LOG_DIR=${LOG_DIR:-/tmp}
 CSV_PATH=${CSV_PATH:-/tmp/mrpc_sweep_results.csv}
 
