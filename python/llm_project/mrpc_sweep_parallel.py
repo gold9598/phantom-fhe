@@ -159,37 +159,72 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
     return cache
 
 
-def _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref_fn):
+def _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref_fn,
+                          capture_pytorch_ref_with_model_fn=None):
     """Sequentially pre-warm the per-idx PT-reference disk cache.
 
-    capture_pytorch_ref loads an 8B HF LLaMA model on cuda:0, runs forward,
-    deletes the model. Done sequentially before worker threads start to
-    avoid N threads contending for cuda:0 memory with concurrent model
-    loads. After this pass, every worker call to _ptref_cached hits the
-    /tmp/mrpc_ptref_idx{idx}_n{n}.npz disk cache (just np.load, no GPU).
+    The HF model is loaded ONCE for the whole loop and reused across all
+    missing indices, then deleted. Done sequentially before worker threads
+    start to avoid N threads contending for cuda:0 memory with concurrent
+    model loads. After this pass, every worker call to _ptref_cached hits
+    the /tmp/mrpc_ptref_idx{idx}_n{n}.npz disk cache (just np.load, no GPU).
     """
+    import torch
+    from transformers import AutoModelForCausalLM
+
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
                   "Sentence 1: {s1}\nSentence 2: {s2}\n"
                   "Answer (Yes or No):")
     phantom.set_cuda_device(0)
-    misses = 0
+
+    # Determine which indices are cache misses before touching the GPU.
+    miss_indices = []
     for idx in todo:
         row = ds[idx]
         prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
         token_ids = tok(prompt).input_ids
         path = f"/tmp/mrpc_ptref_idx{idx}_n{len(token_ids)}.npz"
-        if os.path.exists(path):
-            continue
-        misses += 1
+        if not os.path.exists(path):
+            miss_indices.append(idx)
+
+    if not miss_indices:
+        print(f"  PT-ref cache: all {len(todo)} indices already on disk", flush=True)
+        return
+
+    # Load the HF model once for all misses.
+    print(f"  loading HF model once for pre-warm ({len(miss_indices)} misses)...",
+          flush=True)
+    t_load0 = time.perf_counter()
+    model = AutoModelForCausalLM.from_pretrained(
+        "NousResearch/Meta-Llama-3.1-8B",
+        torch_dtype=torch.float16, device_map="cuda:0")
+    model.eval()
+    t_load = time.perf_counter() - t_load0
+    print(f"  HF model loaded in {t_load:.1f}s", flush=True)
+
+    for idx in miss_indices:
+        row = ds[idx]
+        prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
+        token_ids = tok(prompt).input_ids
+        path = f"/tmp/mrpc_ptref_idx{idx}_n{len(token_ids)}.npz"
         print(f"  PT-ref miss: idx={idx} num_tokens={len(token_ids)}  "
               f"(running PyTorch)...", flush=True)
-        ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_fn(token_ids)
+        if capture_pytorch_ref_with_model_fn is not None:
+            ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_with_model_fn(
+                model, tok, token_ids)
+        else:
+            ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_fn(token_ids)
         np.savez(path, ref=ref, prenorm=prenorm,
                  yes=np.float64(yes_pt), no=np.float64(no_pt))
-    if misses == 0:
-        print(f"  PT-ref cache: all {len(todo)} indices already on disk", flush=True)
-    else:
-        print(f"  PT-ref cache: pre-warmed {misses} new indices", flush=True)
+
+    del model
+    torch.cuda.empty_cache()
+    t_total = time.perf_counter() - t_load0
+    t_forwards = t_total - t_load
+    print(f"  PT-ref cache: pre-warmed {len(miss_indices)} new indices "
+          f"in {t_total:.1f}s (model load {t_load:.1f}s + "
+          f"forwards {t_forwards:.1f}s)",
+          flush=True)
 
 
 def _ptref_load(idx, token_ids, capture_pytorch_ref_fn):
@@ -292,6 +327,7 @@ def main():
     from llama3 import (PROBE_FULL, load_layer_weights,
                           encode_layer_rp_indep_irps)
     from llama3_mrpc import (run_classifier_fhe, capture_pytorch_ref,
+                              capture_pytorch_ref_with_model,
                               build_user_steps_mrpc, setup_engine)
 
     tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
@@ -330,12 +366,11 @@ def main():
 
     # ---- Phase 3: pre-warm PT-ref disk cache on main thread (cuda:0) ----
     # Avoids N threads racing on cuda:0 with concurrent 8B model loads.
+    # HF model loaded once for all misses, deleted before workers start.
     # After this pass every worker call is np.load from disk (thread-safe).
     print(f"Pre-warming PT-ref disk cache...", flush=True)
-    t_pt0 = time.perf_counter()
-    _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref)
-    print(f"  PT-ref pre-warm done in {time.perf_counter() - t_pt0:.1f}s",
-          flush=True)
+    _prewarm_ptref_cache(todo, tok, ds, capture_pytorch_ref,
+                         capture_pytorch_ref_with_model_fn=capture_pytorch_ref_with_model)
 
     # ---- Phase 4: round-robin dispatch across worker threads ----
     chunks = [todo[i::num_gpus] for i in range(num_gpus)]

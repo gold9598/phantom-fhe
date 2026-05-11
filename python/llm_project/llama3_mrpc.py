@@ -847,21 +847,22 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     return yes_logit, no_logit
 
 
-def capture_pytorch_ref(token_ids):
-    """Run PyTorch LLaMA-3.1-8B forward on token_ids and capture all hidden
-    states + the pre-final-norm last hidden state. Returns:
-      pytorch_ref:      (n_layers+1, num_tokens, D_MODEL) post-final-norm at idx -1
-      pytorch_pre_norm: (num_tokens, D_MODEL) — pre-final-norm last hidden state
-      yes_logit, no_logit: PyTorch reference logits at the last token position
+def capture_pytorch_ref_with_model(model, tok, token_ids):
+    """Run a forward pass on a pre-loaded model and return the same data as
+    capture_pytorch_ref. The caller is responsible for loading and deleting
+    the model; this function does NOT load or free it.
+
+    Args:
+      model: pre-loaded AutoModelForCausalLM on cuda:0 (fp16, eval mode).
+      tok:   unused; kept for call-site symmetry with capture_pytorch_ref.
+      token_ids: list[int] token ids for the prompt.
+
+    Returns:
+      pytorch_ref:      (n_layers+1, num_tokens, D_MODEL) ndarray float64
+      pytorch_pre_norm: (num_tokens, D_MODEL) ndarray float64
+      yes_pt, no_pt:    float logits at the last token position
     """
     import torch
-    from transformers import AutoModelForCausalLM
-    print(f"  Loading PyTorch model (fp16)...")
-    t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained("NousResearch/Meta-Llama-3.1-8B",
-                                                  torch_dtype=torch.float16, device_map="cuda:0")
-    model.eval()
-    print(f"  loaded in {time.perf_counter()-t0:.1f}s")
     input_ids = torch.tensor([token_ids], device="cuda:0")
     pre_norm_capture = {}
     h = model.model.norm.register_forward_pre_hook(
@@ -878,9 +879,28 @@ def capture_pytorch_ref(token_ids):
     meta = json.loads(open(f"{PROBE_FULL}/meta.json").read())
     yes_pt = float(last_logits[meta["yes_token_id"]])
     no_pt = float(last_logits[meta["no_token_id"]])
+    return pytorch_ref, pytorch_pre_norm, yes_pt, no_pt
+
+
+def capture_pytorch_ref(token_ids):
+    """Run PyTorch LLaMA-3.1-8B forward on token_ids and capture all hidden
+    states + the pre-final-norm last hidden state. Returns:
+      pytorch_ref:      (n_layers+1, num_tokens, D_MODEL) post-final-norm at idx -1
+      pytorch_pre_norm: (num_tokens, D_MODEL) — pre-final-norm last hidden state
+      yes_logit, no_logit: PyTorch reference logits at the last token position
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+    print(f"  Loading PyTorch model (fp16)...")
+    t0 = time.perf_counter()
+    model = AutoModelForCausalLM.from_pretrained("NousResearch/Meta-Llama-3.1-8B",
+                                                  torch_dtype=torch.float16, device_map="cuda:0")
+    model.eval()
+    print(f"  loaded in {time.perf_counter()-t0:.1f}s")
+    ref, prenorm, yes_pt, no_pt = capture_pytorch_ref_with_model(model, None, token_ids)
     del model
     torch.cuda.empty_cache()
-    return pytorch_ref, pytorch_pre_norm, yes_pt, no_pt
+    return ref, prenorm, yes_pt, no_pt
 
 
 DEBUG_LAYER = None
