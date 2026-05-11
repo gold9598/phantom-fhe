@@ -754,9 +754,11 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             print(f"  [calib] softmax_safety_scale={max_abs_calib.get('softmax_safety_scale', 1.0):.4f}")
 
         # Encrypt inputs (multi-ct K, V)
+        t_encrypt0 = time.perf_counter()
         x_ct, k_cts, v_cts, c_per_head, _ = encrypt_layer_inputs_multi(
             ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
             num_tokens, cos_all, sin_all, P_local)
+        t_encrypt = time.perf_counter() - t_encrypt0
 
         # ---- FHE forward through one decoder layer ----
         if verbose:
@@ -817,8 +819,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         layer_times.append(layer_ms)
 
         # Decrypt for accuracy check (vs pre-norm reference for L=31, vs pytorch_ref[L+1] for others)
+        t_decrypt0 = time.perf_counter()
         y_full = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
                            dtype=np.float64)
+        t_decrypt = time.perf_counter() - t_decrypt0
         y_p = y_full[::T_MODEL][:D_MODEL]
         if layer_idx < NUM_DECODERS - 1:
             ref = pytorch_ref[layer_idx + 1, P_local]
@@ -826,9 +830,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             ref = pytorch_pre_norm[P_local]  # pre-final-norm for L=31
         max_err = float(np.abs(y_p - ref).max())
         rel_rms = float(np.linalg.norm(y_p - ref) / np.linalg.norm(ref))
+        t_fhe_ms = layer_ms - (t_encrypt + t_decrypt) * 1000.0
         print(f"  Layer {layer_idx:2d}: ‖y_fhe‖={np.linalg.norm(y_p):.4f}  "
               f"‖y_ref‖={np.linalg.norm(ref):.4f}  max|err|={max_err:.3e}  "
-              f"rel-RMS={rel_rms:.3e}  t={layer_ms:.0f}ms")
+              f"rel-RMS={rel_rms:.3e}  t={layer_ms:.0f}ms  "
+              f"[encrypt={t_encrypt*1000:.0f}ms decrypt={t_decrypt*1000:.0f}ms "
+              f"fhe={t_fhe_ms:.0f}ms]")
         y_p_fhe = y_p
 
     # ---- LM head (host-side)
