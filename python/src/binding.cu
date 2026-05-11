@@ -388,7 +388,14 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     m.def("encode_single_chain_plaintext",
           [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
-             const std::vector<std::complex<double>> &slots, double scale) {
+             std::vector<std::complex<double>> slots, double scale) {
+              // `slots` is already a C++ vector at this point (pybind11
+              // unpacked the Python list during argument marshalling), so
+              // we no longer need the GIL for the NTT + encode work below.
+              // Releasing here lets concurrent worker threads encode in
+              // parallel during the Wq IRP pre-encode phase (32 layers x
+              // 256 SCPs = 8,192 calls per example).
+              py::gil_scoped_release release;
               return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale);
           },
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"));
@@ -400,13 +407,20 @@ PYBIND11_MODULE(pyPhantom, m) {
     // level-agnostic, the chain index is supplied at expand-time only.
     m.def("scp_from_bytes",
           [](py::bytes data, double scale, std::size_t N) {
-              std::string s(data);  // ref to bytes; pybind11 keeps it alive
+              // Extract the bytes into a std::string while we still hold
+              // the GIL — converting py::bytes -> std::string touches the
+              // Python object.
+              std::string s(data);
               if (s.size() != N * sizeof(std::int64_t)) {
                   throw std::runtime_error(
                       "scp_from_bytes: byte length mismatch (got " +
                       std::to_string(s.size()) + ", expected " +
                       std::to_string(N * sizeof(std::int64_t)) + ")");
               }
+              // The pinned-host allocation + memcpy are pure C++; release
+              // the GIL so concurrent workers can deserialize SCPs in
+              // parallel during the disk-cache load.
+              py::gil_scoped_release release;
               phantom::SingleChainPlaintext out;
               out.scale = scale;
               out.coeffs = phantom::PinnedHostInt64Buffer(N);
