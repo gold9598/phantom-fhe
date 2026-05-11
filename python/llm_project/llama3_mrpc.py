@@ -572,6 +572,74 @@ def _probe(tag, ctx, encoder, sk, ct):
           f"max|.|={np.abs(v).max():.4e} mean|.|={np.abs(v).mean():.4e}")
 
 
+# Module-level full-weight cache shared across all run_classifier_fhe calls.
+# Populated lazily by _LazyLayerWeights on the first miss for each layer
+# (typically the first example's compute_layer_calib_n on layer 0). Per layer
+# this is a 9-key dict (~1.1 GB), but only the layers actually visited by
+# `min_layer..max_layer` will ever be loaded, and they are shared across all
+# subsequent examples and all worker threads — so the 4 GPU workers
+# collectively pay the disk + glibc malloc cost ONCE per layer over the
+# entire sweep, not once per example.
+_LAZY_FULL_WEIGHT_CACHE = {}
+_LAZY_FULL_WEIGHT_LOCK = threading.Lock()
+
+
+class _LazyLayerWeights:
+    """Dict-like wrapper around a pre-loaded per-layer weight SUBSET.
+
+    Returns values directly from the subset when present; on a miss
+    (Wo/Wgate/Wup/Wdown for the per-example hot path), falls back to a
+    one-shot full `load_layer_weights(layer_idx)` cached in `full_cache`
+    under `lock`. Subsequent misses for the same layer hit the cache; a
+    miss in one worker thread populates the cache for all workers.
+
+    Supports `__getitem__`, `__contains__`, `__iter__`, and `get()` so it
+    is a drop-in stand-in for the subset dict at every call site that
+    treats it as read-only.
+    """
+
+    __slots__ = ("_layer_idx", "_subset", "_full_cache", "_lock")
+
+    def __init__(self, layer_idx, subset, full_cache, lock):
+        self._layer_idx = layer_idx
+        self._subset = subset
+        self._full_cache = full_cache
+        self._lock = lock
+
+    def _full(self):
+        cached = self._full_cache.get(self._layer_idx)
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = self._full_cache.get(self._layer_idx)
+            if cached is None:
+                cached = load_layer_weights(self._layer_idx)
+                self._full_cache[self._layer_idx] = cached
+        return cached
+
+    def __getitem__(self, key):
+        v = self._subset.get(key)
+        if v is not None:
+            return v
+        return self._full()[key]
+
+    def __contains__(self, key):
+        if key in self._subset:
+            return True
+        # Treat the full on-disk weight set as the source of truth so callers
+        # using `if k in w` (e.g. encode_layer_irps' subset check) see all
+        # 9 keys without forcing a disk load.
+        return key in ("Wq", "Wk", "Wv", "Wo", "Wgate", "Wup", "Wdown", "g1", "g2")
+
+    def __iter__(self):
+        return iter(("Wq", "Wk", "Wv", "Wo", "Wgate", "Wup", "Wdown", "g1", "g2"))
+
+    def get(self, key, default=None):
+        if key in self._subset:
+            return self._subset[key]
+        return self._full().get(key, default)
+
+
 def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
                          cos_all_full, sin_all_full, label="prompt",
                          debug_layer=None, max_layer=None, min_layer=None,
@@ -606,9 +674,20 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     # workers stuck on disk I/O + glibc malloc contention inside
     # load_layer_weights (~128 MB allocations × 9 keys × 4 threads); the
     # pre-load eliminates that contention entirely.
+    #
+    # The preloaded subset is missing the R_P-independent keys
+    # (Wo/Wgate/Wup/Wdown). Most consumers (encode_layer_irps, attention/MLP
+    # blocks) serve those from the shared rp_indep_cache and never touch
+    # `w[...]` directly, but a few call sites (e.g. compute_layer_calib_n in
+    # this module) do read them. We wrap the subset in _LazyLayerWeights so
+    # any missed key triggers a one-shot full load_layer_weights() on first
+    # access. The full-weight cache is module-level so the cost is paid ONCE
+    # per layer across the entire sweep (all examples, all workers).
     def _get_layer_w(layer_idx):
         if preloaded_weights is not None:
-            return preloaded_weights[layer_idx]
+            return _LazyLayerWeights(
+                layer_idx, preloaded_weights[layer_idx],
+                _LAZY_FULL_WEIGHT_CACHE, _LAZY_FULL_WEIGHT_LOCK)
         return load_layer_weights(layer_idx)
 
     # ---- Engine. If caller supplies one, reuse it (required when sharing
