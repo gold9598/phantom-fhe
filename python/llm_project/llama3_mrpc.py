@@ -523,7 +523,7 @@ def _probe(tag, ctx, encoder, sk, ct):
 
 def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm,
                          cos_all_full, sin_all_full, label="prompt",
-                         debug_layer=None, max_layer=None):
+                         debug_layer=None, max_layer=None, min_layer=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -596,6 +596,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     y_p_fhe = None  # final hidden state at P (post-residual2 of last layer)
 
     for layer_idx in range(NUM_DECODERS):
+        if min_layer is not None and layer_idx < min_layer:
+            continue
         if max_layer is not None and layer_idx > max_layer:
             print(f"  early exit after layer {max_layer}")
             break
@@ -638,8 +640,11 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         _best_err = float(np.abs(np.polyval(
             [round(c * _SILU_ENC_SCALE) / _SILU_ENC_SCALE
              for c in silu_coeffs[::-1]], _silu_zs) - _silu_actual).max())
-        # Test degrees up to 20 (PS depth 5; +1 for normalization = 6 levels,
-        # within budget). Beyond 20, gains shrink and PS depth grows.
+        # Test degrees up to 20 (PS depth 5; +1 for normalization = 6 levels).
+        # deg=24 with normalized coeffs has c_top ~ 8e4 (encoded ~9e16, within
+        # prime 2^60 ≈ 1.15e18 but apparently triggers a slow path in Phantom's
+        # eval_polynomial — observed to hang on L31 silu). deg=28+ even worse.
+        # Higher degrees would also push PS depth to 6, busting chain budget.
         for _d in (10, 12, 16, 18, 20):
             _c = fit_silu_coeffs(silu_domain, deg=_d, normalized=True)
             _cq = [round(c * _SILU_ENC_SCALE) / _SILU_ENC_SCALE for c in _c]
@@ -782,6 +787,23 @@ def capture_pytorch_ref(token_ids):
 
 DEBUG_LAYER = None
 MAX_LAYER = None
+MIN_LAYER = None
+
+
+def _cached_pytorch_ref(idx, truncate_to, token_ids):
+    """Load cached PT reference for (idx, truncate_to) from disk if present;
+    otherwise run capture_pytorch_ref and save to disk. Saves ~3 min of PT
+    model load+forward when iterating on a specific layer's FHE accuracy."""
+    cache_path = f"/tmp/mrpc_ptref_idx{idx}_n{len(token_ids)}.npz"
+    if __import__("os").path.exists(cache_path):
+        print(f"  [cache hit] loading PT ref from {cache_path}")
+        z = np.load(cache_path)
+        return z["ref"], z["prenorm"], float(z["yes"]), float(z["no"])
+    print(f"  [cache miss] running PT and saving to {cache_path}")
+    ref, prenorm, yes_pt, no_pt = capture_pytorch_ref(token_ids)
+    np.savez(cache_path, ref=ref, prenorm=prenorm,
+             yes=np.float64(yes_pt), no=np.float64(no_pt))
+    return ref, prenorm, yes_pt, no_pt
 
 
 def run_mrpc_example(idx, truncate_to=None):
@@ -807,8 +829,9 @@ def run_mrpc_example(idx, truncate_to=None):
     print(f"  s1={row['sentence1']!r}")
     print(f"  s2={row['sentence2']!r}")
 
-    # PyTorch reference
-    pytorch_ref, pytorch_pre_norm, yes_pt, no_pt = capture_pytorch_ref(token_ids)
+    # PyTorch reference (cached on disk)
+    pytorch_ref, pytorch_pre_norm, yes_pt, no_pt = _cached_pytorch_ref(
+        idx, truncate_to, token_ids)
     print(f"  PT  yes_logit={yes_pt:.4f}  no_logit={no_pt:.4f}")
     pt_pred = "Yes" if yes_pt > no_pt else "No"
 
@@ -819,7 +842,7 @@ def run_mrpc_example(idx, truncate_to=None):
     yes_logit, no_logit = run_classifier_fhe(
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}",
-        debug_layer=DEBUG_LAYER, max_layer=MAX_LAYER)
+        debug_layer=DEBUG_LAYER, max_layer=MAX_LAYER, min_layer=MIN_LAYER)
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     print(f"\n=== Stage 3b-f-2 result ===")
     print(f"  FHE yes={yes_logit:.4f}  no={no_logit:.4f}  pred={fhe_pred}")
@@ -860,11 +883,14 @@ if __name__ == "__main__":
                     help="Print stage probes for this layer index")
     ap.add_argument("--max-layer", type=int, default=None,
                     help="Stop after this layer index (early exit)")
+    ap.add_argument("--min-layer", type=int, default=None,
+                    help="Skip layers before this index (uses PT ref as input)")
     ap.add_argument("--truncate-to", type=int, default=None,
                     help="Truncate the MRPC prompt to first N tokens (for num_tokens sweep)")
     args = ap.parse_args()
     DEBUG_LAYER = args.debug_layer
     MAX_LAYER = args.max_layer
+    MIN_LAYER = args.min_layer
     if args.mode == "qbrown4":
         main_4tok()
     else:
