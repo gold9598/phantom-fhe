@@ -30,6 +30,11 @@ cd "$REPO"
 # build/lib/pyPhantom.cpython-<ver>-<arch>.so by the repo's CMake.
 if ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&1; then
     echo "[setup] pyPhantom .so not found in $REPO/build/lib — building..."
+    # Init the pybind11 submodule (the build needs python/pybind11/CMakeLists.txt).
+    if [ ! -f python/pybind11/CMakeLists.txt ]; then
+        echo "[setup] initializing git submodules (pybind11)..."
+        git submodule update --init --recursive
+    fi
     # CUDA_ARCH default 86 (Ampere — A6000/A100). Override with
     # CUDA_ARCH=120 for 5090 (Blackwell), 89 for 4090 (Ada), etc.
     CUDA_ARCH=${CUDA_ARCH:-86}
