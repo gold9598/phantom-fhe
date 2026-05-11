@@ -489,7 +489,15 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         # bootstrap), leaving no level headroom for merge_bootstrap's
         # pre-scale multiplies. Use separate bootstrap_safe — at max_abs
         # = TARGET_MAG = 0.45 (< target_mag 0.49) it skips scaling and
-        # runs bootstrap_inplace directly with no level cost. ----
+        # runs bootstrap_inplace directly with no level cost.
+        # Opt 3 attempted: pair these bootstraps via merge_bootstrap to
+        # halve the stage-B bootstrap count (10 -> 5 at nt=75). Rejected
+        # because merge_bootstrap unconditionally multiplies ct2 by sd*i
+        # via multiply_plain+rescale_to_next (bootstrap.py:186-192) —
+        # consumes 1 level even when sd==1.0. At max_user_level inputs,
+        # this raises before bootstrap_inplace. Skipping this opt keeps
+        # correctness; a zero-level pack would need a phantom API for
+        # i-multiplication without rescale, which doesn't exist today. ----
         e_i = bootstrap_safe(engine, ctx, encoder, e_i,
                                max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
         if j is not None:
