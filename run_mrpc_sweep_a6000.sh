@@ -48,9 +48,13 @@ if [ -n "${REBUILD:-}" ] || ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&
         echo "[setup] initializing git submodules (pybind11)..."
         git submodule update --init --recursive
     fi
-    # CUDA_ARCH default 86 (Ampere — A6000/A100). Override with
-    # CUDA_ARCH=120 for 5090 (Blackwell), 89 for 4090 (Ada), etc.
-    CUDA_ARCH=${CUDA_ARCH:-86}
+    # CUDA_ARCH:
+    #   80 — A100 (Ampere data-center)   [DEFAULT — A100×4 sweep box]
+    #   86 — A6000 / RTX 3090 (Ampere consumer)
+    #   89 — RTX 4090 (Ada Lovelace)
+    #   90 — H100 (Hopper)
+    #  120 — RTX 5090 (Blackwell)
+    CUDA_ARCH=${CUDA_ARCH:-80}
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
         -DPHANTOM_USE_CUDA_PTX=ON \
         -DPHANTOM_ENABLE_PYTHON_BINDING=ON \
