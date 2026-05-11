@@ -36,8 +36,13 @@ fi
 
 # Ensure pyPhantom .so is built. The Python binding is built as
 # build/lib/pyPhantom.cpython-<ver>-<arch>.so by the repo's CMake.
-if ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&1; then
-    echo "[setup] pyPhantom .so not found in $REPO/build/lib — building..."
+if [ -n "${REBUILD:-}" ] || ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&1; then
+    if [ -n "${REBUILD:-}" ]; then
+        echo "[setup] REBUILD=1: wiping build/ for clean rebuild..."
+        rm -rf build
+    else
+        echo "[setup] pyPhantom .so not found in $REPO/build/lib — building..."
+    fi
     # Init the pybind11 submodule (the build needs python/pybind11/CMakeLists.txt).
     if [ ! -f python/pybind11/CMakeLists.txt ]; then
         echo "[setup] initializing git submodules (pybind11)..."
