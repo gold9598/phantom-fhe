@@ -689,19 +689,11 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
         silu_max = max_abs_calib["gate"] / BOOT_CALIB_MARGIN
         silu_domain = (-silu_max * 1.2, silu_max * 1.2)
-        # Chebyshev BASIS coefficients for Clenshaw evaluation (deg=32 gives
-        # FHE max|err| ~3e-3 on D=16 — matches numpy Linf because Clenshaw
-        # keeps intermediates bounded by max|t_k| ~ silu_max, vs monomial PS
-        # whose intermediates scale with c_top ~ silu_max·D^N).
-        silu_D = silu_domain[1]
-        silu_t_coeffs = fit_silu_chebyshev_basis(silu_domain, deg=32)
-        # Use NORMALIZED Chebyshev fit: coeffs are for the polynomial in
-        # z = x/D where D = silu_domain[1]. Equivalent to scaling all
-        # coeffs by D^i, which lifts the high-order coefficients above
-        # CKKS encoding precision (1/SCALE ~ 9e-13) even at deg=20+ on
-        # wide D=16 domains. Caller (silu()) does z = x/D as one extra
-        # ct·scalar multiply (1 level cost). The adaptive picker tests
-        # multiple degrees and chooses min Linf-at-CKKS-quantized.
+        # Use NORMALIZED monomial fit when an adaptive degree <= 20 meets
+        # the error threshold (~1e-3); falls back to the deg=32 Chebyshev
+        # Clenshaw path otherwise. Clenshaw adds 2 extra bootstraps + ~30
+        # ct-ct multiplies (~840ms/layer), so prefer eval_polynomial when
+        # the simpler path's accuracy is comparable.
         _silu_D = silu_domain[1]
         _silu_xs = np.linspace(silu_domain[0], silu_domain[1], 1001)
         _silu_zs = _silu_xs / _silu_D
@@ -726,6 +718,23 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 _best_err = _err
                 silu_deg = _d
                 silu_coeffs = _c
+        # Opt 2: dispatch silu_clenshaw only when the adaptive winner is
+        # still over the error budget. The deg=32 Chebyshev BASIS path
+        # (Clenshaw) bounds intermediates by max|t_k| ~ silu_max — needed
+        # when the normalized poly fit can't hit ~1e-3 Linf at deg <= 20.
+        # Threshold = 5e-3 (matches the error budget the existing pipeline
+        # tolerates at deg=32 Clenshaw on wide silu domains).
+        _SILU_POLY_ERR_BUDGET = 5e-3
+        if silu_deg <= 20 and _best_err <= _SILU_POLY_ERR_BUDGET:
+            silu_t_coeffs = None  # gates fhe_mlp_irp_bootstrap to eval_polynomial
+            silu_D = None
+            _silu_path = f"poly{silu_deg}"
+        else:
+            silu_D = silu_domain[1]
+            silu_t_coeffs = fit_silu_chebyshev_basis(silu_domain, deg=32)
+            _silu_path = "clenshaw"
+        if verbose or layer_idx == (min_layer if min_layer is not None else 0):
+            print(f"  [silu: deg={silu_deg} path={_silu_path} Linf={_best_err:.2e}]")
         if verbose:
             margin = BOOT_CALIB_MARGIN
             ks = ("x_in", "rms1_out", "x_mid", "rms2_out",
