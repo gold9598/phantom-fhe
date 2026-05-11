@@ -26,6 +26,14 @@ CSV_PATH=${CSV_PATH:-/tmp/mrpc_sweep_results.csv}
 
 cd "$REPO"
 
+# Ensure /tmp/llama_probe_full/ probe data exists (weight .npy files,
+# rope_*.npy, meta.json). One-time extract from HF LLaMA-3.1-8B.
+PROBE_DIR=${PROBE_DIR:-/tmp/llama_probe_full}
+if [ ! -f "$PROBE_DIR/meta.json" ]; then
+    echo "[setup] Probe data not found at $PROBE_DIR — extracting from HF model..."
+    "$PYTHON" -u python/llm_project/setup_probe_data.py --probe-dir "$PROBE_DIR"
+fi
+
 # Ensure pyPhantom .so is built. The Python binding is built as
 # build/lib/pyPhantom.cpython-<ver>-<arch>.so by the repo's CMake.
 if ! ls build/lib/pyPhantom.cpython-*.so >/dev/null 2>&1; then
