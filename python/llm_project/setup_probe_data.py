@@ -34,7 +34,7 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float32, device_map="cpu")
+        args.model, torch_dtype=torch.float32, device_map="cpu")
     cfg = model.config
     print(f"  hidden_size={cfg.hidden_size}  num_layers={cfg.num_hidden_layers}  "
           f"rms_norm_eps={cfg.rms_norm_eps}", flush=True)
