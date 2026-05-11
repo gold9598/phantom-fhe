@@ -854,15 +854,40 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
         _probe_diff("17.post_Wgate", ctx, encoder, sk, gate_ct,
                     probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
                     orderless=True)
-    # ---- Refresh gate_ct via homomorphic bootstrap. ----
+
+    # ---- up = Wup @ x. Compute BEFORE bootstrap so we can merge-bootstrap
+    # gate_ct and up_ct as a complex pair (one bootstrap instead of two,
+    # saves ~163ms/layer).
     t0 = _t()
-    gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
-                             max_abs=_calib["gate"], slot_count=NUM_SLOTS)
+    up_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_up_irp,
+                              NUM_SLOTS, D_MODEL, D_PAD_MLP,
+                              baby_steps=BABY_STEPS_IRP_MLP,
+                              sub_mask_pt=sub_mask_wide_pt)
+    _rec("mlp_up", t0)
+    up_ct = phantom.rescale_to_next(ctx, up_ct)
+    up_ct.set_scale(SCALE)
+    _vp("post_Wup", up_ct)
+    if probe_np is not None and sk is not None:
+        _probe_diff("20.post_Wup", ctx, encoder, sk, up_ct,
+                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
+
+    # ---- Merge-bootstrap gate_ct + up_ct via complex pair. ----
+    from blocks.bootstrap import merge_bootstrap
+    t0 = _t()
+    pair_max_abs = max(_calib["gate"], _calib["up"])
+    gate_ct, up_ct = merge_bootstrap(
+        engine, ctx, encoder, gate_ct, up_ct,
+        max_abs=pair_max_abs, slot_count=NUM_SLOTS, galois_key=galois_key)
     _rec("bootstrap", t0)
     _vp("post_gate_boot", gate_ct)
+    _vp("post_up_boot", up_ct)
     if probe_np is not None and sk is not None:
         _probe_diff("18.post_gate_boot", ctx, encoder, sk, gate_ct,
                     probe_np["gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
+                    orderless=True)
+        _probe_diff("21.post_up_boot", ctx, encoder, sk, up_ct,
+                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
                     orderless=True)
 
     # ---- silu(gate). ----
@@ -880,33 +905,6 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
     if probe_np is not None and sk is not None:
         _probe_diff("19.post_silu", ctx, encoder, sk, silu_gate,
                     probe_np["silu_gate_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
-                    orderless=True)
-
-    # ---- up = Wup @ x. (Re-use x_irp; same chain.) ----
-    t0 = _t()
-    up_ct = irp_matvec_rect_host(ctx, encoder, galois_key, x_irp, diag_up_irp,
-                              NUM_SLOTS, D_MODEL, D_PAD_MLP,
-                              baby_steps=BABY_STEPS_IRP_MLP,
-                              sub_mask_pt=sub_mask_wide_pt)
-    _rec("mlp_up", t0)
-
-    # up_ct exits IRP at scale^2; rescale to SCALE before bootstrap.
-    up_ct = phantom.rescale_to_next(ctx, up_ct)
-    up_ct.set_scale(SCALE)
-    _vp("post_Wup", up_ct)
-    if probe_np is not None and sk is not None:
-        _probe_diff("20.post_Wup", ctx, encoder, sk, up_ct,
-                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
-                    orderless=True)
-    # ---- Refresh up_ct via homomorphic bootstrap. ----
-    t0 = _t()
-    up_ct = bootstrap_safe(engine, ctx, encoder, up_ct,
-                           max_abs=_calib["up"], slot_count=NUM_SLOTS)
-    _rec("bootstrap", t0)
-    _vp("post_up_boot", up_ct)
-    if probe_np is not None and sk is not None:
-        _probe_diff("21.post_up_boot", ctx, encoder, sk, up_ct,
-                    probe_np["up_P"], stride=_T_PRIME_WIDE, count=D_PAD_MLP,
                     orderless=True)
 
     # ---- h = silu_gate * up. ----
