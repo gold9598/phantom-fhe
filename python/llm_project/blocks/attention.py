@@ -222,7 +222,7 @@ def qkt_irp_mask_scale_plaintext(
     slot[h*d_head*t + tok] for h<n_heads, tok<num_tokens; zero elsewhere."""
     num_slots = encoder.slot_count()
     slots = _qkt_irp_head_mask_slots(num_slots, d_head, d_total, t, num_tokens, scale_value)
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 def qkt_irp_per_head_sub_plaintext(
@@ -243,7 +243,7 @@ def qkt_irp_per_head_sub_plaintext(
             idx = base + tok
             if idx < num_slots:
                 slots[idx] = c_per_head[h]
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 def score_v_irp_output_mask_plaintext(
@@ -262,7 +262,7 @@ def score_v_irp_output_mask_plaintext(
         idx = i * t
         if idx < num_slots:
             slots[idx] = 1.0
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +721,7 @@ def _encode_mul_rescale_snap(ctx, encoder, ct, slots, encode_scale, nominal=None
     if nominal is None:
         nominal = ct.scale()
     pt = encoder.encode_double_vector(
-        ctx, slots.tolist(), encode_scale, ct.chain_index(),
+        ctx, slots, encode_scale, ct.chain_index(),
     )
     result = phantom.multiply_plain(ctx, ct, pt)
     result = phantom.rescale_to_next(ctx, result)
@@ -744,7 +744,7 @@ def score_mask_plaintext(
         raise ValueError("score_mask_plaintext: d_total must be a multiple of d_head")
     num_slots = encoder.slot_count()
     slots = _head_stride_mask(num_slots, d_head, d_total, positions_per_ct)
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 def mask_scale_plaintext(
@@ -758,7 +758,7 @@ def mask_scale_plaintext(
         raise ValueError("mask_scale_plaintext: d_total must be a multiple of d_head")
     num_slots = encoder.slot_count()
     slots = _head_stride_mask(num_slots, d_head, d_total, num_tokens, scale_value)
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +969,7 @@ def attention_forward_llama(
         for h in range(n_heads):
             sub_slots[t * d_total + h * d_head] = c_per_head[h]
     sub_pt = encoder.encode_double_vector(
-        ctx, sub_slots.tolist(), scores_ct.scale(), scores_ct.chain_index())
+        ctx, sub_slots, scores_ct.scale(), scores_ct.chain_index())
     scores_ct = phantom.sub_plain(ctx, scores_ct, sub_pt)
     _rec("attn_A_wq_qkt_mask_sub", t0)
 

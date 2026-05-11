@@ -390,9 +390,9 @@ def encrypt_layer_inputs(ctx, encoder, sk, fresh_ci, x_btd, g1, Wq_baked, Wk, Wv
             for tok in range(NUM_TOKENS):
                 k_slots[base + tok] = K_full_h2[tok, h_idx, j]
                 v_slots[base + tok] = V_full_h2[tok, h_idx, j]
-    x_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, fresh_ci))
-    k_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, k_slots.tolist(), SCALE, fresh_ci))
-    v_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, v_slots.tolist(), SCALE, fresh_ci))
+    x_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, x_slots, SCALE, fresh_ci))
+    k_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, k_slots, SCALE, fresh_ci))
+    v_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, v_slots, SCALE, fresh_ci))
     return x_ct, k_ct, v_ct, c_per_head
 
 def _probe(tag, ctx, encoder, sk, ct):
@@ -717,7 +717,8 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     t0 = _t()
     _PRE_FINSMX_MEAN = 0.4487
     mean_pt_pre = encoder.encode_double_vector(
-        ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+        ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+        e_ct.scale(), e_ct.chain_index())
     e_ct = phantom.sub_plain(ctx, e_ct, mean_pt_pre)
     if probe_np is not None and sk is not None:
         raw_e2 = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
@@ -741,7 +742,8 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
               f"  diff_max={np.abs(diff_e3).max():.2e}"
               f"  diff_rms={np.linalg.norm(diff_e3)/math.sqrt(len(diff_e3)):.2e}")
     mean_pt_post = encoder.encode_double_vector(
-        ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+        ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+        e_ct.scale(), e_ct.chain_index())
     e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
     _rec("bootstrap", t0)
 

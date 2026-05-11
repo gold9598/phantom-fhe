@@ -47,7 +47,7 @@ def _fill_head_block(
 
 def _encode_pt(ctx, encoder, values: np.ndarray, chain_index: int, scale: float):
     """Encode a numpy float64 array as a PhantomPlaintext at given chain/scale."""
-    return encoder.encode_double_vector(ctx, values.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, values, scale, chain_index)
 
 
 class RopeTables:

@@ -64,7 +64,7 @@ def encode_matrix_fd(ctx, encoder, matrix, num_rows, num_cols, scale):
             global_j = col_start + local_j
             for i in range(num_rows):
                 slots[local_j * num_rows + i] = complex(mat_np[i, global_j], 0.0)
-        scp = phantom.encode_single_chain_plaintext(ctx, encoder, slots.tolist(), scale)
+        scp = phantom.encode_single_chain_plaintext(ctx, encoder, slots, scale)
         chunks.append(scp)
 
     return EncodedMatrixFD(chunks, num_rows, num_cols, cols_per_chunk)
@@ -94,7 +94,7 @@ def encrypt_vector_fd(ctx, encoder, sk, vector, feature_dim, scale, chain_index)
         for local_j in range(col_end - col_start):
             v = vec_np[col_start + local_j]
             slots[local_j * feature_dim : local_j * feature_dim + feature_dim] = v
-        pt = encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+        pt = encoder.encode_double_vector(ctx, slots, scale, chain_index)
         ct = sk.encrypt_symmetric(ctx, pt)
         chunks.append(ct)
 

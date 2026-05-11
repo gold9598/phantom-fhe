@@ -91,7 +91,9 @@ def encode_irp_diagonals(
     G = K // M
 
     slot_arrays = _build_irp_slots(matrix, N, d, t, K, M, G, dtype=np.float64)
-    return [encoder.encode_double_vector(ctx, s.tolist(), scale, chain_index)
+    # Pass numpy arrays directly — the C++ binding has a numpy fast path that
+    # avoids the GIL-held per-element tolist() marshalling.
+    return [encoder.encode_double_vector(ctx, s, scale, chain_index)
             for s in slot_arrays]
 
 
@@ -121,7 +123,10 @@ def encode_irp_diagonals_host(
     G = K // M
 
     slot_arrays = _build_irp_slots(matrix, N, d, t, K, M, G, dtype=complex)
-    return [phantom.encode_single_chain_plaintext(ctx, encoder, s.tolist(), scale)
+    # Pass numpy complex arrays directly — avoids the GIL-held tolist()
+    # marshalling that previously dominated the Wq IRP pre-encode phase
+    # (~50 ms per call × 256 SCPs × 32 layers = ~6 min per worker).
+    return [phantom.encode_single_chain_plaintext(ctx, encoder, s, scale)
             for s in slot_arrays]
 
 
@@ -324,7 +329,7 @@ def encode_irp_mask(
     t, _ = _check_dims(N, d)
     slots = np.zeros(N, dtype=np.float64)
     slots[::t][:d] = 1.0
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +471,7 @@ def encrypt_irp_input(
         raise ValueError(f"encrypt_irp_input: a must have shape ({d},), got {a.shape}")
     slots = np.zeros(N, dtype=np.float64)
     slots[::t][:d] = a  # only first d strided positions
-    pt = encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    pt = encoder.encode_double_vector(ctx, slots, scale, chain_index)
     return sk.encrypt_symmetric(ctx, pt)
 
 
@@ -618,7 +623,7 @@ def encode_irp_output_mask_wide(
     t_out = N // d_out
     slots = np.zeros(N, dtype=np.float64)
     slots[::t_out][:d_out] = 1.0
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 def irp_required_steps_rect(
@@ -697,7 +702,7 @@ def encrypt_irp_input_rect(
     for q in range(alpha):
         for i in range(d):
             slots[i * t + q * t_prime] = a[i + q * d]
-    pt = encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    pt = encoder.encode_double_vector(ctx, slots, scale, chain_index)
     return sk.encrypt_symmetric(ctx, pt)
 
 
@@ -882,8 +887,10 @@ def encode_irp_diagonals_rect_pair_host(
         for sr, si in zip(slots_real, slots_imag):
             # Combine: real part from sr (already real-only), imag from si.real.
             combined = sr.real + 1j * si.real
+            # Pass numpy complex array directly — fast path via binding's
+            # numpy overload (no Python iteration of 65K complex objects).
             plaintexts.append(phantom.encode_single_chain_plaintext(
-                ctx, encoder, combined.tolist(), scale))
+                ctx, encoder, combined, scale))
     return plaintexts
 
 

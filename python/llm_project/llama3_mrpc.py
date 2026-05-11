@@ -334,16 +334,16 @@ def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
     k_blocks_slots, v_blocks_slots = pack_kv_blocks(
         K_full_h, V_full_h, num_tokens, T_MODEL, NUM_SLOTS, N_HEADS, D_HEAD)
     k_cts = [sk.encrypt_symmetric(ctx,
-        encoder.encode_double_vector(ctx, kb.tolist(), SCALE, fresh_ci))
+        encoder.encode_double_vector(ctx, kb, SCALE, fresh_ci))
         for kb in k_blocks_slots]
     v_cts = [sk.encrypt_symmetric(ctx,
-        encoder.encode_double_vector(ctx, vb.tolist(), SCALE, fresh_ci))
+        encoder.encode_double_vector(ctx, vb, SCALE, fresh_ci))
         for vb in v_blocks_slots]
 
     x_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
     x_slots[::T_MODEL][:D_MODEL] = x_btd[query_position]
     x_ct = sk.encrypt_symmetric(ctx,
-        encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, fresh_ci))
+        encoder.encode_double_vector(ctx, x_slots, SCALE, fresh_ci))
 
     return x_ct, k_cts, v_cts, c_per_head, Wq_baked
 
@@ -439,13 +439,15 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         phantom.square_iterations_damped_inplace(
             ctx, encoder, relin_key, e_ct, damps)
         mean_pt = encoder.encode_double_vector(
-            ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+            e_ct.scale(), e_ct.chain_index())
         return phantom.sub_plain(ctx, e_ct, mean_pt)
 
     def _stage_c_post(e_ct, blk_size):
         """mean-add + mask*safety_scale."""
         mean_pt = encoder.encode_double_vector(
-            ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+            e_ct.scale(), e_ct.chain_index())
         e_ct = phantom.add_plain(ctx, e_ct, mean_pt)
         e_nominal = e_ct.scale()
         mask_pt = qkt_irp_mask_scale_plaintext(
@@ -523,7 +525,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     t0 = _t()
     a_chain_guess = e_blocks[0].chain_index()
     head_first_slot_mask_pt = encoder.encode_double_vector(
-        ctx, head_first_slot_mask_slots.tolist(), SCALE, a_chain_guess)
+        ctx, head_first_slot_mask_slots, SCALE, a_chain_guess)
     weights_blocks = multi_ct_softmax_finalize(
         ctx, encoder, relin_key, galois_key,
         e_blocks, head_first_slot_mask_pt,
