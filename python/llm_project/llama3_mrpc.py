@@ -407,12 +407,18 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         for kk, sb in enumerate(score_blocks):
             _probe(f"attn post-qkt[{kk}]", ctx, encoder, sk, sb)
 
-    # Per-block: mask*scale + sub C[h] + bootstrap + ps_exp + damped + mean handling + mask
-    e_blocks = []
-    for blk, (sb, blk_size) in enumerate(zip(score_blocks, block_sizes)):
-        # mask*scale (block-aware: only first blk_size tokens active)
+    # Per-block softmax pipeline, restructured to pair bootstraps across
+    # consecutive blocks via merge_bootstrap (saves 6/12 bootstraps for
+    # n_blocks=6: 3 stage-A pairs + 3 stage-B pairs, ~1s/layer).
+    from blocks.bootstrap import merge_bootstrap
+    inv_sqrt_d = 1.0 / math.sqrt(float(D_HEAD))
+    safety_scale = max_abs_calib.get("softmax_safety_scale", 1.0) if max_abs_calib else 1.0
+    damps = softmax_damping_schedule(NUM_SQUARINGS, num_tokens, EXTRA_SCALE, TARGET_MAG)
+    _PRE_FINSMX_MEAN = 0.4487
+
+    def _stage_a_premask(sb, blk_size):
+        """mask*scale + sub_C (block-aware)."""
         nominal = sb.scale()
-        inv_sqrt_d = 1.0 / math.sqrt(float(D_HEAD))
         ms_pt = qkt_irp_mask_scale_plaintext(
             ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
             inv_sqrt_d, sb.chain_index(), SCALE)
@@ -422,37 +428,24 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         sub_pt = qkt_irp_per_head_sub_plaintext(
             ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
             c_per_head, sb.chain_index(), sb.scale())
-        sb = phantom.sub_plain(ctx, sb, sub_pt)
+        return phantom.sub_plain(ctx, sb, sub_pt)
 
-        # Bootstrap before damped squarings
-        sb = bootstrap_safe(engine, ctx, encoder, sb,
-                              max_abs=_calib["scores"], slot_count=NUM_SLOTS)
-
-        # ps_exp + damped squarings (use TOTAL num_tokens for damping schedule)
-        damps = softmax_damping_schedule(NUM_SQUARINGS, num_tokens, EXTRA_SCALE, TARGET_MAG)
+    def _stage_b_ps_exp(sb):
+        """ps_exp_init + damped squarings + mean-sub."""
         e_ct = phantom.ps_exp_init(
             ctx, encoder, relin_key, sb,
             num_tokens, NUM_SQUARINGS, EXTRA_SCALE)
         phantom.square_iterations_damped_inplace(
             ctx, encoder, relin_key, e_ct, damps)
-
-        # Mean-sub + bootstrap + mean-add
-        _PRE_FINSMX_MEAN = 0.4487
-        mean_pt_pre = encoder.encode_double_vector(
+        mean_pt = encoder.encode_double_vector(
             ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
-        e_ct = phantom.sub_plain(ctx, e_ct, mean_pt_pre)
-        e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
-                                max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
-        mean_pt_post = encoder.encode_double_vector(
-            ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
-        e_ct = phantom.add_plain(ctx, e_ct, mean_pt_post)
+        return phantom.sub_plain(ctx, e_ct, mean_pt)
 
-        # Mask + safety scale fused: mask zeros non-meaningful slots AND
-        # multiplies meaningful slots by safety_scale. This keeps the per-head
-        # sum after cross-block aggregation below Goldschmidt's (0, 2)
-        # convergence range. Folding the scale into the existing mask
-        # multiply is level-free vs a separate post-scale step.
-        safety_scale = max_abs_calib.get("softmax_safety_scale", 1.0) if max_abs_calib else 1.0
+    def _stage_c_post(e_ct, blk_size):
+        """mean-add + mask*safety_scale."""
+        mean_pt = encoder.encode_double_vector(
+            ctx, [_PRE_FINSMX_MEAN] * NUM_SLOTS, e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.add_plain(ctx, e_ct, mean_pt)
         e_nominal = e_ct.scale()
         mask_pt = qkt_irp_mask_scale_plaintext(
             ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
@@ -460,8 +453,55 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
         e_ct = phantom.rescale_to_next(ctx, e_ct)
         e_ct.set_scale(e_nominal)
+        return e_ct
 
-        e_blocks.append(e_ct)
+    n_blocks = len(score_blocks)
+    e_blocks = [None] * n_blocks
+    # Process blocks in PAIRS to share bootstrap_inplace calls.
+    pair_idx = 0
+    while pair_idx < n_blocks:
+        i = pair_idx
+        j = pair_idx + 1 if pair_idx + 1 < n_blocks else None
+
+        # ---- Stage A: mask + sub_C for each block in pair. ----
+        sb_i = _stage_a_premask(score_blocks[i], block_sizes[i])
+        if j is not None:
+            sb_j = _stage_a_premask(score_blocks[j], block_sizes[j])
+
+        # ---- Bootstrap before damped squarings (merge-paired). ----
+        if j is not None:
+            sb_i, sb_j = merge_bootstrap(
+                engine, ctx, encoder, sb_i, sb_j,
+                max_abs=_calib["scores"], slot_count=NUM_SLOTS,
+                galois_key=galois_key)
+        else:
+            sb_i = bootstrap_safe(engine, ctx, encoder, sb_i,
+                                    max_abs=_calib["scores"], slot_count=NUM_SLOTS)
+
+        # ---- Stage B: ps_exp + damped + mean-sub. ----
+        e_i = _stage_b_ps_exp(sb_i)
+        if j is not None:
+            e_j = _stage_b_ps_exp(sb_j)
+
+        # ---- Bootstrap after damped (NOT merge-paired here).
+        # Stage B e_ct enters at user_level = max_user_level (12 levels
+        # consumed by ps_exp + 4 damped squarings from a fresh stage-A
+        # bootstrap), leaving no level headroom for merge_bootstrap's
+        # pre-scale multiplies. Use separate bootstrap_safe — at max_abs
+        # = TARGET_MAG = 0.45 (< target_mag 0.49) it skips scaling and
+        # runs bootstrap_inplace directly with no level cost. ----
+        e_i = bootstrap_safe(engine, ctx, encoder, e_i,
+                               max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+        if j is not None:
+            e_j = bootstrap_safe(engine, ctx, encoder, e_j,
+                                   max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+
+        # ---- Stage C: mean-add + mask*safety_scale. ----
+        e_blocks[i] = _stage_c_post(e_i, block_sizes[i])
+        if j is not None:
+            e_blocks[j] = _stage_c_post(e_j, block_sizes[j])
+
+        pair_idx += 2
     _rec("attn_blocks", t0)
     if verbose:
         if safety_scale < 0.999:
