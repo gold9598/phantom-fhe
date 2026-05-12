@@ -941,7 +941,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # iteration so compute_layer_calib_n (when precomputed_calib is
         # None) reuses it without re-reading 1.9 GB from disk.
         if _stream_rp_indep and layer_idx not in wq_cache:
-            from blocks.scp_disk_cache import load_scp_dict_from_disk
+            from blocks.scp_disk_cache import load_scp_dict_from_disk, has_cache
             _t_stream0 = time.perf_counter()
             _layer_dir = os.path.join(rp_indep_disk_root,
                                        f"layer_{layer_idx:02d}")
@@ -954,17 +954,38 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             # Store the FULL dict so compute_layer_calib_n can reuse
             # without a second disk read.
             layer_weights[layer_idx] = _w_full_jit
-            _t_enc0 = time.perf_counter()
-            _tup_jit = encode_layer_irps(
-                ctx, encoder, _w_full_jit, R_P,
-                rp_indep_cache=rp_indep_cache, layer_idx=layer_idx)
-            _t_enc = time.perf_counter() - _t_enc0
-            wq_cache[layer_idx] = (None,) + tuple(_tup_jit[1:])
-            del _tup_jit, _sub
+            # Check the Wq disk cache: built by build_wq_disk_cache.py
+            # and keyed by (num_tokens, layer_idx). When hit, skip the
+            # ~5-7 s encode_layer_irps cost — just load diag_wq_irp
+            # from disk and splice it together with the rp_indep parts.
+            _wq_disk_layer = os.path.join(
+                os.path.dirname(rp_indep_disk_root),
+                "wq", f"nt_{num_tokens}", f"layer_{layer_idx:02d}")
+            if has_cache(_wq_disk_layer):
+                _t_wq_disk0 = time.perf_counter()
+                _wq_sub = load_scp_dict_from_disk(_wq_disk_layer)
+                diag_wq_irp = _wq_sub[layer_idx]
+                _t_wq_disk = time.perf_counter() - _t_wq_disk0
+                _t_enc = 0.0
+                _diag_wo, _diag_gate, _diag_up, _diag_down = rp_indep_cache[layer_idx]
+                wq_cache[layer_idx] = (None, diag_wq_irp, _diag_wo,
+                                         _diag_gate, _diag_up, _diag_down)
+                del _wq_sub
+                _wq_source = f"disk={_t_wq_disk:.1f}s"
+            else:
+                _t_enc0 = time.perf_counter()
+                _tup_jit = encode_layer_irps(
+                    ctx, encoder, _w_full_jit, R_P,
+                    rp_indep_cache=rp_indep_cache, layer_idx=layer_idx)
+                _t_enc = time.perf_counter() - _t_enc0
+                wq_cache[layer_idx] = (None,) + tuple(_tup_jit[1:])
+                del _tup_jit
+                _wq_source = f"encode={_t_enc:.1f}s"
+            del _sub
             if verbose or layer_idx == (min_layer if min_layer is not None else 0):
                 print(f"  [stream L={layer_idx:02d}: "
-                      f"disk={_t_disk:.1f}s w_load={_t_w:.1f}s "
-                      f"wq_enc={_t_enc:.1f}s total={time.perf_counter() - _t_stream0:.1f}s]")
+                      f"rp_disk={_t_disk:.1f}s w_load={_t_w:.1f}s "
+                      f"wq_{_wq_source} total={time.perf_counter() - _t_stream0:.1f}s]")
 
         # Per-layer real weights + IRP encoding (pre-encoded above)
         w = layer_weights[layer_idx]
