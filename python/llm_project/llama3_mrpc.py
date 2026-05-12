@@ -924,6 +924,64 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     layer_times = []
     y_p_fhe = None  # final hidden state at P (post-residual2 of last layer)
 
+    # Streaming pipeline: a background thread prefetches layer L+1's
+    # disk artifacts (rp_indep SCPs + full weight dict + wq IRPs) while
+    # the main thread runs FHE compute for layer L. With both disk
+    # caches populated, per-layer prep is ~5-8 s of disk reads while
+    # FHE compute is ~3-5 s, so wall-time becomes max(prep, compute).
+    if _stream_rp_indep:
+        import queue as _queue_mod
+        _stream_queue = _queue_mod.Queue(maxsize=1)
+        _stream_stop = threading.Event()
+        _stream_err = []
+
+        def _stream_producer():
+            from blocks.scp_disk_cache import (load_scp_dict_from_disk,
+                                                  has_cache)
+            for _L in range(NUM_DECODERS):
+                if _stream_stop.is_set():
+                    return
+                if min_layer is not None and _L < min_layer:
+                    continue
+                if max_layer is not None and _L > max_layer:
+                    break
+                try:
+                    _rp_dir = os.path.join(rp_indep_disk_root,
+                                            f"layer_{_L:02d}")
+                    _rp_sub = load_scp_dict_from_disk(_rp_dir)
+                    _rp_L = _rp_sub[_L]
+                    _w_L = _get_layer_w(_L)
+                    _wq_dir = os.path.join(
+                        os.path.dirname(rp_indep_disk_root),
+                        "wq", f"nt_{num_tokens}", f"layer_{_L:02d}")
+                    if has_cache(_wq_dir):
+                        _wq_sub = load_scp_dict_from_disk(_wq_dir)
+                        _diag_wq = _wq_sub[_L]
+                        _wo, _gate, _up, _down = _rp_L
+                        _tup_L = (None, _diag_wq, _wo, _gate, _up, _down)
+                    else:
+                        _raw = encode_layer_irps(
+                            ctx, encoder, _w_L, R_P,
+                            rp_indep_cache={_L: _rp_L}, layer_idx=_L)
+                        _tup_L = (None,) + tuple(_raw[1:])
+                    # block on full queue; honor stop event so we don't
+                    # deadlock when the main thread bails out
+                    while not _stream_stop.is_set():
+                        try:
+                            _stream_queue.put((_L, _w_L, _rp_L, _tup_L),
+                                                timeout=1.0)
+                            break
+                        except _queue_mod.Full:
+                            continue
+                except Exception as _e:
+                    _stream_err.append((_L, _e))
+                    _stream_stop.set()
+                    return
+
+        _producer_thread = threading.Thread(
+            target=_stream_producer, name="rp_indep-producer", daemon=True)
+        _producer_thread.start()
+
     for layer_idx in range(NUM_DECODERS):
         if min_layer is not None and layer_idx < min_layer:
             continue
@@ -941,51 +999,26 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # iteration so compute_layer_calib_n (when precomputed_calib is
         # None) reuses it without re-reading 1.9 GB from disk.
         if _stream_rp_indep and layer_idx not in wq_cache:
-            from blocks.scp_disk_cache import load_scp_dict_from_disk, has_cache
-            _t_stream0 = time.perf_counter()
-            _layer_dir = os.path.join(rp_indep_disk_root,
-                                       f"layer_{layer_idx:02d}")
-            _sub = load_scp_dict_from_disk(_layer_dir)
-            rp_indep_cache[layer_idx] = _sub[layer_idx]
-            _t_disk = time.perf_counter() - _t_stream0
-            _t_w0 = time.perf_counter()
-            _w_full_jit = _get_layer_w(layer_idx)
-            _t_w = time.perf_counter() - _t_w0
-            # Store the FULL dict so compute_layer_calib_n can reuse
-            # without a second disk read.
-            layer_weights[layer_idx] = _w_full_jit
-            # Check the Wq disk cache: built by build_wq_disk_cache.py
-            # and keyed by (num_tokens, layer_idx). When hit, skip the
-            # ~5-7 s encode_layer_irps cost — just load diag_wq_irp
-            # from disk and splice it together with the rp_indep parts.
-            _wq_disk_layer = os.path.join(
-                os.path.dirname(rp_indep_disk_root),
-                "wq", f"nt_{num_tokens}", f"layer_{layer_idx:02d}")
-            if has_cache(_wq_disk_layer):
-                _t_wq_disk0 = time.perf_counter()
-                _wq_sub = load_scp_dict_from_disk(_wq_disk_layer)
-                diag_wq_irp = _wq_sub[layer_idx]
-                _t_wq_disk = time.perf_counter() - _t_wq_disk0
-                _t_enc = 0.0
-                _diag_wo, _diag_gate, _diag_up, _diag_down = rp_indep_cache[layer_idx]
-                wq_cache[layer_idx] = (None, diag_wq_irp, _diag_wo,
-                                         _diag_gate, _diag_up, _diag_down)
-                del _wq_sub
-                _wq_source = f"disk={_t_wq_disk:.1f}s"
-            else:
-                _t_enc0 = time.perf_counter()
-                _tup_jit = encode_layer_irps(
-                    ctx, encoder, _w_full_jit, R_P,
-                    rp_indep_cache=rp_indep_cache, layer_idx=layer_idx)
-                _t_enc = time.perf_counter() - _t_enc0
-                wq_cache[layer_idx] = (None,) + tuple(_tup_jit[1:])
-                del _tup_jit
-                _wq_source = f"encode={_t_enc:.1f}s"
-            del _sub
+            # Producer-consumer pipeline: pop the prefetched data the
+            # background thread already loaded for this layer. The
+            # producer is one layer ahead so disk I/O overlapped the
+            # previous layer's FHE compute.
+            _t_wait0 = time.perf_counter()
+            _L_q, _w_q, _rp_q, _tup_q = _stream_queue.get()
+            _t_wait = time.perf_counter() - _t_wait0
+            assert _L_q == layer_idx, (
+                f"producer order mismatch: expected {layer_idx} got {_L_q}")
+            if _stream_err:
+                _ferr_L, _ferr_e = _stream_err[0]
+                raise RuntimeError(
+                    f"stream producer failed at L={_ferr_L}: "
+                    f"{type(_ferr_e).__name__}: {_ferr_e}")
+            layer_weights[layer_idx] = _w_q
+            rp_indep_cache[layer_idx] = _rp_q
+            wq_cache[layer_idx] = _tup_q
             if verbose or layer_idx == (min_layer if min_layer is not None else 0):
                 print(f"  [stream L={layer_idx:02d}: "
-                      f"rp_disk={_t_disk:.1f}s w_load={_t_w:.1f}s "
-                      f"wq_{_wq_source} total={time.perf_counter() - _t_stream0:.1f}s]")
+                      f"queue_wait={_t_wait:.1f}s]")
 
         # Per-layer real weights + IRP encoding (pre-encoded above)
         w = layer_weights[layer_idx]
@@ -1178,6 +1211,17 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             import gc as _gc
             _gc.collect()
             _malloc_trim()
+
+    # Signal producer to stop and reap the thread.
+    if _stream_rp_indep:
+        _stream_stop.set()
+        # Drain the queue in case producer is blocked on a put.
+        try:
+            while True:
+                _stream_queue.get_nowait()
+        except _queue_mod.Empty:
+            pass
+        _producer_thread.join(timeout=10)
 
     # ---- LM head (host-side)
     yes_logit, no_logit = yes_no_logits_np(y_p_fhe, final_norm_g, lm_head_yesno,
