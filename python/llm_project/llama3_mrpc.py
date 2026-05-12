@@ -931,9 +931,17 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     # FHE compute is ~3-5 s, so wall-time becomes max(prep, compute).
     if _stream_rp_indep:
         import queue as _queue_mod
-        _stream_queue = _queue_mod.Queue(maxsize=1)
+        # Prefetch depth. Each in-flight layer holds ~4.3 GB (2.3 GB
+        # rp_indep + 0.13 GB wq SCPs in pinned host + 1.9 GB full
+        # weight dict in numpy heap). Default 4 → ~17 GB peak buffer,
+        # fits comfortably in 62 GB (5090 dev) or 256 GB (A100 host).
+        # Override via STREAM_QUEUE_DEPTH env var; bump higher when the
+        # producer hits disk-I/O variance you want to absorb.
+        _qdepth = max(1, int(os.environ.get("STREAM_QUEUE_DEPTH", 4)))
+        _stream_queue = _queue_mod.Queue(maxsize=_qdepth)
         _stream_stop = threading.Event()
         _stream_err = []
+        print(f"[stream pipeline: prefetch_depth={_qdepth}]")
 
         def _stream_producer():
             from blocks.scp_disk_cache import (load_scp_dict_from_disk,
