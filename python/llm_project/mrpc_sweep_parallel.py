@@ -19,6 +19,7 @@ Output:
           fhe_yes, fhe_no, fhe_pred, time_sec, gpu_id
 """
 import argparse
+import collections
 import csv
 import os
 import sys
@@ -70,13 +71,56 @@ CSV_LOCK = threading.Lock()
 # layer weights. In a 408-MRPC sweep there are ~40 distinct num_tokens
 # values, so the same encoded IRPs are reused ~10x on average. Structure:
 #   SHARED_WQ_CACHE[num_tokens] -> {layer_idx -> tuple-from-encode_layer_irps}
+# Each num_tokens entry is ~4 GB pinned host (256 SCPs/layer * 32 layers).
+# To fit small-RAM boxes (e.g. 5090 dev box has 62 GB), the cache is
+# LRU-bounded by WQ_CACHE_MAX_RAM: when insertion would exceed the cap,
+# the least-recently-inserted entry is persisted to disk (if not already)
+# and dropped from RAM. Workers needing an evicted num_tokens reload it
+# from disk (via _wq_preload_from_disk at startup, or re-encode on miss).
+# Default cap 3 entries = ~12 GB RAM; raise via WQ_CACHE_MAX_RAM env var
+# on big-RAM boxes (e.g. 40 on 256 GB A100 host keeps everything resident).
+#
 # SHARED_WQ_CACHE_EVENTS[num_tokens] is a threading.Event() set by the
 # first thread that finishes encoding for that num_tokens; other threads
 # with the same num_tokens see the Event and wait. Lock guards the
 # "check / create Event / publish entry" sequence only — the heavy
 # encode call happens outside the lock so different num_tokens still
 # parallelize across GPUs.
-SHARED_WQ_CACHE = {}
+WQ_CACHE_MAX_RAM = int(os.environ.get("WQ_CACHE_MAX_RAM", 3))
+
+
+class _WqCacheLRU(collections.OrderedDict):
+    """LRU-bounded OrderedDict for SHARED_WQ_CACHE.
+
+    On `__setitem__`, if size > max_size, persist the least-recently-
+    inserted entry to disk (synchronous, via _evict_wq_to_disk) and pop
+    it. Caller must hold SHARED_WQ_CACHE_LOCK when mutating since the
+    disk save runs inside __setitem__.
+
+    Reads (`in`, `dict[key]`) are NOT lock-protected at the caller — they
+    rely on CPython dict atomicity. We deliberately do NOT move_to_end()
+    on reads so reads stay GIL-atomic and free of OrderedDict pointer
+    mutation. Recency reflects insertion order; each num_tokens is
+    encoded once then reused while still recent, so insertion-order LRU
+    matches the observed access pattern.
+    """
+
+    def __init__(self, max_size):
+        super().__init__()
+        self.max_size = max(1, max_size)
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        super().__setitem__(key, value)
+        while len(self) > self.max_size:
+            evicted_key, evicted_value = self.popitem(last=False)
+            _evict_wq_to_disk(evicted_key, evicted_value)
+
+
+SHARED_WQ_CACHE = _WqCacheLRU(WQ_CACHE_MAX_RAM)
 SHARED_WQ_CACHE_EVENTS = {}
 SHARED_WQ_CACHE_LOCK = threading.Lock()
 
@@ -360,6 +404,45 @@ def _wq_persist_if_new(num_tokens):
         print(f"  wq saved to disk: nt={num_tokens} -> {path}", flush=True)
     except Exception as e:
         print(f"  wq disk save failed for nt={num_tokens}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _evict_wq_to_disk(num_tokens, entry):
+    """Synchronous eviction callback for _WqCacheLRU.
+
+    Called from _WqCacheLRU.__setitem__ when the cache exceeds
+    WQ_CACHE_MAX_RAM. Persists the evicted entry to disk if not already
+    there, then returns so __setitem__ can drop it from RAM. If disk
+    cache is disabled, the entry is dropped silently — workers needing
+    that num_tokens later will pay a re-encode.
+
+    Runs under SHARED_WQ_CACHE_LOCK (caller of __setitem__ holds it).
+    Save cost (~5-10 s for 4 GB of SCPs) blocks other workers that are
+    trying to enter the lock, but in practice this only fires when a
+    fresh num_tokens enters a full cache, so the cumulative wall-time
+    impact is small.
+    """
+    if not _DISK_CACHE_ENABLED:
+        print(f"  [wq_cache] evicting nt={num_tokens} (disk cache off, "
+              f"dropping from RAM)", flush=True)
+        return
+    path = _wq_disk_path(num_tokens)
+    try:
+        from blocks.scp_disk_cache import save_scp_dict_to_disk, has_cache
+    except Exception as e:
+        print(f"  [wq_cache] eviction import failed for nt={num_tokens}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return
+    if has_cache(path):
+        print(f"  [wq_cache] evicting nt={num_tokens} (already on disk)",
+              flush=True)
+        return
+    try:
+        save_scp_dict_to_disk(_wq_extract_diagwq(entry), path)
+        print(f"  [wq_cache] evicting nt={num_tokens} -> persisted to {path}",
+              flush=True)
+    except Exception as e:
+        print(f"  [wq_cache] eviction save FAILED for nt={num_tokens}: "
               f"{type(e).__name__}: {e}", flush=True)
 
 
