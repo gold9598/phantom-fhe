@@ -822,7 +822,19 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 if max_layer is not None and _li > max_layer:
                     break
                 _w = _get_layer_w(_li)
-                layer_weights[_li] = _w
+                # Store only the small per-example-hot subset (Wq/Wk/Wv +
+                # g1/g2 used by encrypt_layer_inputs_multi & rmsnorm).
+                # The big matrices (Wo/Wgate/Wup/Wdown ~1.5 GB/layer) are
+                # already encoded into the wq_cache / rp_indep_cache; if
+                # the compute loop needs them again (compute_layer_calib_n
+                # when precomputed_calib is None), it reloads per-layer.
+                # Storing the full _w here piles up 32 * 1.9 GB = 60 GB
+                # Python heap and OOMs 62 GB boxes.
+                layer_weights[_li] = {
+                    k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2")
+                    if k in _w
+                }
+                del _w
                 _tup = encode_layer_irps(
                     ctx, encoder, _w, R_P,
                     rp_indep_cache=rp_indep_cache, layer_idx=_li)
@@ -834,6 +846,9 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             ev.set()
     if not _shared_hit and shared_wq_cache is None:
         # No shared cache: legacy local-only path.
+        # Store only the small per-example-hot subset; full weights are
+        # reloaded inside the compute loop per layer if needed
+        # (compute_layer_calib_n path).
         wq_cache = {}
         for _li in range(NUM_DECODERS):
             if min_layer is not None and _li < min_layer:
@@ -841,12 +856,16 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             if max_layer is not None and _li > max_layer:
                 break
             _w = _get_layer_w(_li)
-            layer_weights[_li] = _w
+            layer_weights[_li] = {
+                k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2") if k in _w
+            }
             wq_cache[_li] = encode_layer_irps(
                 ctx, encoder, _w, R_P,
                 rp_indep_cache=rp_indep_cache, layer_idx=_li)
+            del _w
     # On a shared-cache hit we still need per-layer weights for downstream
-    # (rmsnorm, lm_head, calib). Load them now without re-encoding IRPs.
+    # (rmsnorm, lm_head, calib). Load just the subset — full weights are
+    # reloaded per layer inside the compute loop if needed.
     if _shared_hit:
         for _li in range(NUM_DECODERS):
             if min_layer is not None and _li < min_layer:
@@ -854,7 +873,11 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             if max_layer is not None and _li > max_layer:
                 break
             if _li not in layer_weights:
-                layer_weights[_li] = _get_layer_w(_li)
+                _w = _get_layer_w(_li)
+                layer_weights[_li] = {
+                    k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2") if k in _w
+                }
+                del _w
     t_wq_encode = time.perf_counter() - t_wq_encode0
     print(f"[wq encode: {t_wq_encode:.1f}s]")
 
@@ -887,8 +910,15 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if precomputed_calib is not None:
             z1_l, z2_l, max_abs_calib = precomputed_calib[layer_idx]
         else:
+            # compute_layer_calib_n needs Wo/Wgate/Wup/Wdown which are NOT
+            # in our subset `w`. Reload the full weight dict per-layer
+            # and drop after calib so the heap doesn't grow to 60 GB
+            # across the 32-layer loop.
+            _w_full = load_layer_weights(layer_idx)
             z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
-                x_btd, w, cos_all, sin_all, num_tokens, P_local)
+                x_btd, _w_full, cos_all, sin_all, num_tokens, P_local)
+            del _w_full
+            import gc as _gc; _gc.collect()
         z1_min, z1_max = rms_z_window(z1_l)
         z2_min, z2_max = rms_z_window(z2_l)
         rms1_p = _make_rms_params_local(z1_min, z1_max)
