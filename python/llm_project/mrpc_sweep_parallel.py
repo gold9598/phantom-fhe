@@ -291,7 +291,40 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
                   f"{time.perf_counter() - t0:.1f}s", flush=True)
             return cache
 
-    # Parallel encode: spawn N worker threads, one per GPU.
+    # No disk cache: build in a subprocess for memory isolation.
+    # The in-process build path (32 back-to-back encodes with no compute
+    # breaks) caused glibc + pinned-host memory growth to ~60 GB on the
+    # 62 GB 5090 box, OOMing. Subprocess isolation means all build-time
+    # allocations die with the child; parent loads cleanly from disk.
+    if rp_path and _DISK_CACHE_ENABLED:
+        import multiprocessing
+        print(f"  rp_indep cache missing on disk; building in subprocess "
+              f"(memory isolation)...", flush=True)
+        t_sub0 = time.perf_counter()
+        mp_ctx = multiprocessing.get_context("spawn")
+        p = mp_ctx.Process(target=_rp_indep_build_subprocess_main,
+                            args=(_DISK_CACHE_ROOT, 0, num_decoders, True))
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"rp_indep build subprocess exited with code {p.exitcode}")
+        print(f"  rp_indep subprocess done in "
+              f"{time.perf_counter() - t_sub0:.1f}s; loading from disk...",
+              flush=True)
+        t_load0 = time.perf_counter()
+        cache = load_scp_dict_from_disk(rp_path)
+        missing = [L for L in range(num_decoders) if L not in cache]
+        if missing:
+            raise RuntimeError(
+                f"rp_indep subprocess produced incomplete cache; "
+                f"missing layers: {missing[:5]}..")
+        print(f"  rp_indep loaded from disk ({len(cache)} layers) in "
+              f"{time.perf_counter() - t_load0:.1f}s", flush=True)
+        return cache
+
+    # Fallback in-process build path (only when --no-disk-cache is set):
+    # parallel encode across worker threads, one per GPU.
     cache = {}
     cache_lock = threading.Lock()
     num_engines = len(engines)
@@ -485,6 +518,67 @@ def _evict_wq_to_disk(num_tokens, entry):
     except Exception as e:
         print(f"  [wq_cache] eviction save FAILED for nt={num_tokens}: "
               f"{type(e).__name__}: {e}", flush=True)
+
+
+def _rp_indep_build_subprocess_main(disk_root, gpu_id, num_decoders,
+                                      pack_gate_up=True):
+    """Subprocess entry point: build the rp_indep cache from scratch and
+    save it to {disk_root}/rp_indep.
+
+    Runs in a CHILD process so all allocations (pinned host SCPs, glibc
+    heap fragmentation from numpy temporaries in _build_irp_slots, GPU
+    pool retention) die with the child. The parent then loads the SCPs
+    from disk into its own freshly-allocated pinned host memory — no
+    inherited fragmentation, no leaked slabs.
+
+    This is the architectural answer to the 62 GB box hitting ~60 GB
+    during in-process build: subprocess isolation rather than chasing
+    individual allocator pathologies.
+    """
+    # Pin this child to one GPU and re-import everything inside the
+    # child (spawn start method can't pickle module-level closures).
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    sys.path.insert(0, _THIS_DIR)
+    sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
+    import gc
+    import pyPhantom as phantom_child  # noqa: F401 — same module, fresh handle
+    from llama3 import load_layer_weights, encode_layer_rp_indep_irps
+    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from blocks.scp_disk_cache import save_scp_dict_to_disk
+
+    print(f"  [rp_indep-subproc] PID={os.getpid()} GPU={gpu_id} "
+          f"building engine...", flush=True)
+    t_eng0 = time.perf_counter()
+    user_steps, step_categories = build_user_steps_mrpc()
+    engine = setup_engine(user_steps, step_categories=step_categories)
+    ctx = engine.context()
+    encoder = engine.encoder()
+    print(f"  [rp_indep-subproc] engine built in "
+          f"{time.perf_counter() - t_eng0:.1f}s", flush=True)
+
+    cache = {}
+    t_build0 = time.perf_counter()
+    for L in range(num_decoders):
+        t0 = time.perf_counter()
+        w = load_layer_weights(L)
+        result = encode_layer_rp_indep_irps(ctx, encoder, w,
+                                             pack_gate_up=pack_gate_up)
+        cache[L] = result
+        elapsed = time.perf_counter() - t0
+        print(f"  [rp_indep-subproc] cached layer {L:02d}  ({elapsed:.1f}s)",
+              flush=True)
+        del w, result
+        gc.collect()
+        _malloc_trim()
+
+    rp_path = os.path.join(disk_root, "rp_indep")
+    t_save0 = time.perf_counter()
+    print(f"  [rp_indep-subproc] saving to {rp_path}...", flush=True)
+    save_scp_dict_to_disk(cache, rp_path)
+    print(f"  [rp_indep-subproc] built {num_decoders} layers in "
+          f"{time.perf_counter() - t_build0 - (time.perf_counter() - t_save0):.1f}s "
+          f"+ saved in {time.perf_counter() - t_save0:.1f}s. Exiting.",
+          flush=True)
 
 
 def _ptref_prewarm_subprocess_main(miss_specs, gpu_id):
