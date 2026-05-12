@@ -102,7 +102,7 @@ def _compute_metrics():
 
 def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
               run_classifier_fhe, capture_pytorch_ref_cached, P_local_fn,
-              rp_indep_cache, engine):
+              rp_indep_cache, engine, rp_indep_disk_root=None):
     row = ds[idx]
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
                   "Sentence 1: {s1}\nSentence 2: {s2}\n"
@@ -121,7 +121,8 @@ def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}",
         debug_layer=None, max_layer=None, min_layer=None,
-        rp_indep_cache=rp_indep_cache, engine=engine)
+        rp_indep_cache=rp_indep_cache, engine=engine,
+        rp_indep_disk_root=rp_indep_disk_root)
     elapsed = time.perf_counter() - t0
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     return {
@@ -181,18 +182,36 @@ def main():
           flush=True)
     engine = setup_engine(user_steps, step_categories=step_categories)
 
-    # Per-layer R_P-independent IRP cache (Wo, gate+up packed, Wdown). First
-    # example populates it (~14s/layer × 32 = ~7.5 min one-time cost);
-    # subsequent examples skip re-encoding (~14s/layer = ~7.5 min saved).
-    # Total host RAM: ~3GB/layer × 32 = ~96GB. Requires 128GB+ RAM box.
+    # Per-layer R_P-independent IRP cache (Wo, gate+up packed, Wdown).
+    #
+    # On big-RAM hosts: First example populates rp_indep_cache in-process
+    # (~14s/layer × 32 = ~7.5 min one-time cost) holding ~73 GB pinned host,
+    # subsequent examples reuse. Requires 128GB+ RAM.
+    #
+    # On small-RAM hosts (e.g. 5090 dev box, 62 GB): set rp_indep_disk_root
+    # to the per-layer cache produced by build_disk_cache.py. The cache
+    # is streamed from disk per-layer inside run_classifier_fhe: load
+    # layer L's SCPs → encode wq → compute → drop. Peak in-RAM cost
+    # stays at ~3-5 GB instead of 73 GB.
     rp_indep_cache = {}
+    _disk_root = os.path.join(_REPO, "cache", "rp_indep")
+    _disk_manifest = os.path.join(_disk_root, "MANIFEST.json")
+    if os.path.exists(_disk_manifest):
+        rp_indep_disk_root = _disk_root
+        print(f"Streaming rp_indep from disk: {_disk_root}", flush=True)
+    else:
+        rp_indep_disk_root = None
+        print(f"No disk cache at {_disk_root}; rp_indep will be built "
+              f"in-process on the first example (requires 100+ GB host RAM)",
+              flush=True)
 
     for k, idx in enumerate(todo):
         try:
             print(f"\n[{k+1}/{len(todo)}] idx={idx}...", flush=True)
             row = _run_one(idx, tok, ds, None, cos_all_full, sin_all_full,
                             run_classifier_fhe, _ptref_cached, None,
-                            rp_indep_cache, engine)
+                            rp_indep_cache, engine,
+                            rp_indep_disk_root=rp_indep_disk_root)
             _append_row(row)
             agree_str = " (agree)" if row["fhe_pred"] == row["pt_pred"] else " (DISAGREE)"
             print(f"  idx={idx}: PT={row['pt_pred']} FHE={row['fhe_pred']}"

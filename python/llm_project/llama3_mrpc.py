@@ -7,11 +7,33 @@ sanity check: [BOS, "The", " quick", " brown"] (4 tokens).
 
 3b-f-2 will scale to NUM_TOKENS=64 (n_blocks=8) on a real MRPC prompt.
 """
+import ctypes
 import json
 import math
+import os
 import sys
 import threading
 import time
+
+# libc.malloc_trim helper for the streaming-rp_indep path. Phantom's
+# cudaMallocHost pages live OUTSIDE glibc, but per-layer numpy
+# temporaries in _build_irp_slots and astype copies DO go through
+# glibc, and on a 62 GB box they accumulate uncoalesced free chunks
+# fast enough to push RSS past the ceiling between layers.
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+    _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+    _LIBC.malloc_trim.restype = ctypes.c_int
+except Exception:
+    _LIBC = None
+
+
+def _malloc_trim():
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
 
 import numpy as np
 
@@ -656,7 +678,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                          shared_wq_cache=None, shared_wq_cache_events=None,
                          shared_wq_cache_lock=None,
                          preloaded_weights=None,
-                         precomputed_calib=None):
+                         precomputed_calib=None,
+                         rp_indep_disk_root=None):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -770,7 +793,22 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     t_wq_encode0 = time.perf_counter()
     layer_weights = {}  # layer_idx -> w (cache weight loads too)
     _shared_hit = False
-    if shared_wq_cache is not None and num_tokens in shared_wq_cache:
+    _stream_rp_indep = False
+    # Streaming mode: when rp_indep_disk_root is set, skip the upfront
+    # 32-layer build pass entirely. Each layer's IRPs are loaded from
+    # disk and encoded just before that layer's compute, then dropped
+    # immediately after. Keeps peak host RSS bounded to ~5 GB instead
+    # of ~73 GB on small-RAM boxes (the 62 GB 5090).
+    if rp_indep_disk_root is not None:
+        assert shared_wq_cache is None, (
+            "rp_indep_disk_root incompatible with shared_wq_cache "
+            "(streaming + cross-thread sharing don't mix)")
+        wq_cache = {}
+        _stream_rp_indep = True
+        t_wq_encode = time.perf_counter() - t_wq_encode0
+        print(f"[wq encode: streaming-rp_indep mode, no upfront build "
+              f"(setup {t_wq_encode:.1f}s)]")
+    elif shared_wq_cache is not None and num_tokens in shared_wq_cache:
         wq_cache = shared_wq_cache[num_tokens]
         _shared_hit = True
         print(f"[wq encode: HIT shared_wq_cache nt={num_tokens}]")
@@ -844,7 +882,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 wq_cache[_li] = (None,) + tuple(_tup[1:])
             shared_wq_cache[num_tokens] = wq_cache
             ev.set()
-    if not _shared_hit and shared_wq_cache is None:
+    if not _shared_hit and shared_wq_cache is None and not _stream_rp_indep:
         # No shared cache: legacy local-only path.
         # Store only the small per-example-hot subset; full weights are
         # reloaded inside the compute loop per layer if needed
@@ -878,8 +916,9 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                     k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2") if k in _w
                 }
                 del _w
-    t_wq_encode = time.perf_counter() - t_wq_encode0
-    print(f"[wq encode: {t_wq_encode:.1f}s]")
+    if not _stream_rp_indep:
+        t_wq_encode = time.perf_counter() - t_wq_encode0
+        print(f"[wq encode: {t_wq_encode:.1f}s]")
 
     print(f"\nRunning {NUM_DECODERS} decoder layers...")
     layer_times = []
@@ -895,6 +934,38 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         verbose = (debug_layer is not None and layer_idx == debug_layer)
         x_btd = pytorch_ref[layer_idx]  # (NUM_TOKENS, D_MODEL) — input to layer L
 
+        # Streaming mode: JIT-load this layer's rp_indep SCPs from disk,
+        # then encode wq, just before we need it. Dropped at the end of
+        # this iteration. Keeps host RSS bounded to one layer's worth.
+        # We keep the FULL weight dict (not just the subset) for one
+        # iteration so compute_layer_calib_n (when precomputed_calib is
+        # None) reuses it without re-reading 1.9 GB from disk.
+        if _stream_rp_indep and layer_idx not in wq_cache:
+            from blocks.scp_disk_cache import load_scp_dict_from_disk
+            _t_stream0 = time.perf_counter()
+            _layer_dir = os.path.join(rp_indep_disk_root,
+                                       f"layer_{layer_idx:02d}")
+            _sub = load_scp_dict_from_disk(_layer_dir)
+            rp_indep_cache[layer_idx] = _sub[layer_idx]
+            _t_disk = time.perf_counter() - _t_stream0
+            _t_w0 = time.perf_counter()
+            _w_full_jit = _get_layer_w(layer_idx)
+            _t_w = time.perf_counter() - _t_w0
+            # Store the FULL dict so compute_layer_calib_n can reuse
+            # without a second disk read.
+            layer_weights[layer_idx] = _w_full_jit
+            _t_enc0 = time.perf_counter()
+            _tup_jit = encode_layer_irps(
+                ctx, encoder, _w_full_jit, R_P,
+                rp_indep_cache=rp_indep_cache, layer_idx=layer_idx)
+            _t_enc = time.perf_counter() - _t_enc0
+            wq_cache[layer_idx] = (None,) + tuple(_tup_jit[1:])
+            del _tup_jit, _sub
+            if verbose or layer_idx == (min_layer if min_layer is not None else 0):
+                print(f"  [stream L={layer_idx:02d}: "
+                      f"disk={_t_disk:.1f}s w_load={_t_w:.1f}s "
+                      f"wq_enc={_t_enc:.1f}s total={time.perf_counter() - _t_stream0:.1f}s]")
+
         # Per-layer real weights + IRP encoding (pre-encoded above)
         w = layer_weights[layer_idx]
         Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
@@ -909,11 +980,16 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # touches Wq/Wk/Wv/g1/g2 directly.
         if precomputed_calib is not None:
             z1_l, z2_l, max_abs_calib = precomputed_calib[layer_idx]
+        elif _stream_rp_indep:
+            # In streaming mode `w` is the FULL weight dict (kept alive for
+            # this iteration), so calib uses it directly — no second disk
+            # read. The streaming-end block below drops it.
+            z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
+                x_btd, w, cos_all, sin_all, num_tokens, P_local)
         else:
-            # compute_layer_calib_n needs Wo/Wgate/Wup/Wdown which are NOT
-            # in our subset `w`. Reload the full weight dict per-layer
-            # and drop after calib so the heap doesn't grow to 60 GB
-            # across the 32-layer loop.
+            # Non-streaming legacy path: layer_weights[layer_idx] is the
+            # subset; reload the full dict per-layer and drop after calib
+            # so the heap doesn't grow to 60 GB across the 32-layer loop.
             _w_full = load_layer_weights(layer_idx)
             z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
                 x_btd, _w_full, cos_all, sin_all, num_tokens, P_local)
@@ -1068,6 +1144,19 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
               f"[encrypt={t_encrypt*1000:.0f}ms decrypt={t_decrypt*1000:.0f}ms "
               f"fhe={t_fhe_ms:.0f}ms]")
         y_p_fhe = y_p
+
+        # Streaming mode: drop this layer's IRPs + raw weights so the
+        # pinned-host SCPs (~2.3 GB) and Python heap go back to the OS
+        # before the next layer's load. malloc_trim returns glibc
+        # uncoalesced free chunks; Phantom SCP destructors release
+        # cudaMallocHost-pinned pages directly.
+        if _stream_rp_indep:
+            wq_cache.pop(layer_idx, None)
+            rp_indep_cache.pop(layer_idx, None)
+            layer_weights.pop(layer_idx, None)
+            import gc as _gc
+            _gc.collect()
+            _malloc_trim()
 
     # ---- LM head (host-side)
     yes_logit, no_logit = yes_no_logits_np(y_p_fhe, final_norm_g, lm_head_yesno,
