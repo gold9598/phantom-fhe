@@ -21,12 +21,41 @@ Output:
 import argparse
 import collections
 import csv
+import ctypes
 import os
 import sys
 import threading
 import time
 
+# Limit glibc malloc arenas to reduce fragmentation. Default is 8 * NCPU
+# arenas, each retaining un-coalesced free chunks; on the rp_indep cache
+# build (32 back-to-back encodes of ~2 GB transient numpy per layer with
+# no compute breaks) this caused RSS to balloon to ~60 GB even though
+# live data only summed to ~28 GB, OOM'ing 62 GB boxes. Must be set
+# BEFORE any allocations / numpy import to take effect.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
 import numpy as np
+
+# Module-level libc handle for malloc_trim() — used after each rp_indep
+# layer encode to return freed glibc heap pages to the OS. None if libc
+# can't be loaded (non-Linux); callers handle the None case.
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+    _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+    _LIBC.malloc_trim.restype = ctypes.c_int
+except Exception:
+    _LIBC = None
+
+
+def _malloc_trim():
+    """Ask glibc to release uncoalesced free chunks back to the OS.
+    No-op on systems where libc.so.6 is unavailable."""
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
 
 # Resolve build/lib and llm_project paths relative to this file so the script
 # runs on any host without modification (5090 dev box, A6000/A100 sweep box).
@@ -294,6 +323,7 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
             # (mid-cache) on a 62 GB box.
             del w, result
             gc.collect()
+            _malloc_trim()
 
     threads = []
     for gpu_id in range(num_engines):
