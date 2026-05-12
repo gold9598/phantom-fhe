@@ -87,23 +87,48 @@ ensure_probe
 # lazily during the first example's FHE compute, interleaving each
 # encode with ~15 s of GPU work so the allocator can release pressure.
 # Override with PARALLEL=1 to force the parallel path anyway.
+#
+# Also pre-warm the PT-ref disk cache in a subprocess BEFORE the sweep.
+# Without this the simple sweep loads HF model per-example, and
+# PyTorch's caching allocator retains ~15 GB on GPU 0 after `del`,
+# which on a 32 GB 5090 + 13 GB CKKS engine + FHE working set OOMs
+# the GPU silently (CUDA error eats the Python frame, no traceback).
+# Skip prewarm with SKIP_PREWARM=1.
 if [[ "${PARALLEL:-0}" == "1" ]]; then
     CMD="$PYTHON -u python/llm_project/mrpc_sweep_parallel.py --start $START --end $END --num-gpus $NUM_GPUS"
 else
-    CMD="$PYTHON -u python/llm_project/mrpc_sweep.py --start $START --end $END"
+    PREWARM_CMD="$PYTHON -u python/llm_project/prewarm_ptref.py --start $START --end $END"
+    if [[ "${SKIP_PREWARM:-0}" == "1" ]]; then
+        CMD="$PYTHON -u python/llm_project/mrpc_sweep.py --start $START --end $END"
+    else
+        CMD="$PREWARM_CMD && $PYTHON -u python/llm_project/mrpc_sweep.py --start $START --end $END"
+    fi
 fi
 
 if [[ "${1:-}" == "--background" ]]; then
     : > "$LOG"
+    # Write the sweep command into a wrapper script. Avoids fragile
+    # double-vs-single quoting through `tmux new-session "..."` (the
+    # previous attempt left `$?` un-expanded in the log, so we never
+    # saw the real exit code).
+    WRAPPER=$(mktemp /tmp/run_mrpc_5090_wrapper.XXXXXX.sh)
+    cat > "$WRAPPER" <<EOF
+#!/usr/bin/env bash
+cd "$SCRIPT_DIR"
+stdbuf -oL -eL $CMD 2>&1 | tee -a "$LOG"
+rc=\${PIPESTATUS[0]}
+echo "[sweep exited rc=\$rc]" | tee -a "$LOG"
+sleep 600
+EOF
+    chmod +x "$WRAPPER"
     echo "[run_mrpc_5090] launching in tmux session '$SESSION', log: $LOG"
-    echo "[run_mrpc_5090] using parallel sweep code with NUM_GPUS=$NUM_GPUS"
-    tmux new-session -d -s "$SESSION" \
-        "cd '$SCRIPT_DIR' && stdbuf -oL -eL $CMD 2>&1 | tee -a '$LOG'; echo '[sweep exited rc=\$?]' | tee -a '$LOG'; sleep 600"
+    echo "[run_mrpc_5090] wrapper: $WRAPPER"
+    tmux new-session -d -s "$SESSION" "$WRAPPER"
     echo "[run_mrpc_5090] tmux session live"
     echo "[run_mrpc_5090] monitor:  ./run_mrpc_5090.sh --status"
     echo "[run_mrpc_5090] attach:   ./run_mrpc_5090.sh --attach   (Ctrl-b d to detach)"
     echo "[run_mrpc_5090] stop:     ./run_mrpc_5090.sh --stop"
 else
     echo "[run_mrpc_5090] launching in foreground"
-    $CMD 2>&1 | tee "$LOG"
+    eval "$CMD" 2>&1 | tee "$LOG"
 fi
