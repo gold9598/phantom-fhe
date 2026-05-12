@@ -269,6 +269,7 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
 
     def _worker_encode_layers(gpu_id, engine):
         """Worker thread: encode assigned layers on gpu_id."""
+        import gc
         phantom.set_cuda_device(gpu_id)
         ctx = engine.context()
         encoder = engine.encoder()
@@ -283,6 +284,16 @@ def _build_shared_rp_indep_cache(engines, num_decoders,
                 cache[L] = result
                 print(f"  cached layer {L:02d} on gpu{gpu_id}  "
                       f"({elapsed:.1f}s)", flush=True)
+            # Force-release the layer's fp64 weight matrices and any
+            # numpy temporaries (Wgate_pad / Wup_pad / Wdown_pad created
+            # inside encode_layer_rp_indep_irps). Without this, Python's
+            # generational GC lets the previous layer's ~1.9 GB linger
+            # while the next layer's weights are loaded, and glibc malloc
+            # quickly fragments under the resulting allocation churn —
+            # per-layer encode time grows from ~13 s (early) to ~60 s
+            # (mid-cache) on a 62 GB box.
+            del w, result
+            gc.collect()
 
     threads = []
     for gpu_id in range(num_engines):
