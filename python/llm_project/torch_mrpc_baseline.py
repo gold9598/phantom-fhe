@@ -69,7 +69,7 @@ def main():
     print(f"Loading model (fp16) onto cuda:0...")
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, dtype=torch.float16, device_map="cuda:0")
+        MODEL_NAME, torch_dtype=torch.float16, device_map="cuda:0")
     model.eval()
     print(f"  model loaded in {time.time()-t0:.1f}s")
 

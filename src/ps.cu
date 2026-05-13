@@ -39,8 +39,17 @@ namespace phantom {
             ct.set_scale(nominal);
         }
 
-        // Add scalar `c` in <=0.1 pieces via add_plain (no chain change).
+        // Add scalar `c` in <=100.0 pieces via add_plain (no chain change).
         // Encodes each piece at ct.scale() so phantom's scale-match check passes.
+        // Threshold was 0.1 historically (for tiny eps adds in rmsnorm where
+        // encoding a value < precision_floor would otherwise round to zero),
+        // but the PS evaluator for high-degree polynomial fits passes chunk
+        // constants on the order of 10^4 — splitting those into 10^5 pieces
+        // dominated runtime (a deg=20 silu evaluation took 229s, ~750k splits).
+        // CKKS encoding precision at SCALE=2^40 is ~10^-13 absolute, so
+        // encoding a value of magnitude 100 in one piece has the same
+        // precision as 1000 pieces of 0.1. The larger threshold is safe for
+        // any value below ~10^10 (well below 60-bit prime).
         void add_scalar_split_inplace(
                 const PhantomContext &ctx,
                 PhantomCKKSEncoder &encoder,
@@ -48,7 +57,7 @@ namespace phantom {
                 double scalar) {
             if (scalar == 0.0) return;
             const double abs_v = std::fabs(scalar);
-            std::size_t pieces = static_cast<std::size_t>(std::ceil(abs_v / 0.1));
+            std::size_t pieces = static_cast<std::size_t>(std::ceil(abs_v / 100.0));
             if (pieces < 1) pieces = 1;
             const double piece = scalar / static_cast<double>(pieces);
             for (std::size_t i = 0; i < pieces; ++i) {

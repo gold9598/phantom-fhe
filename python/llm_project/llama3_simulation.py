@@ -121,7 +121,7 @@ def rope_matrix_np(cos_p, sin_p):
 
 def _re_encrypt_slots(ctx, encoder, sk, slots, chain_index, scale=SCALE):
     return sk.encrypt_symmetric(
-        ctx, encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index))
+        ctx, encoder.encode_double_vector(ctx, slots, scale, chain_index))
 
 def relayout_periodic_to_irp(ctx, encoder, sk, ct, d_periodic, d_irp,
                               chain_index, scale=SCALE):
@@ -204,7 +204,7 @@ def fhe_attention_irp(ctx, encoder, sk, relin_key,
         for h in range(N_HEADS):
             sub_mask[tt * D_TOTAL + h * D_HEAD] = c_per_head[h]
     sub_pt = encoder.encode_double_vector(
-        ctx, sub_mask.tolist(), scores_ct.scale(), scores_ct.chain_index())
+        ctx, sub_mask, scores_ct.scale(), scores_ct.chain_index())
     scores_ct = phantom.sub_plain(ctx, scores_ct, sub_pt)
 
     damps = softmax_damping_schedule(NUM_SQUARINGS, NUM_TOKENS, EXTRA_SCALE, TARGET_MAG)
@@ -219,7 +219,7 @@ def fhe_attention_irp(ctx, encoder, sk, relin_key,
             mask_arr[tt * D_TOTAL + h * D_HEAD] = 1.0
     e_nominal = e_ct.scale()
     mask_pt = encoder.encode_double_vector(
-        ctx, mask_arr.tolist(), SCALE, e_ct.chain_index())
+        ctx, mask_arr, SCALE, e_ct.chain_index())
     e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
     e_ct = phantom.rescale_to_next(ctx, e_ct)
     e_ct.set_scale(e_nominal)
@@ -239,7 +239,7 @@ def fhe_attention_irp(ctx, encoder, sk, relin_key,
     b0 = np.zeros(NUM_SLOTS, dtype=np.float64)
     b0[:D_TOTAL] = 1.0
     b0_pt = encoder.encode_double_vector(
-        ctx, b0.tolist(), SCALE, attn_h.chain_index())
+        ctx, b0, SCALE, attn_h.chain_index())
     attn_h = phantom.multiply_plain(ctx, attn_h, b0_pt)
     attn_h = phantom.rescale_to_next(ctx, attn_h)
     attn_h = phantom.replicate(ctx, galois_key, attn_h, D_TOTAL, NUM_SLOTS)
@@ -510,9 +510,9 @@ def main():
         k_slots[base:base+D_TOTAL] = K_full[tt]
         v_slots[base:base+D_TOTAL] = V_full[tt]
     # All inputs at chain 1 (fresh). rmsnorm uses the chain-1 SDPA bundle.
-    x_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, x_slots.tolist(), SCALE, 1))
-    k_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, k_slots.tolist(), SCALE, 1))
-    v_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, v_slots.tolist(), SCALE, 1))
+    x_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, x_slots, SCALE, 1))
+    k_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, k_slots, SCALE, 1))
+    v_ct = sk.encrypt_symmetric(ctx, encoder.encode_double_vector(ctx, v_slots, SCALE, 1))
 
     # ---- Pre-encode FHE weights (IRP) ----
     print("Encoding IRP weights...")

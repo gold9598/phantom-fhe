@@ -68,7 +68,7 @@ def _check_dims(N: int, d: int) -> tuple:
 
 def _encode_slots_pt(ctx, encoder, slots: np.ndarray, scale: float, chain_index: int):
     """Encode a float64 slot array as a plaintext at the given chain/scale."""
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 def _encode_zero_pt(ctx, encoder, N: int, scale: float, chain_index: int):

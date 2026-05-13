@@ -91,7 +91,9 @@ def encode_irp_diagonals(
     G = K // M
 
     slot_arrays = _build_irp_slots(matrix, N, d, t, K, M, G, dtype=np.float64)
-    return [encoder.encode_double_vector(ctx, s.tolist(), scale, chain_index)
+    # Pass numpy arrays directly — the C++ binding has a numpy fast path that
+    # avoids the GIL-held per-element tolist() marshalling.
+    return [encoder.encode_double_vector(ctx, s, scale, chain_index)
             for s in slot_arrays]
 
 
@@ -121,7 +123,10 @@ def encode_irp_diagonals_host(
     G = K // M
 
     slot_arrays = _build_irp_slots(matrix, N, d, t, K, M, G, dtype=complex)
-    return [phantom.encode_single_chain_plaintext(ctx, encoder, s.tolist(), scale)
+    # Pass numpy complex arrays directly — avoids the GIL-held tolist()
+    # marshalling that previously dominated the Wq IRP pre-encode phase
+    # (~50 ms per call × 256 SCPs × 32 layers = ~6 min per worker).
+    return [phantom.encode_single_chain_plaintext(ctx, encoder, s, scale)
             for s in slot_arrays]
 
 
@@ -324,7 +329,7 @@ def encode_irp_mask(
     t, _ = _check_dims(N, d)
     slots = np.zeros(N, dtype=np.float64)
     slots[::t][:d] = 1.0
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +471,7 @@ def encrypt_irp_input(
         raise ValueError(f"encrypt_irp_input: a must have shape ({d},), got {a.shape}")
     slots = np.zeros(N, dtype=np.float64)
     slots[::t][:d] = a  # only first d strided positions
-    pt = encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    pt = encoder.encode_double_vector(ctx, slots, scale, chain_index)
     return sk.encrypt_symmetric(ctx, pt)
 
 
@@ -618,7 +623,7 @@ def encode_irp_output_mask_wide(
     t_out = N // d_out
     slots = np.zeros(N, dtype=np.float64)
     slots[::t_out][:d_out] = 1.0
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 def irp_required_steps_rect(
@@ -697,7 +702,7 @@ def encrypt_irp_input_rect(
     for q in range(alpha):
         for i in range(d):
             slots[i * t + q * t_prime] = a[i + q * d]
-    pt = encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    pt = encoder.encode_double_vector(ctx, slots, scale, chain_index)
     return sk.encrypt_symmetric(ctx, pt)
 
 
@@ -821,3 +826,94 @@ def irp_matvec_rect(
         else:
             out = phantom.add(ctx, out, sub_q)
     return out
+
+
+def encode_irp_diagonals_rect_pair_host(
+    ctx,
+    encoder,
+    matrix_real: np.ndarray,
+    matrix_imag: np.ndarray,
+    N: int,
+    d_in: int,
+    d_out: int,
+    scale: float,
+    baby_steps: int = 1,
+) -> List:
+    """Pack two real rect matrices into one complex IRP plaintext set.
+
+    `matrix_real` becomes the real part, `matrix_imag` the imag part of
+    each slot. A subsequent irp_matvec_host call multiplies a real-only
+    ciphertext by these complex plaintexts and accumulates a complex-
+    valued result: re(result) = matrix_real @ x, im(result) = matrix_imag @ x.
+
+    Halves the number of plaintexts vs encoding the two matrices
+    separately (since both share the same diagonal indexing). Halves
+    the matvec multiplication count for the pair.
+
+    Both matrices must have the same (d_in, d_out) shape; alpha sub-blocks
+    are folded by the rect encoder identically for both.
+    """
+    if matrix_real.shape != matrix_imag.shape:
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: shape mismatch "
+                         f"{matrix_real.shape} vs {matrix_imag.shape}")
+    if matrix_real.shape != (d_in, d_out):
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: matrices must be "
+                         f"({d_in}, {d_out}), got {matrix_real.shape}")
+    if d_in == d_out:
+        raise ValueError("encode_irp_diagonals_rect_pair_host: d_in == d_out -- use "
+                         "square pair variant instead")
+    d = min(d_in, d_out)
+    alpha = max(d_in, d_out) // d
+    _check_rect_dims(N, d, alpha)
+    t, K = _check_dims(N, d)
+    M = baby_steps
+    if not _is_pow2(M):
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: baby_steps must be power of 2, got {M}")
+    if K % M != 0:
+        raise ValueError(f"encode_irp_diagonals_rect_pair_host: baby_steps={M} must divide K={K}")
+    G = K // M
+
+    plaintexts = []
+    for q in range(alpha):
+        slice_axis = slice(None, None)
+        if d_in < d_out:
+            W_q_real = matrix_real[:, q * d:(q + 1) * d]
+            W_q_imag = matrix_imag[:, q * d:(q + 1) * d]
+        else:
+            W_q_real = matrix_real[q * d:(q + 1) * d, :]
+            W_q_imag = matrix_imag[q * d:(q + 1) * d, :]
+        slots_real = _build_irp_slots(W_q_real, N, d, t, K, M, G, dtype=complex)
+        slots_imag = _build_irp_slots(W_q_imag, N, d, t, K, M, G, dtype=complex)
+        for sr, si in zip(slots_real, slots_imag):
+            # Combine: real part from sr (already real-only), imag from si.real.
+            combined = sr.real + 1j * si.real
+            # Pass numpy complex array directly — fast path via binding's
+            # numpy overload (no Python iteration of 65K complex objects).
+            plaintexts.append(phantom.encode_single_chain_plaintext(
+                ctx, encoder, combined, scale))
+    return plaintexts
+
+
+def extract_real_imag_pair(ctx, encoder, galois_key, ct_complex,
+                            slot_count, user_scale):
+    """Split a complex ct (= ct_re + i·ct_im) into ct_re, ct_im via
+    conjugation. Uses Phantom's auto-generated step=0 galois key.
+    Costs 1 chain level (the *0.5 / -0.5i multiply)."""
+    ct_conj = phantom.rotate(ctx, ct_complex, 0, galois_key)
+    half_scpt = phantom.encode_single_chain_plaintext(
+        ctx, encoder, [0.5 + 0j] * slot_count, user_scale)
+    neg_half_i_scpt = phantom.encode_single_chain_plaintext(
+        ctx, encoder, [-0.5j] * slot_count, user_scale)
+    half_pt = phantom.expand_single_chain_to_full(
+        ctx, half_scpt, ct_complex.chain_index())
+    neg_half_i_pt = phantom.expand_single_chain_to_full(
+        ctx, neg_half_i_scpt, ct_complex.chain_index())
+    s = phantom.add(ctx, ct_complex, ct_conj)
+    ct_re = phantom.multiply_plain(ctx, s, half_pt)
+    ct_re = phantom.rescale_to_next(ctx, ct_re)
+    ct_re.set_scale(user_scale)
+    d = phantom.sub(ctx, ct_complex, ct_conj)
+    ct_im = phantom.multiply_plain(ctx, d, neg_half_i_pt)
+    ct_im = phantom.rescale_to_next(ctx, ct_im)
+    ct_im.set_scale(user_scale)
+    return ct_re, ct_im

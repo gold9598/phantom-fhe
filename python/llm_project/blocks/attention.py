@@ -222,7 +222,7 @@ def qkt_irp_mask_scale_plaintext(
     slot[h*d_head*t + tok] for h<n_heads, tok<num_tokens; zero elsewhere."""
     num_slots = encoder.slot_count()
     slots = _qkt_irp_head_mask_slots(num_slots, d_head, d_total, t, num_tokens, scale_value)
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 def qkt_irp_per_head_sub_plaintext(
@@ -243,7 +243,7 @@ def qkt_irp_per_head_sub_plaintext(
             idx = base + tok
             if idx < num_slots:
                 slots[idx] = c_per_head[h]
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 def score_v_irp_output_mask_plaintext(
@@ -262,7 +262,7 @@ def score_v_irp_output_mask_plaintext(
         idx = i * t
         if idx < num_slots:
             slots[idx] = 1.0
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +323,193 @@ def compute_qkt_irp(
         acc = phantom.add(ctx, acc, rot_ct)
 
     return acc
+
+
+def multi_ct_softmax_finalize(
+    ctx, encoder, relin_key, galois_key,
+    e_blocks, head_first_slot_mask_pt,
+    n_heads: int, d_head: int, t: int, iters: int,
+    user_scale: float,
+    sk=None, verbose=False,
+):
+    """Cross-block softmax aggregation for multi-ct e (Stage 3b-c).
+
+    Each e_block_k holds scaled exp values for tokens in block k:
+        slot[h*d_head*t + tok_local] = e[h, k*t + tok_local]   for tok_local in [0, t)
+    Slots beyond block_sizes[k] in the last (partial) block are zero (caller
+    must mask them).
+
+    Computes weights_block_k = e_block_k / global_sum_per_head, where
+        global_sum_per_head[h] = Σ_k Σ_tok_local e[h, k*t + tok_local]
+                              = Σ_t (over all token positions) e[h, t]
+
+    Algorithm:
+      1. Cross-block sum: e_sum = Σ_k e_block_k.
+      2. Within-block sum_reduce stride=1 count=t. The stock sum_reduce only
+         puts the correct per-head sum at slot[h*d_head*t + 0]; slots
+         tok_local in [1, t) hold sliding-window partial sums and are wrong
+         for our non-cyclic layout (the multi-block case has all t slots
+         populated with distinct values per block, so the existing single-ct
+         cyclic-replica trick doesn't apply).
+      3. Mask + broadcast: a_broadcast = (a * head_first_slot_mask) then
+         doubling rotate-adds to populate slots [h*d_head*t + 0..t) with the
+         per-head sum. Costs 1 level for the mask multiply + rescale.
+      4. Per-block Goldschmidt: weights_block_k = phantom.softmax_correct(
+         e_block_k, a_broadcast, iters) -> e_block_k / a_broadcast.
+
+    Args:
+      head_first_slot_mask_pt: precomputed plaintext with 1.0 at slot
+        [h*d_head*t + 0] for h in [0, n_heads) and 0.0 elsewhere, encoded at
+        the chain matching `a` after step 2.
+      user_scale: engine.user_scale() — used to snap a's scale after the
+        mask multiply + rescale.
+
+    Required Galois rotation steps:
+      step 2: {1, 2, ..., t/2} (positive)
+      step 3: {-1, -2, ..., -t/2} (negative, for the broadcast doubling)
+
+    Returns: list of n_blocks weights ciphertexts.
+    """
+    n_blocks = len(e_blocks)
+    if n_blocks == 0:
+        raise ValueError("multi_ct_softmax_finalize: e_blocks is empty")
+    if not _is_pow2(t):
+        raise ValueError("multi_ct_softmax_finalize: t must be a power of 2")
+
+    # 1. Cross-block sum.
+    def _p(tag, ct):
+        if not (verbose and sk is not None): return
+        v = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
+                     dtype=np.float64)
+        # show value at slot[h*d_head*t + 0] for h=0 (representative per-head sum)
+        slot0 = v[0]
+        print(f"      [softmax-probe] {tag:25s} slot0={slot0:.4e} max|.|={np.abs(v).max():.4e}")
+
+    e_sum = e_blocks[0]
+    for k in range(1, n_blocks):
+        e_sum = phantom.add(ctx, e_sum, e_blocks[k])
+    _p("e_sum (cross-block)", e_sum)
+
+    # 2. Within-block sum_reduce: stride=1, count=t. After log2(t) iterations,
+    # acc[h*d_head*t + 0] holds the global per-head sum; slots 1..t-1 hold
+    # sliding-window partial sums (wrong for our layout).
+    a = e_sum
+    step = 1
+    reach = 1
+    while reach < t:
+        rot = phantom.rotate(ctx, a, int(step), galois_key)
+        a = phantom.add(ctx, a, rot)
+        step <<= 1
+        reach <<= 1
+    _p("a (post-reduce)", a)
+
+    # 3. Mask + broadcast. Mask zeroes everything except slot[h*d_head*t + 0]
+    # for each h, leaving the correct per-head sum at slot 0 only. Then
+    # doubling rotate-adds spread that value to slots [0..t).
+    a_masked = phantom.multiply_plain(ctx, a, head_first_slot_mask_pt)
+    a_masked = phantom.rescale_to_next(ctx, a_masked)
+    a_masked.set_scale(user_scale)
+    _p("a_masked", a_masked)
+    a_bc = a_masked
+    s = 1
+    while s < t:
+        rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
+        a_bc = phantom.add(ctx, a_bc, rot)
+        s <<= 1
+    _p("a_bc (broadcast)", a_bc)
+
+    # 4. Per-block Goldschmidt. The e_blocks are still at the pre-mask-rescale
+    # chain; mod_switch them down to a_bc's chain so softmax_correct accepts
+    # both at the same level.
+    a_chain = a_bc.chain_index()
+    weights_blocks = []
+    for e_block in e_blocks:
+        if e_block.chain_index() != a_chain:
+            e_block = phantom.mod_switch_to(ctx, e_block, a_chain)
+        wb = phantom.softmax_correct(ctx, encoder, relin_key, e_block, a_bc, iters)
+        weights_blocks.append(wb)
+    return weights_blocks
+
+
+def compute_qkt_irp_multi(
+    ctx, encoder, relin_key, galois_key,
+    q_ct, k_blocks_cts,
+    d_head: int, d_total: int, t: int,
+    num_tokens: int = None,
+):
+    """QK^T over a multi-ciphertext K cache (Stage 3b-b).
+
+    Each k_block holds up to t = T_MODEL = 8 token positions packed in the
+    same in-block layout that compute_qkt_irp consumes. Block k holds tokens
+    [k*t, k*t + t). The final block may be partial (block_size < t); slots
+    beyond block_size are zero in the K-block ct, and the resulting score
+    block has zeros at those positions too — those are masked downstream.
+
+    Args:
+        q_ct: query ciphertext (single, post-Wq-IRP, stride-t Q layout).
+        k_blocks_cts: list of n_blocks K-block ciphertexts.
+        d_head, d_total, t: same as compute_qkt_irp.
+        num_tokens: total number of active tokens across all blocks. Used to
+            compute per-block sizes (returned alongside the score blocks).
+            If None, defaults to len(k_blocks_cts) * t (assume all full).
+
+    Returns:
+        score_blocks: list of n_blocks ciphertexts, each with the same per-
+            block layout that compute_qkt_irp's single-ct output has —
+            slot[h*d_head*t + tok_local] = m[tok_local, h] for tok_local in
+            [0, t). The mid-head junk slots [d_head*tok_local + 1 .. ] hold
+            partial-junk that the caller must mask out.
+        block_sizes: list of n_blocks ints, the number of valid tokens in
+            each block. block_sizes[k] = min(t, num_tokens - k*t).
+
+    Q is preprocessed (replicated across t-slots) ONCE outside the per-block
+    loop — saves log2(t) rotations per block at the cost of one extra ct
+    holding the preprocessed Q.
+
+    Caller is responsible for:
+      * mod_switch'ing each k_block to q_ct's chain (the existing pipeline
+        does this via mod_switch_to_inplace before compute_qkt_irp);
+      * applying mask*scale + per-head sub on each score block (block-aware
+        mask: only block_sizes[k] tokens are meaningful in block k);
+      * cross-block softmax aggregation in the multi-ct softmax pipeline.
+    """
+    n_blocks = len(k_blocks_cts)
+    if num_tokens is None:
+        num_tokens = n_blocks * t
+    block_sizes = [min(t, num_tokens - k * t) for k in range(n_blocks)]
+
+    if not _is_pow2(d_head):
+        raise ValueError("compute_qkt_irp_multi: d_head must be a power of 2")
+    if not _is_pow2(d_total):
+        raise ValueError("compute_qkt_irp_multi: d_total must be a power of 2")
+    if not _is_pow2(t):
+        raise ValueError("compute_qkt_irp_multi: t must be a power of 2")
+    log_t = int(round(math.log2(t)))
+    log_d_head = int(round(math.log2(d_head)))
+
+    # Preprocess Q ONCE across the per-block loop: pure replicate across t-slots.
+    q_pp = q_ct
+    for s in range(log_t):
+        rot_amt = -(1 << s)
+        rot_ct = phantom.rotate(ctx, q_pp, int(rot_amt), galois_key)
+        q_pp = phantom.add(ctx, q_pp, rot_ct)
+
+    score_blocks = []
+    for k_ct in k_blocks_cts:
+        # ct·ct multiply Q_pp × K_block.
+        nominal = q_pp.scale()
+        prod = phantom.multiply_and_relin(ctx, q_pp, k_ct, relin_key)
+        prod = phantom.rescale_to_next(ctx, prod)
+        prod.set_scale(nominal)
+        # Reduce over j-axis (the d_head dimension).
+        acc = prod
+        for s in range(log_d_head):
+            rot_amt = t * (1 << s)
+            rot_ct = phantom.rotate(ctx, acc, int(rot_amt), galois_key)
+            acc = phantom.add(ctx, acc, rot_ct)
+        score_blocks.append(acc)
+
+    return score_blocks, block_sizes
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +625,54 @@ def score_times_v_irp(
     return out
 
 
+def score_times_v_irp_multi(
+    ctx, encoder, relin_key, galois_key,
+    weights_blocks, v_blocks_cts,
+    d_head: int, d_total: int, t: int,
+    output_mask_pt,
+    num_tokens_per_block: int = None,
+):
+    """Compute Σ_t weights[t, h] * V[t, h, j] over a multi-ciphertext
+    weights/V cache (Stage 3b-d).
+
+    Each weights_block_k and v_block_k holds tokens [k*t, (k+1)*t). Calls
+    score_times_v_irp on each pair to produce a per-block partial attn
+    output, then sums across blocks for the final attn_irp ct.
+
+    For partial blocks (last block with block_size < t), the weights_block
+    is already masked (slots beyond block_size are zero from the per-block
+    softmax pipeline), so the contribution from those slots is zero — we
+    pass num_tokens_per_block=t for all blocks. The reduce step in
+    score_times_v_irp sums all t slots; the masked-out positions contribute
+    zero.
+
+    Required Galois steps: same as score_times_v_irp for a single block —
+    {-t, -2t, ..., -t*d_head/2} (broadcast over j-axis) and {1, 2, ..., t/2}
+    (reduce over tok-axis).
+    """
+    if num_tokens_per_block is None:
+        num_tokens_per_block = t
+    n_blocks = len(weights_blocks)
+    if len(v_blocks_cts) != n_blocks:
+        raise ValueError("score_times_v_irp_multi: weights and v block counts mismatch")
+    if n_blocks == 0:
+        raise ValueError("score_times_v_irp_multi: blocks list is empty")
+
+    partials = []
+    for w_block, v_block in zip(weights_blocks, v_blocks_cts):
+        partial = score_times_v_irp(
+            ctx, encoder, relin_key, galois_key,
+            w_block, v_block,
+            d_head, d_total, num_tokens_per_block, t, output_mask_pt)
+        partials.append(partial)
+
+    # Cross-block sum: free in level cost (just adds).
+    attn = partials[0]
+    for k in range(1, n_blocks):
+        attn = phantom.add(ctx, attn, partials[k])
+    return attn
+
+
 def attention_forward_required_steps(
     baby_steps: int,
     d_head: int,
@@ -486,7 +721,7 @@ def _encode_mul_rescale_snap(ctx, encoder, ct, slots, encode_scale, nominal=None
     if nominal is None:
         nominal = ct.scale()
     pt = encoder.encode_double_vector(
-        ctx, slots.tolist(), encode_scale, ct.chain_index(),
+        ctx, slots, encode_scale, ct.chain_index(),
     )
     result = phantom.multiply_plain(ctx, ct, pt)
     result = phantom.rescale_to_next(ctx, result)
@@ -509,7 +744,7 @@ def score_mask_plaintext(
         raise ValueError("score_mask_plaintext: d_total must be a multiple of d_head")
     num_slots = encoder.slot_count()
     slots = _head_stride_mask(num_slots, d_head, d_total, positions_per_ct)
-    return encoder.encode_double_vector(ctx, slots.tolist(), scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
 
 
 def mask_scale_plaintext(
@@ -523,7 +758,7 @@ def mask_scale_plaintext(
         raise ValueError("mask_scale_plaintext: d_total must be a multiple of d_head")
     num_slots = encoder.slot_count()
     slots = _head_stride_mask(num_slots, d_head, d_total, num_tokens, scale_value)
-    return encoder.encode_double_vector(ctx, slots.tolist(), encode_scale, chain_index)
+    return encoder.encode_double_vector(ctx, slots, encode_scale, chain_index)
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +969,7 @@ def attention_forward_llama(
         for h in range(n_heads):
             sub_slots[t * d_total + h * d_head] = c_per_head[h]
     sub_pt = encoder.encode_double_vector(
-        ctx, sub_slots.tolist(), scores_ct.scale(), scores_ct.chain_index())
+        ctx, sub_slots, scores_ct.scale(), scores_ct.chain_index())
     scores_ct = phantom.sub_plain(ctx, scores_ct, sub_pt)
     _rec("attn_A_wq_qkt_mask_sub", t0)
 
