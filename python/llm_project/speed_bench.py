@@ -186,7 +186,7 @@ def main():
         query_position=real_nt - 1,
         pytorch_ref=pytorch_ref,
         pytorch_pre_norm=pytorch_pre_norm,
-        cos_all=cos_all, sin_all=sin_all,
+        cos_all_full=cos_all, sin_all_full=sin_all,
         label=f"speed_bench_nt{args.nt}",
         debug_layer=None, max_layer=None, min_layer=None,
         rp_indep_cache={}, engine=engine,
