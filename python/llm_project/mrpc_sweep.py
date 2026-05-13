@@ -102,15 +102,30 @@ def _compute_metrics():
 
 def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
               run_classifier_fhe, capture_pytorch_ref_cached, P_local_fn,
-              rp_indep_cache, engine, rp_indep_disk_root=None):
+              rp_indep_cache, engine, rp_indep_disk_root=None,
+              fixed_nt=None):
     row = ds[idx]
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
                   "Sentence 1: {s1}\nSentence 2: {s2}\n"
                   "Answer (Yes or No):")
     prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
-    token_ids = tok(prompt).input_ids
-    num_tokens = len(token_ids)
-    P_local = num_tokens - 1
+    real_token_ids = tok(prompt).input_ids
+    real_nt = len(real_token_ids)
+    # Fixed-nt mode: pad real tokens with EOS up to fixed_nt; query at
+    # the real last-token position (so Yes/No logits aren't read from
+    # a padded slot). Matches Cachemir's seq_len=512 bench setup.
+    if fixed_nt is not None:
+        if real_nt > fixed_nt:
+            token_ids = real_token_ids[:fixed_nt]
+            real_nt = fixed_nt
+        else:
+            token_ids = (list(real_token_ids)
+                         + [tok.eos_token_id] * (fixed_nt - real_nt))
+        num_tokens = fixed_nt
+    else:
+        token_ids = real_token_ids
+        num_tokens = real_nt
+    P_local = real_nt - 1
 
     pytorch_ref, pytorch_pre_norm, yes_pt, no_pt = capture_pytorch_ref_cached(
         idx, token_ids)
@@ -139,6 +154,11 @@ def main():
     ap.add_argument("--end", type=int, default=408)
     ap.add_argument("--summary", action="store_true",
                     help="Only compute summary metrics from existing CSV.")
+    ap.add_argument(
+        "--fixed-nt", type=int, default=None,
+        help="Pad every example's tokens to this nt with EOS so the "
+             "FHE pipeline runs at a constant sequence length. Used "
+             "to match Cachemir's nt=512 speed benchmark.")
     args = ap.parse_args()
 
     if args.summary:
@@ -157,6 +177,9 @@ def main():
     sin_all_full = np.load(f"{PROBE_FULL}/rope_sin.npy").astype(np.float64)
 
     # Per-idx PT-ref disk cache (mirrors llama3_mrpc._cached_pytorch_ref).
+    # The filename keys on len(token_ids) so fixed-nt and variable-nt
+    # PT-refs don't collide (e.g. idx=5 has n=69 in variable mode and
+    # n=512 in fixed-nt-512 mode — two different cache files).
     def _ptref_cached(idx, token_ids):
         path = f"/tmp/mrpc_ptref_idx{idx}_n{len(token_ids)}.npz"
         if os.path.exists(path):
@@ -211,7 +234,8 @@ def main():
             row = _run_one(idx, tok, ds, None, cos_all_full, sin_all_full,
                             run_classifier_fhe, _ptref_cached, None,
                             rp_indep_cache, engine,
-                            rp_indep_disk_root=rp_indep_disk_root)
+                            rp_indep_disk_root=rp_indep_disk_root,
+                            fixed_nt=args.fixed_nt)
             _append_row(row)
             agree_str = " (agree)" if row["fhe_pred"] == row["pt_pred"] else " (DISAGREE)"
             print(f"  idx={idx}: PT={row['pt_pred']} FHE={row['fhe_pred']}"

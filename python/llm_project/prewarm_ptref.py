@@ -29,6 +29,11 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="Re-generate even if .npz already exists.")
     ap.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B")
+    ap.add_argument(
+        "--fixed-nt", type=int, default=None,
+        help="Pad every example's token_ids to this length with EOS "
+             "before running the PT-ref forward pass. Use to populate "
+             "the PT-ref cache for a fixed-nt MRPC sweep.")
     args = ap.parse_args()
 
     # Ensure llm_project + build/lib on path so capture_pytorch_ref_with_model
@@ -55,7 +60,16 @@ def main():
     for idx in range(args.start, args.end):
         row = ds[idx]
         prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
-        token_ids = tok(prompt).input_ids
+        real_ids = tok(prompt).input_ids
+        if args.fixed_nt is not None:
+            if len(real_ids) > args.fixed_nt:
+                token_ids = real_ids[:args.fixed_nt]
+            else:
+                token_ids = (list(real_ids)
+                             + [tok.eos_token_id] *
+                             (args.fixed_nt - len(real_ids)))
+        else:
+            token_ids = real_ids
         n = len(token_ids)
         out_path = f"/tmp/mrpc_ptref_idx{idx}_n{n}.npz"
         if (not args.force) and os.path.exists(out_path):
