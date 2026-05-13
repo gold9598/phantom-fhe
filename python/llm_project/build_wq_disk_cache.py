@@ -105,6 +105,12 @@ def main():
     ap.add_argument("--num-decoders", type=int, default=32)
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--probe", default="/tmp/llama_probe_full")
+    ap.add_argument(
+        "--nt", type=int, action="append", default=None,
+        help="Build the Wq cache for a specific num_tokens value "
+             "(can be repeated for multiple values). Skips MRPC "
+             "enumeration. Use for fixed-nt speed-benchmark setups "
+             "(e.g. --nt 512 to match Cachemir's benchmark).")
     args = ap.parse_args()
 
     from llama3 import load_layer_weights, PROBE_FULL  # noqa: F401
@@ -112,26 +118,30 @@ def main():
     from blocks.scp_disk_cache import save_scp_dict_to_disk
     from llama3 import encode_layer_wq_irp, rope_matrix_np
 
-    # 1. Enumerate unique num_tokens across the MRPC dev range.
-    print(f"[build_wq] enumerating MRPC[{args.start},{args.end}) ...",
-          flush=True)
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
-    ds = load_dataset("nyu-mll/glue", "mrpc")["validation"]
-    PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
-                  "Sentence 1: {s1}\nSentence 2: {s2}\n"
-                  "Answer (Yes or No):")
-    nt_set = set()
-    for idx in range(args.start, args.end):
-        row = ds[idx]
-        prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
-        nt = len(tok(prompt).input_ids)
-        nt_set.add(nt)
-    nt_list = sorted(nt_set)
-    print(f"[build_wq] {len(nt_list)} distinct num_tokens: "
-          f"{nt_list[:10]}{'...' if len(nt_list) > 10 else ''}",
-          flush=True)
+    # 1. Resolve which num_tokens values to encode for.
+    if args.nt:
+        nt_list = sorted(set(args.nt))
+        print(f"[build_wq] explicit nt list: {nt_list}", flush=True)
+    else:
+        print(f"[build_wq] enumerating MRPC[{args.start},{args.end}) ...",
+              flush=True)
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
+        ds = load_dataset("nyu-mll/glue", "mrpc")["validation"]
+        PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
+                      "Sentence 1: {s1}\nSentence 2: {s2}\n"
+                      "Answer (Yes or No):")
+        nt_set = set()
+        for idx in range(args.start, args.end):
+            row = ds[idx]
+            prompt = PROMPT_FMT.format(s1=row["sentence1"], s2=row["sentence2"])
+            nt = len(tok(prompt).input_ids)
+            nt_set.add(nt)
+        nt_list = sorted(nt_set)
+        print(f"[build_wq] {len(nt_list)} distinct num_tokens: "
+              f"{nt_list[:10]}{'...' if len(nt_list) > 10 else ''}",
+              flush=True)
 
     # 2. Build engine.
     phantom.set_cuda_device(args.gpu)
