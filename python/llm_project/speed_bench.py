@@ -1,22 +1,24 @@
-"""Fixed-`nt` speed benchmark to compare per-layer FHE compute time with
-Cachemir's published table (Cachemir's bench uses fixed seq_len = 512
-on A100 80 GB).
+"""Fixed-`nt` speed benchmark to compare per-layer FHE compute time
+with Cachemir's published table (Cachemir's bench uses fixed
+seq_len = 512 on A100 80 GB).
 
 Pipeline:
-  1. Load CKKS engine.
-  2. Take MRPC idx=5's prompt (69 real tokens), pad with EOS to nt=512.
-  3. Capture PyTorch reference once (HF model load + forward) in a
+  1. Build a REAL `nt`-token input by concatenating MRPC dev prompts
+     (natural English). Every position holds a meaningful token.
+  2. Capture PyTorch reference once (HF model load + forward) in a
      subprocess so the 15-16 GB PyTorch GPU retention dies with the
      child — the FHE pass starts on a clean GPU.
-  4. Run run_classifier_fhe at num_tokens=512, query_position = real
-     last-real-token index (so the predicted Yes/No logits come from
-     the real prompt's last position, not from a padding token).
+  3. Load CKKS engine.
+  4. Run run_classifier_fhe with num_tokens=nt and query_position=nt-1
+     (the LAST position). PyTorch's causal mask makes the query attend
+     to all nt-1 previous positions; the FHE pipeline's "no mask"
+     path is trivially equivalent because the query is at the end.
+     All n_blocks = nt / T_MODEL attention blocks are exercised.
   5. Report per-layer timing breakdown.
 
 Usage:
   python speed_bench.py            # nt=512 (Cachemir-style)
   python speed_bench.py --nt 256   # any fixed length up to rope-table limit
-  python speed_bench.py --idx 5    # which MRPC prompt to pad
 """
 import argparse
 import json
@@ -41,9 +43,18 @@ def _pad_ids(token_ids, target_nt, pad_id):
     return list(token_ids) + [pad_id] * (target_nt - len(token_ids))
 
 
-def _ptref_subprocess(idx, target_nt, out_path):
+def _ptref_subprocess(target_nt, out_path):
     """Run PT-ref capture in a child process so its ~15 GB PyTorch
-    allocator state is reclaimed at exit."""
+    allocator state is reclaimed at exit.
+
+    Builds a REAL `target_nt`-token input by concatenating MRPC dev
+    prompts (natural English) so every position holds a meaningful
+    token. The query is placed at the LAST position (target_nt-1) so
+    PyTorch's causal mask makes it attend to all target_nt-1 previous
+    positions — the FHE pipeline's "no mask" path is then trivially
+    equivalent (query is at the end, attends to everything before it).
+    This is the Cachemir-style speed-bench setup.
+    """
     script = f"""
 import os, sys, numpy as np
 sys.path.insert(0, '{os.path.join(_REPO, "build", "lib")}')
@@ -55,17 +66,26 @@ import json
 
 tok = AutoTokenizer.from_pretrained('NousResearch/Meta-Llama-3.1-8B')
 ds = load_dataset('nyu-mll/glue', 'mrpc')['validation']
-row = ds[{idx}]
-prompt = (
-    'Are these two sentences paraphrases of each other?\\n'
-    'Sentence 1: {{}}\\nSentence 2: {{}}\\nAnswer (Yes or No):'
-).format(row['sentence1'], row['sentence2'])
-real_ids = tok(prompt).input_ids
-real_nt = len(real_ids)
-pad_id = tok.eos_token_id
+
+PROMPT_FMT = ('Are these two sentences paraphrases of each other?\\n'
+              'Sentence 1: {{}}\\nSentence 2: {{}}\\nAnswer (Yes or No):')
+
 target_nt = {target_nt}
-ids = real_ids + [pad_id] * (target_nt - real_nt) if real_nt < target_nt else real_ids[:target_nt]
-print(f'real_nt={{real_nt}}  pad_to={{target_nt}}  pad_id={{pad_id}}', flush=True)
+
+# Build a long real input by concatenating MRPC prompts.
+parts = []
+total_tokens = 0
+for idx in range(len(ds)):
+    row = ds[idx]
+    p = PROMPT_FMT.format(row['sentence1'], row['sentence2'])
+    parts.append(p)
+    total_tokens += len(tok(p).input_ids)
+    if total_tokens > target_nt + 32:
+        break
+long_text = ' '.join(parts)
+ids = tok(long_text).input_ids[:target_nt]
+print(f'built {{len(ids)}}-token real input from '
+      f'{{len(parts)}} MRPC prompts', flush=True)
 
 model = AutoModelForCausalLM.from_pretrained(
     'NousResearch/Meta-Llama-3.1-8B',
@@ -73,10 +93,6 @@ model = AutoModelForCausalLM.from_pretrained(
 model.eval()
 print('model loaded', flush=True)
 
-# No attention mask: FHE pipeline doesn't apply a mask either, so for
-# apples-to-apples timing comparison both sides do attention over all
-# nt positions including the padded tail. The Yes/No logits at the
-# real_last_token position are still well-defined.
 input_ids = torch.tensor([ids], device='cuda:0')
 pre_norm_capture = {{}}
 h = model.model.norm.register_forward_pre_hook(
@@ -91,13 +107,18 @@ pytorch_ref = np.stack([
 pytorch_pre_norm = pre_norm_capture['x'].squeeze(0).detach().cpu().to(
     torch.float32).numpy().astype(np.float64)
 
-last_logits = out.logits[0, real_nt - 1].to(torch.float32).cpu().numpy()
+# Query at the LAST position so causal mask is automatic (query attends
+# to all previous positions). yes/no logits at that position are
+# meaningless for paraphrase classification on the concatenated text,
+# but the FHE forward pass exercises all target_nt attention positions,
+# which is the speed metric we want.
+last_logits = out.logits[0, target_nt - 1].to(torch.float32).cpu().numpy()
 meta = json.loads(open('{PROBE}/meta.json').read())
 yes_pt = float(last_logits[meta['yes_token_id']])
 no_pt = float(last_logits[meta['no_token_id']])
 np.savez('{out_path}', ref=pytorch_ref, prenorm=pytorch_pre_norm,
          yes=np.float64(yes_pt), no=np.float64(no_pt),
-         real_nt=np.int32(real_nt), pad_id=np.int32(pad_id))
+         real_nt=np.int32(target_nt))
 print(f'saved ref shape={{pytorch_ref.shape}} prenorm={{pytorch_pre_norm.shape}}', flush=True)
 print(f'yes_pt={{yes_pt:.4f}} no_pt={{no_pt:.4f}}', flush=True)
 """
@@ -107,16 +128,16 @@ print(f'yes_pt={{yes_pt:.4f}} no_pt={{no_pt:.4f}}', flush=True)
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nt", type=int, default=512)
-    ap.add_argument("--idx", type=int, default=5)
     ap.add_argument("--rebuild-ptref", action="store_true")
     args = ap.parse_args()
 
-    out_path = f"/tmp/mrpc_ptref_nt{args.nt}_idx{args.idx}.npz"
+    out_path = f"/tmp/speed_bench_ptref_nt{args.nt}.npz"
     if args.rebuild_ptref or not os.path.exists(out_path):
-        print(f"[speed_bench] capturing PT-ref at nt={args.nt} in subprocess...",
-              flush=True)
+        print(f"[speed_bench] capturing PT-ref at nt={args.nt} (real "
+              f"concatenated input, query at position nt-1) "
+              f"in subprocess...", flush=True)
         t0 = time.perf_counter()
-        _ptref_subprocess(args.idx, args.nt, out_path)
+        _ptref_subprocess(args.nt, out_path)
         print(f"[speed_bench] PT-ref captured in {time.perf_counter() - t0:.1f}s",
               flush=True)
 
@@ -127,10 +148,8 @@ def main():
     no_pt = float(z["no"])
     real_nt = int(z["real_nt"])
     print(f"[speed_bench] loaded PT-ref: ref={pytorch_ref.shape} "
-          f"prenorm={pytorch_pre_norm.shape} real_nt={real_nt}", flush=True)
-    print(f"[speed_bench] PT logits at real-last-token: "
-          f"yes={yes_pt:.4f} no={no_pt:.4f} → pt_pred="
-          f"{'Yes' if yes_pt > no_pt else 'No'}", flush=True)
+          f"prenorm={pytorch_pre_norm.shape} nt={real_nt} (all real, query=nt-1)",
+          flush=True)
 
     # Load RoPE tables (must have at least nt positions).
     cos_all = np.load(f"{PROBE}/rope_cos.npy").astype(np.float64)
@@ -168,7 +187,7 @@ def main():
         pytorch_ref=pytorch_ref,
         pytorch_pre_norm=pytorch_pre_norm,
         cos_all=cos_all, sin_all=sin_all,
-        label=f"nt{args.nt}_idx{args.idx}",
+        label=f"speed_bench_nt{args.nt}",
         debug_layer=None, max_layer=None, min_layer=None,
         rp_indep_cache={}, engine=engine,
         rp_indep_disk_root=rp_disk)
