@@ -46,6 +46,7 @@ from blocks.attention import (
     qkt_irp_mask_scale_plaintext, qkt_irp_per_head_sub_plaintext,
     score_v_irp_output_mask_plaintext,
     sdpa_irp_required_steps,
+    pack_score_blocks_tree, packed_softmax_finalize, unpack_packed_weights,
 )
 from blocks.bootstrap import bootstrap_safe
 from blocks.bootstrap_placement import (
@@ -105,6 +106,115 @@ def compute_layer_z_n(x_btd, w, num_tokens, query_position):
     return z1, None  # rms2 z computed below
 
 
+# K cache magnitude pre-scaler. Reduces ||K_h||_2 entering the QKT ct·ct
+# multiply — post-QKT err is Cauchy-Schwarz-bounded by err_Q · ||K_h||_2.
+# Default 0.25 → 4× err reduction at zero level/runtime cost. Math is
+# invariant: inv_sqrt_d divides by the same factor downstream.
+K_CACHE_SCALE = float(os.environ.get("K_CACHE_SCALE", "1.0"))
+
+# Fixed-nt causal-correctness invariant.
+#
+# FHE attention has no causal mask: correctness comes purely from the
+# query only ever seeing real (non-padded) keys. In variable-nt mode the
+# prompt is exactly real_nt tokens with the query at the last position
+# (query_position == num_tokens - 1), so num_tokens IS the real token
+# count and there is nothing to clip. In --fixed-nt N mode the prompt is
+# padded with EOS keys AFTER the query (query_position = real_nt - 1,
+# num_tokens = N > real_nt); those pad keys must be excluded from every
+# score / softmax / calibration reduction or the query non-causally
+# attends future EOS tokens and the layer output diverges (L0 ~1e45).
+#
+# `real_nt = query_position + 1` is the count of real tokens up to and
+# including the query and is the single quantity every num_tokens-direct
+# attention/softmax/calibration site must use. It is derivable at every
+# call site from the already-threaded query_position, so the fix needs
+# no new parameter or env flag and is the DEFAULT behavior. When the
+# prompt is not padded (variable-nt), real_nt == num_tokens and every
+# clip below is a no-op: the variable-nt path is byte-identical.
+def _real_nt(num_tokens, query_position):
+    """Real token count (incl. query). Pad slots [real_nt, num_tokens) are
+    excluded from all reductions. No-op (== num_tokens) for variable-nt."""
+    if query_position is None:
+        return num_tokens
+    return min(num_tokens, query_position + 1)
+
+
+# Degree-8 polynomial coefficients for exp on [-2, 2], extracted from
+# softmax.cu:21-31 (EXP_CHEB_COEFFS_DEG4_R2).  Used by
+# _sim_pre_finsmx_mean below; stored at module level to avoid repeated
+# array construction.
+_EXP_CHEB_DEG4_R2 = np.array([
+    1.0000000000000002,
+    0.9999999011179665,
+    0.49999999014536933,
+    0.16666798420023443,
+    0.04166679798739991,
+    0.008328598903862764,
+    0.001388416857145537,
+    0.00020469833492755798,
+    2.542872206845459e-05,
+])
+
+
+def _sim_pre_finsmx_mean(scores_post_C_ht, num_tokens, real_nt=None):
+    """Empirical mean of Stage-B softmax output over ALL NUM_SLOTS slots.
+
+    Plaintext simulation (pure NumPy, no GPU).  Mirrors /tmp/sim_pre_finsmx_mean.py.
+
+    Args:
+        scores_post_C_ht: np.ndarray shape (N_HEADS, num_tokens) — real
+            per-head post-sub_C scores from the current layer.
+        num_tokens: int — number of populated tokens.
+        real_nt: int or None — real (non-padded) token count. At fixed-nt
+            the block_sizes clip masks pad-token score slots to 0 in the
+            FHE pipeline, so columns [real_nt, num_tokens) behave like
+            unpopulated (score=0) slots. None / == num_tokens → no-op
+            (variable-nt: byte-identical to the original).
+    """
+    if real_nt is None:
+        real_nt = num_tokens
+    # ps_exp_init / damps use the SAME token count the FHE pipeline uses
+    # (real_nt). The damping schedule's f_sq*d = target_mag cancellation
+    # only holds when t_factor and damps share one token count, so these
+    # MUST move together (see softmax_damping_schedule).
+    # --- ps_exp_init on populated slots ---
+    t_factor = float(real_nt) ** (-1.0 / float(2 ** NUM_SQUARINGS))
+    lead = EXTRA_SCALE * t_factor
+    inv_se = 1.0 / float(2 ** NUM_SQUARINGS)
+    inv_pow = 1.0
+    coeffs = np.empty(len(_EXP_CHEB_DEG4_R2))
+    for i in range(len(_EXP_CHEB_DEG4_R2)):
+        coeffs[i] = lead * _EXP_CHEB_DEG4_R2[i] * inv_pow
+        inv_pow *= inv_se
+
+    # Only the first real_nt score columns are populated; pad columns are
+    # masked to 0 by the block_sizes clip and contribute v0 like every
+    # other unpopulated slot.
+    scores_flat = scores_post_C_ht[:, :real_nt].ravel().astype(np.float64)
+    # Horner evaluation
+    y_pop = np.zeros(len(scores_flat), dtype=np.float64)
+    for i in range(len(coeffs) - 1, -1, -1):
+        y_pop = y_pop * scores_flat + coeffs[i]
+
+    # Damped squarings on populated slots
+    damps = softmax_damping_schedule(NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    for d in damps:
+        y_pop = y_pop * y_pop * d
+
+    # --- ps_exp_init on score=0 (unpopulated slots) ---
+    y0 = np.zeros(1, dtype=np.float64)
+    for i in range(len(coeffs) - 1, -1, -1):
+        y0 = y0 * np.zeros(1) + coeffs[i]
+    for d in damps:
+        y0 = y0 * y0 * d
+    v0 = float(y0[0])
+
+    n_populated = N_HEADS * real_nt
+    n_unpopulated = NUM_SLOTS - n_populated
+    global_mean = (y_pop.sum() + n_unpopulated * v0) / NUM_SLOTS
+    return float(global_mean)
+
+
 def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position,
                             margin=BOOT_CALIB_MARGIN):
     """num_tokens-aware version of compute_layer_z + compute_layer_max_abs.
@@ -117,6 +227,15 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
     Wq, Wk, Wv, Wo = w["Wq"], w["Wk"], w["Wv"], w["Wo"]
     Wgate, Wup, Wdown = w["Wgate"], w["Wup"], w["Wdown"]
     P_q = query_position
+    # Real (non-padded) token count. The FHE pipeline's block_sizes clip
+    # masks pad-token K/V slots [real_nt, num_tokens) to 0 at stage-A, so
+    # the calibration MUST compute scores / c_per_head / softmax_safety /
+    # pre_finsmx_mean over the SAME first real_nt keys — otherwise the
+    # padded-key scores (huge at L0: residual magnitude largest there)
+    # pollute c_per_head, ps_exp saturates, and the layer blows up to
+    # ~1e45. Variable-nt: real_nt == num_tokens → identical slicing,
+    # byte-identical result.
+    real_nt = _real_nt(num_tokens, P_q)
 
     # rms1 input variance
     z1 = float((x_btd[P_q] ** 2).mean() + EPSILON)
@@ -129,8 +248,12 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
     K_full = apply_rope_np(K_full, cos_all, sin_all)
     K_full = np.repeat(K_full, N_KV_GROUPS, axis=1)
     V_full = np.repeat(V_full, N_KV_GROUPS, axis=1)
+    # Exclude EOS-pad keys/values: the query (at P_q = real_nt - 1) only
+    # ever attends real tokens [0, real_nt). No-op for variable-nt.
+    K_full = K_full[:real_nt]
+    V_full = V_full[:real_nt]
     q_max = float(np.abs(Q_full[P_q]).max())
-    # scores: shape (N_HEADS, num_tokens). Per-head max for c_per_head.
+    # scores: shape (N_HEADS, real_nt). Per-head max for c_per_head.
     scores = np.einsum('hd,thd->ht', Q_full[P_q], K_full) / math.sqrt(D_HEAD)
     c_per_head = scores.max(-1) + 0.5  # (N_HEADS,) — per-head softmax shift
     scores_post_C = scores - c_per_head[:, None]  # broadcast over T
@@ -138,11 +261,14 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
     weights = np.exp(scores_post_C - scores_post_C.max(-1, keepdims=True))
     weights = weights / weights.sum(-1, keepdims=True)
     # Softmax safety scale: post-damped per-head sum is approximately
-    # TARGET_MAG (0.45) * sum_t exp(score_post_C[h, t]). When scores are
-    # tightly clustered (typical at L0 with many similar embeddings), this
-    # sum can exceed Goldschmidt's convergence range (0, 2). Scale e_blocks
-    # by safety_scale before softmax_correct so the per-head sum stays under
-    # 1.5; weights are scale-invariant so this changes nothing in the math.
+    # TARGET_MAG (0.45) * sum_t exp(score_post_C[h, t]). Goldschmidt
+    # `softmax_correct` converges for a∈(0, 2) but its CKKS noise floor
+    # scales roughly as |a|^iters per iteration multiplication — at a≈1.5
+    # the floor is ~570× larger than at a≈0.6. Block-0 (attention sink)
+    # carries the largest weights → inherits this amplified Goldschmidt
+    # residual, causing the observed 7.3× per-block noise asymmetry at L=10.
+    # weights=e/a is scale-invariant, so we aggressively scale to land at
+    # ~0.6 instead of ~1.5.
     SOFTMAX_TARGET = 1.5
     sum_t_exp = np.exp(scores_post_C).sum(axis=-1)  # (N_HEADS,) — per-head sum
     expected_max_sum = float(sum_t_exp.max() * 0.45)  # TARGET_MAG
@@ -176,6 +302,8 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
         "up":       up_max * margin,
         "h":        h_max * margin,
         "softmax_safety_scale": softmax_safety_scale,
+        "pre_finsmx_mean": _sim_pre_finsmx_mean(
+            scores_post_C, real_nt, real_nt=real_nt),
     }
     return z1, z2, max_abs
 
@@ -204,10 +332,51 @@ def build_user_steps_mrpc():
         softmax_steps.append(int(1 << s))
         softmax_steps.append(-int(1 << s))
 
+    # Packed-score softmax (single-ct path, all blocks packed via tree
+    # rotation). Adds log2(packed_nt) sum_reduce + log2(packed_nt) broadcast
+    # rotations, plus BSGS unpack rotations when PACKED_SOFTMAX_NT_MAX is set
+    # (typical value: 512). For n_blocks_max=64 the unpack uses BSGS
+    # (baby_count=8, giant_count=8): 7 baby + 7 giant = 14 positive multiples
+    # of T_MODEL instead of the naive 63. Pack rotations reuse the existing
+    # sdpa_score_v_broadcast keys {-T, -2T, ..., -32T} so no new negative
+    # multiples of T are needed.
+    packed_nt_max_env = os.environ.get("PACKED_SOFTMAX_NT_MAX")
+    packed_sum_reduce_set = set()
+    packed_broadcast_set = set()
+    packed_unpack_set = set()
+    extra_packed_steps = []
+    if packed_nt_max_env:
+        packed_nt_max = int(packed_nt_max_env)
+        if packed_nt_max <= 0 or (packed_nt_max & (packed_nt_max - 1)) != 0:
+            raise ValueError(
+                f"PACKED_SOFTMAX_NT_MAX must be a positive power of 2, "
+                f"got {packed_nt_max}")
+        if packed_nt_max % T_MODEL != 0:
+            raise ValueError(
+                f"PACKED_SOFTMAX_NT_MAX={packed_nt_max} must be multiple of "
+                f"T_MODEL={T_MODEL}")
+        n_blocks_max = packed_nt_max // T_MODEL
+        log_packed_nt = int(round(math.log2(packed_nt_max)))
+        packed_sum_reduce_set = {int(1 << s) for s in range(log_packed_nt)}
+        packed_broadcast_set = {-int(1 << s) for s in range(log_packed_nt)}
+        # BSGS unpack: baby_count chosen so baby_count*giant_count >= n_blocks_max
+        # with baby_count + giant_count minimized. For n_blocks_max=64 use
+        # baby_count=8 (covers 8*8=64) -> 7 baby + 7 giant = 14 keys.
+        BSGS_BABY_COUNT = 8
+        bsgs_giant_count = (n_blocks_max + BSGS_BABY_COUNT - 1) // BSGS_BABY_COUNT
+        packed_unpack_set = (
+            {int(T_MODEL * b) for b in range(1, BSGS_BABY_COUNT)}
+            | {int(T_MODEL * BSGS_BABY_COUNT * g)
+               for g in range(1, bsgs_giant_count)}
+        )
+        extra_packed_steps = (list(packed_sum_reduce_set)
+                              + list(packed_broadcast_set)
+                              + list(packed_unpack_set))
+
     user_steps = sorted(set(
         list(rms_steps) + list(sdpa_steps) +
         list(irp_attn_steps) + list(irp_mlp_w_steps) + list(irp_mlp_t_steps) +
-        softmax_steps
+        softmax_steps + extra_packed_steps
     ))
     step_categories = {
         "rms": set(rms_steps),
@@ -219,6 +388,9 @@ def build_user_steps_mrpc():
         "softmax_cross_block_doubling": {-int(1 << s) for s in range(log_t)},
         "qkt_q_preprocess": {-int(1 << s) for s in range(log_t)},
         "sdpa_score_v_broadcast": {-int(T_MODEL * (1 << s)) for s in range(log_d_head)},
+        "packed_softmax_sum_reduce": packed_sum_reduce_set,
+        "packed_softmax_broadcast": packed_broadcast_set,
+        "packed_unpack": packed_unpack_set,
     }
     return user_steps, step_categories
 
@@ -251,6 +423,9 @@ def setup_engine(user_steps, step_categories=None, target_chain_default=16):
     shallower chain and cause out-of-bounds reads.
     """
     if step_categories is not None:
+        # FRESHEST_CHAIN=16 is invariant for both legacy (NSL=14) and use17
+        # (NSL=16) under evalmod_r=3. Verified post-engine-construction
+        # via engine.freshest_chain_index().
         FRESHEST_CHAIN = 16
         TARGET_RMS      = FRESHEST_CHAIN + 0   # 16
         TARGET_FINALIZE = FRESHEST_CHAIN + 1   # 17
@@ -267,6 +442,14 @@ def setup_engine(user_steps, step_categories=None, target_chain_default=16):
         finalize_set    = step_categories["softmax_within_block"]   # {1, 2, 4}
         score_v_set     = step_categories["sdpa_score_v_broadcast"]
         cross_block_set = step_categories["softmax_cross_block_doubling"]  # {-1,-2,-4}
+        # Packed-score softmax: same chain depths as the per-block
+        # equivalents. sum_reduce + broadcast fire post-stage-A bootstrap
+        # (chain 17 = TARGET_FINALIZE); unpack rotates the post-Goldschmidt
+        # weights (chain 23 = TARGET_SCORE_V). Empty sets when packed
+        # softmax is disabled.
+        packed_sum_reduce_set = step_categories.get("packed_softmax_sum_reduce", set())
+        packed_broadcast_set  = step_categories.get("packed_softmax_broadcast", set())
+        packed_unpack_set     = step_categories.get("packed_unpack", set())
 
         target_chain_indices = []
         for s in user_steps:
@@ -278,6 +461,12 @@ def setup_engine(user_steps, step_categories=None, target_chain_default=16):
                 target_chain_indices.append(TARGET_FINALIZE)    # 17
             elif s in finalize_set:
                 target_chain_indices.append(TARGET_FINALIZE)    # 17
+            elif s in packed_sum_reduce_set:
+                target_chain_indices.append(TARGET_FINALIZE)    # 17
+            elif s in packed_broadcast_set:
+                target_chain_indices.append(TARGET_FINALIZE)    # 17
+            elif s in packed_unpack_set:
+                target_chain_indices.append(TARGET_SCORE_V)     # 23
             elif s in score_v_set:
                 target_chain_indices.append(TARGET_SCORE_V)     # 23
             elif s in irp_only_set:
@@ -317,6 +506,11 @@ def setup_engine(user_steps, step_categories=None, target_chain_default=16):
     cfg.include_user_rotations = False
     cfg.user_rotation_steps = user_steps
     cfg.user_rotation_target_chain_indices = target_chain_indices
+    # Opt-in to the BootstrapTo17Levels chain layout (Lapis-shape, the_lib's
+    # prime *counts* but Lapis prime *sizes*). Gives max_user_level = NSL-1
+    # = 16 at NSL=17; useful for NUM_SQUARINGS=6 if the resulting bootstrap
+    # working memory fits the GPU.
+    cfg.use_bootstrap_to_17_levels = os.environ.get("USE_BOOTSTRAP_17") == "1"
     print(f"  Engine: logN={LOG_N} NSL={NUM_SCALE_LEVELS} #user_steps={len(user_steps)}")
     t0 = time.perf_counter()
     eng = phantom.ckks_engine(cfg)
@@ -349,12 +543,38 @@ def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
     K_full_h = np.repeat(K, N_KV_GROUPS, axis=1)  # (num_tokens, N_HEADS, D_HEAD)
     V_full_h = np.repeat(V, N_KV_GROUPS, axis=1)
 
+    # c_per_head is the per-head softmax shift the ciphertext actually
+    # receives (via qkt_irp_per_head_sub_plaintext at stage-A). It MUST
+    # be computed over the same real keys [0, real_nt) the FHE pipeline
+    # reduces over (block_sizes clip masks pad keys to 0). Using the
+    # padded keys here is the primary L0/L1 blow-up: at L0 the EOS-pad
+    # raw scores are astronomically large, c_per_head is wildly off, and
+    # ps_exp saturates -> ~1e45. Variable-nt: real_nt == num_tokens
+    # -> identical, byte-for-byte.
+    real_nt = _real_nt(num_tokens, query_position)
     Q_np = (xn[query_position] @ Wq_baked.T).reshape(N_HEADS, D_HEAD)
-    scores_np = np.einsum('hd,thd->th', Q_np, K_full_h) / math.sqrt(D_HEAD)
+    scores_np = (np.einsum('hd,thd->th', Q_np, K_full_h[:real_nt])
+                 / math.sqrt(D_HEAD))
     c_per_head = scores_np.max(0) + 0.5
 
+    # Pack/encrypt K/V for the REAL tokens [0, real_nt) only. The query
+    # only ever attends real keys; the EOS-pad keys [real_nt, num_tokens)
+    # must never enter the encrypted KV cache. Packing the padded
+    # num_tokens at fixed-nt would encode/encrypt ceil(num_tokens/T)
+    # ciphertexts (64 at nt=512) instead of ceil(real_nt/T) (8 for
+    # real_nt=60). Beyond the obvious slot waste, feeding those extra
+    # pad ciphertexts through the engine corrupts accuracy at scale
+    # (uniform ~0.3 rel-RMS + L7/L8/L31 ~1e3 blow-ups at fixed-512;
+    # survivable but still wrong at fixed-128). pack_kv_blocks already
+    # zeros slots past each block_size and fills only block_size real
+    # tokens, so packing real_nt yields EXACTLY the variable-nt-real_nt
+    # blocks: structurally and numerically identical to a real
+    # nt=real_nt prompt. BSGS / rotation / diagonal decomposition is
+    # unchanged — only the (real-only) block count differs.
+    # Variable-nt: real_nt == num_tokens -> identical, byte-for-byte.
     k_blocks_slots, v_blocks_slots = pack_kv_blocks(
-        K_full_h, V_full_h, num_tokens, T_MODEL, NUM_SLOTS, N_HEADS, D_HEAD)
+        K_full_h, V_full_h, real_nt, T_MODEL, NUM_SLOTS, N_HEADS, D_HEAD,
+        k_scale=K_CACHE_SCALE)
     k_cts = [sk.encrypt_symmetric(ctx,
         encoder.encode_double_vector(ctx, kb, SCALE, fresh_ci))
         for kb in k_blocks_slots]
@@ -374,7 +594,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
                              x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
                              k_cts, v_cts, c_per_head,
                              num_tokens, max_abs_calib, head_first_slot_mask_slots,
-                             stage_times=None, verbose=False):
+                             stage_times=None, verbose=False, query_position=None):
     """Multi-ct attention block. Same shape as fhe_attention_irp_bootstrap
     but using compute_qkt_irp_multi + per-block softmax pipeline +
     multi_ct_softmax_finalize + score_times_v_irp_multi.
@@ -419,13 +639,52 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     _rec("bootstrap", t0)
     if verbose: _probe("attn post-q-boot", ctx, encoder, sk, q_ct)
 
+    # Causal-correctness clip for padded fixed-nt. The query only ever
+    # attends real keys [0, real_nt); EOS-pad keys [real_nt, num_tokens)
+    # must be excluded from the ENTIRE attention path.
+    #
+    # CRITICAL: do this BEFORE the mod_switch loop and the QK^T. The
+    # EOS-pad K is packed at full block width by pack_kv_blocks (it keys
+    # on the padded num_tokens), so a pad block's QK^T is a real dot
+    # product whose magnitude, at embedding-scale early layers, overflows
+    # the CKKS scale inside compute_qkt_irp_multi. If the pad k_cts are
+    # fed to compute_qkt_irp_multi (even though their score blocks are
+    # later masked/dropped), the overflowed intermediates corrupt the
+    # shared relin/rescale path and degrade EVERY block's accuracy — the
+    # damage scales with the number of pad blocks (survivable at
+    # fixed-128's 8 pad blocks, fatal at fixed-512's 56: observed uniform
+    # ~0.3 rel-RMS + L7/L8/L31 ~1e3 blow-ups). Truncating k_cts/v_cts to
+    # exactly the real blocks here makes compute_qkt_irp_multi see only
+    # the real prefix — structurally and numerically identical to running
+    # variable-nt at num_tokens=real_nt (fixed-128 AND fixed-512 -> the
+    # same 8-block variable-nt-60 layout). BSGS matmul/rotation/diagonal
+    # decomposition is unchanged: we feed it fewer (real-only) blocks,
+    # never a modified algorithm. Variable-nt: real_nt == num_tokens so
+    # the guard is skipped entirely -> byte-identical.
+    real_nt = _real_nt(num_tokens, query_position)
+    if real_nt < num_tokens:
+        n_real_blocks = math.ceil(real_nt / T_MODEL)
+        k_cts = k_cts[:n_real_blocks]
+        v_cts = v_cts[:n_real_blocks]
+        eff_num_tokens = real_nt
+    else:
+        eff_num_tokens = num_tokens
+
     # compute_qkt_irp_multi — produces n_blocks score blocks
     t0 = _t()
     for k_ct in k_cts:
         phantom.mod_switch_to_inplace(ctx, k_ct, q_ct.chain_index())
     score_blocks, block_sizes = compute_qkt_irp_multi(
         ctx, encoder, relin_key, galois_key,
-        q_ct, k_cts, D_HEAD, D_TOTAL, T_MODEL, num_tokens=num_tokens)
+        q_ct, k_cts, D_HEAD, D_TOTAL, T_MODEL, num_tokens=eff_num_tokens)
+    if real_nt < num_tokens:
+        # block_sizes from eff_num_tokens=real_nt is already the exact
+        # variable-nt-real_nt layout (e.g. [8]*7+[4] for real_nt=60); the
+        # last block is partial and masked downstream by stage-A as usual.
+        print(f"  [fixed-nt clip] block_sizes -> {block_sizes} "
+              f"(real_nt={real_nt}, num_tokens={num_tokens}, "
+              f"n_blocks {len(score_blocks)})")
+
     if verbose:
         for kk, sb in enumerate(score_blocks):
             _probe(f"attn post-qkt[{kk}]", ctx, encoder, sk, sb)
@@ -434,10 +693,30 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     # consecutive blocks via merge_bootstrap (saves 6/12 bootstraps for
     # n_blocks=6: 3 stage-A pairs + 3 stage-B pairs, ~1s/layer).
     from blocks.bootstrap import merge_bootstrap
-    inv_sqrt_d = 1.0 / math.sqrt(float(D_HEAD))
+    # K_CACHE_SCALE: K is pre-scaled by this factor at packing time (see
+    # encrypt_layer_inputs_multi → pack_kv_blocks). post-QKT err is
+    # Cauchy-Schwarz-bounded by err_Q · ||K_h||_2, so scaling K down by 4×
+    # at encoding drops cascade post-QKT err 4× (1.16 → 0.29 measured).
+    # Math is invariant: inv_sqrt_d is divided by K_CACHE_SCALE so the
+    # post-stage-A scores are bit-identical (effective `inv_sqrt_d/K_scale ·
+    # (K · K_scale) = K · inv_sqrt_d`).
+    inv_sqrt_d = (1.0 / math.sqrt(float(D_HEAD))) / K_CACHE_SCALE
     safety_scale = max_abs_calib.get("softmax_safety_scale", 1.0) if max_abs_calib else 1.0
-    damps = softmax_damping_schedule(NUM_SQUARINGS, num_tokens, EXTRA_SCALE, TARGET_MAG)
-    _PRE_FINSMX_MEAN = 0.4487
+    # ps_exp_init's lead = EXTRA_SCALE * t^(-1/2^NSQ) and softmax_damping_schedule's
+    # per-step damps share that SAME t: the damping derivation makes
+    # f_sq*d = TARGET_MAG by construction only when both use one token
+    # count. The t^(-1) it bakes in is the softmax denominator
+    # pre-normalization and must be the REAL summed-key count (real_nt),
+    # not the padded N (which over-normalizes by N/real_nt). These two
+    # therefore MUST move together (changing only one breaks the analytic
+    # cancellation). Variable-nt: real_nt == num_tokens -> byte-identical.
+    damps = softmax_damping_schedule(NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    # Mean is dominated by unpopulated slots (~96% of NUM_SLOTS), which equal
+    # TARGET_MAG=0.45 after damping (pipeline(score=0) = TARGET_MAG by construction).
+    # NumPy simulation: 0.4225 (nt=64) ↔ 0.4435 (nt=16) across NSQ — varies with
+    # fill rate. 0.4487 is a safe single constant; for tighter bootstrap centering
+    # set the empirical mean from max_abs_calib["pre_finsmx_mean"] when provided.
+    _PRE_FINSMX_MEAN = 0.4487  # OLD hardcoded value (functional baseline)
 
     def _stage_a_premask(sb, blk_size):
         """mask*scale + sub_C (block-aware)."""
@@ -455,9 +734,11 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
 
     def _stage_b_ps_exp(sb):
         """ps_exp_init + damped squarings + mean-sub."""
+        # real_nt (NOT padded num_tokens) — paired with the damps above;
+        # see the softmax_damping_schedule comment. No-op for variable-nt.
         e_ct = phantom.ps_exp_init(
             ctx, encoder, relin_key, sb,
-            num_tokens, NUM_SQUARINGS, EXTRA_SCALE)
+            real_nt, NUM_SQUARINGS, EXTRA_SCALE)
         phantom.square_iterations_damped_inplace(
             ctx, encoder, relin_key, e_ct, damps)
         mean_pt = encoder.encode_double_vector(
@@ -481,81 +762,239 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         return e_ct
 
     n_blocks = len(score_blocks)
-    e_blocks = [None] * n_blocks
-    # Process blocks in PAIRS to share bootstrap_inplace calls.
+
+    # Packed-score softmax: pack all n_blocks score cts into ONE ct via
+    # tree-rotation, then run stage A/B/C + Goldschmidt + unpack on that
+    # single ct. Saves (n_blocks - 1) stage-A bootstraps, (n_blocks - 1)
+    # stage-B bootstraps, (n_blocks - 1) ps_exp+damped polynomials, and
+    # (n_blocks - 1) Goldschmidt invocations vs the per-block pipeline.
+    # Required galois keys are pre-generated when PACKED_SOFTMAX_NT_MAX is
+    # set at engine build (see build_user_steps_mrpc).
+    use_packed = (os.environ.get("PACKED_SOFTMAX") == "1"
+                  and n_blocks >= 2
+                  and (n_blocks & (n_blocks - 1)) == 0
+                  and num_tokens == n_blocks * T_MODEL
+                  and all(bs == T_MODEL for bs in block_sizes))
+    # Packed path: pack AFTER stage C. e_blocks at that point have ~1e-7
+    # noise at unpopulated slots (stage-C mask*safety on bounded values is
+    # clean), so the tree pack stays contamination-free. Pack-before-A
+    # (with or without N strict 0/1 cleanse masks; empirically tested
+    # N=0,1,2) doesn't work — the CKKS multiplicative noise floor at
+    # "zero" mask slots is stable around junk*ε ≈ 0.07 per slot regardless
+    # of cleanse passes, and the tree pack accumulates n_blocks copies of
+    # that, blowing per-head sum past Goldschmidt's |a|<2 window.
+
+    # PACKED_STAGE_B (Phase 1, architect plan): pack AFTER stage A's
+    # premask but BEFORE stage B. Stage A produces clean encoded zeros at
+    # off-block slots (qkt_irp_mask_scale_plaintext zeros everything but
+    # the per-head first-blk_size slots), so pack-with-use_mask=False is
+    # safe — no leakage to accumulate. Splits 64 blocks across TWO packed
+    # cts (32 blocks each = 8192 populated / 32768 slots per ct) and runs
+    # stage B / stage C twice instead of 64×. After stage C, the two
+    # packed cts are merged into one via a single tree-pack round and the
+    # existing post-stage-C `use_packed` finalize + unpack path takes
+    # over unchanged.
+    # Generalized from the original hardcoded `n_blocks == 64` to any
+    # pow2 n_blocks >= 2 (mirrors the use_packed guard style at :649-650).
+    # Regression invariant: at n_blocks == 64 this guard, the grouping
+    # below, and PACKED_BLK_SIZE are byte-identical to the original
+    # 2-way [0:32]/[32:64] split with PACKED_BLK_SIZE = 32*T_MODEL.
+    use_packed_stage_b = (os.environ.get("PACKED_STAGE_B") == "1"
+                          and n_blocks >= 2
+                          and (n_blocks & (n_blocks - 1)) == 0
+                          and num_tokens == n_blocks * T_MODEL
+                          and all(bs == T_MODEL for bs in block_sizes))
+
     pair_idx = 0
-    while pair_idx < n_blocks:
-        i = pair_idx
-        j = pair_idx + 1 if pair_idx + 1 < n_blocks else None
+    e_blocks = [None] * n_blocks
+    if use_packed_stage_b:
+        # Pack-after-stage-A (Phase 1) — see architect rationale in the
+        # comment block above. Runs stage A 64× (cheap; 2 levels each, no
+        # bootstrap), packs the stage-A outputs into TWO packed cts
+        # (32 blocks per ct), bootstraps each packed ct, runs stage B
+        # ONCE per packed ct, bootstraps each, runs stage C ONCE per
+        # packed ct (with blk_size = 32*T_MODEL = 256 — the mask
+        # plaintext naturally extends), then merges the two stage-C
+        # outputs into ONE packed ct via a 2-element tree-pack. The
+        # downstream finalize path consumes e_blocks=[merged_ct] (a
+        # single-element list) so pack_score_blocks_tree at the existing
+        # use_packed branch becomes a no-op pass-through.
+        # Geometric safety: every group packs group_blocks*T_MODEL tokens
+        # into the per-head region of width head_block = D_HEAD*T_MODEL
+        # (= 1024). The largest group is GROUP=32 blocks (or all n_blocks
+        # when n_blocks < GROUP), so n_blocks*T_MODEL must not exceed
+        # head_block or the packed region would spill into the next head's
+        # slots and silently corrupt the score layout. Guard, don't trust.
+        head_block = D_HEAD * T_MODEL
+        if n_blocks * T_MODEL > head_block:
+            raise ValueError(
+                f"use_packed_stage_b: n_blocks*T_MODEL="
+                f"{n_blocks * T_MODEL} exceeds head_block={head_block} "
+                f"(D_HEAD*T_MODEL); packed region would spill into the "
+                f"next head. Reduce n_blocks or disable PACKED_STAGE_B.")
 
-        # ---- Stage A: mask + sub_C for each block in pair. ----
-        sb_i = _stage_a_premask(score_blocks[i], block_sizes[i])
-        if j is not None:
-            sb_j = _stage_a_premask(score_blocks[j], block_sizes[j])
+        sb_pre = [_stage_a_premask(score_blocks[k], block_sizes[k])
+                  for k in range(n_blocks)]
+        # General G-grouping: split the n_blocks stage-A premasked cts into
+        # G = ceil(n_blocks / GROUP) consecutive groups of <= GROUP blocks
+        # each, then run the pack -> bootstrap -> stage B -> bootstrap ->
+        # stage C pipeline once per group. Regression invariant: with
+        # GROUP=32 and n_blocks==64, G==2 and the two groups are exactly
+        # sb_pre[0:32] and sb_pre[32:64] — byte-identical to the original
+        # hardcoded 2-way split. For n_blocks==8 (nt=64): G==1, a single
+        # group of 8 blocks, one packed ct, and the final merge over a
+        # 1-element list is a no-op (pack_score_blocks_tree returns it
+        # unchanged).
+        GROUP = 32
+        G = math.ceil(n_blocks / GROUP)
+        groups = [sb_pre[g * GROUP:(g + 1) * GROUP] for g in range(G)]
+        packed_c_groups = []
+        # Per-group PACKED_BLK_SIZE = (#blocks in that group) * T_MODEL.
+        # For a full GROUP=32 group this is 32*T_MODEL = 256 (identical to
+        # the original constant); a trailing short group uses its actual
+        # block count (e.g. n_blocks==8 -> 8*T_MODEL = 64).
+        group_blk_sizes = []
+        for group in groups:
+            group_blocks = len(group)
+            group_blk_size = group_blocks * T_MODEL
+            group_blk_sizes.append(group_blk_size)
+            # use_mask=False: stage-A premask zeros off-block slots cleanly,
+            # so the tree-pack does not accumulate noise. Saves
+            # log2(group_blocks) levels per packed ct.
+            packed_ct = pack_score_blocks_tree(ctx, galois_key, group,
+                                               T_MODEL)
+            packed_ct = bootstrap_safe(engine, ctx, encoder, packed_ct,
+                                          max_abs=_calib["scores"],
+                                          slot_count=NUM_SLOTS)
+            # Stage B on the packed ct (operates slot-wise, layout-agnostic).
+            packed_e = _stage_b_ps_exp(packed_ct)
+            # Post-stage-B bootstrap (mirror per-block path at :622-624).
+            packed_e = bootstrap_safe(engine, ctx, encoder, packed_e,
+                                        max_abs=TARGET_MAG,
+                                        slot_count=NUM_SLOTS)
+            # Stage C with blk_size = group_blk_size. The mask plaintext
+            # qkt_irp_mask_scale_plaintext takes num_tokens=group_blk_size
+            # and naturally writes value at slot[h*d_head*t + tok] for
+            # tok < group_blk_size per head — exactly the populated range
+            # after the group_blocks-block pack.
+            packed_c_groups.append(_stage_c_post(packed_e, group_blk_size))
 
-        # ---- Bootstrap before damped squarings (merge-paired). ----
-        if j is not None:
-            sb_i, sb_j = merge_bootstrap(
-                engine, ctx, encoder, sb_i, sb_j,
-                max_abs=_calib["scores"], slot_count=NUM_SLOTS,
-                galois_key=galois_key)
-        else:
-            sb_i = bootstrap_safe(engine, ctx, encoder, sb_i,
-                                    max_abs=_calib["scores"], slot_count=NUM_SLOTS)
+        # Merge the G stage-C outputs into one packed ct. The merge stride
+        # is the per-group PACKED_BLK_SIZE (all full groups share the same
+        # GROUP*T_MODEL stride; a single trailing short group never needs a
+        # merge). For n_blocks==64: G==2, stride = 32*T_MODEL = 256 — one
+        # rotation step, identical to the original. For G==1 this is a
+        # 1-element list and pack_score_blocks_tree returns it unchanged
+        # (no-op, verified at attention.py:365-366). Both halves are clean
+        # at off-block slots (stage-C mask zeroes everything outside the
+        # populated range), so use_mask=False is safe.
+        merge_stride = group_blk_sizes[0]
+        merged_packed_e = pack_score_blocks_tree(
+            ctx, galois_key, packed_c_groups, merge_stride)
+        # Hand off to the existing finalize path as a 1-element list.
+        # pack_score_blocks_tree on a 1-element list returns it unchanged,
+        # so the existing pack at the use_packed branch is a no-op.
+        e_blocks = [merged_packed_e]
+        use_packed = True
+    else:
+        # Process blocks in PAIRS to share bootstrap_inplace calls.
+        while pair_idx < n_blocks:
+            i = pair_idx
+            j = pair_idx + 1 if pair_idx + 1 < n_blocks else None
 
-        # ---- Stage B: ps_exp + damped + mean-sub. ----
-        e_i = _stage_b_ps_exp(sb_i)
-        if j is not None:
-            e_j = _stage_b_ps_exp(sb_j)
+            # ---- Stage A: mask + sub_C for each block in pair. ----
+            sb_i = _stage_a_premask(score_blocks[i], block_sizes[i])
+            if j is not None:
+                sb_j = _stage_a_premask(score_blocks[j], block_sizes[j])
 
-        # ---- Bootstrap after damped (NOT merge-paired here).
-        # Stage B e_ct enters at user_level = max_user_level (12 levels
-        # consumed by ps_exp + 4 damped squarings from a fresh stage-A
-        # bootstrap), leaving no level headroom for merge_bootstrap's
-        # pre-scale multiplies. Use separate bootstrap_safe — at max_abs
-        # = TARGET_MAG = 0.45 (< target_mag 0.49) it skips scaling and
-        # runs bootstrap_inplace directly with no level cost.
-        # Opt 3 attempted: pair these bootstraps via merge_bootstrap to
-        # halve the stage-B bootstrap count (10 -> 5 at nt=75). Rejected
-        # because merge_bootstrap unconditionally multiplies ct2 by sd*i
-        # via multiply_plain+rescale_to_next (bootstrap.py:186-192) —
-        # consumes 1 level even when sd==1.0. At max_user_level inputs,
-        # this raises before bootstrap_inplace. Skipping this opt keeps
-        # correctness; a zero-level pack would need a phantom API for
-        # i-multiplication without rescale, which doesn't exist today. ----
-        e_i = bootstrap_safe(engine, ctx, encoder, e_i,
-                               max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
-        if j is not None:
-            e_j = bootstrap_safe(engine, ctx, encoder, e_j,
+            # ---- Bootstrap before damped squarings (merge-paired). ----
+            # At NSL>=20 with NUM_SQUARINGS=6, stage A (2 levels) + stage B
+            # (16 levels) = 18 levels — fits in max_user_level=19. We can skip
+            # the stage A bootstrap entirely, saving 32 paired bootstraps per
+            # layer (~5.4s). Opt-in via SKIP_STAGE_A_BOOT=1.
+            if os.environ.get("SKIP_STAGE_A_BOOT") != "1":
+                if j is not None:
+                    sb_i, sb_j = merge_bootstrap(
+                        engine, ctx, encoder, sb_i, sb_j,
+                        max_abs=_calib["scores"], slot_count=NUM_SLOTS,
+                        galois_key=galois_key)
+                else:
+                    sb_i = bootstrap_safe(engine, ctx, encoder, sb_i,
+                                            max_abs=_calib["scores"], slot_count=NUM_SLOTS)
+
+            # ---- Stage B: ps_exp + damped + mean-sub. ----
+            e_i = _stage_b_ps_exp(sb_i)
+            if j is not None:
+                e_j = _stage_b_ps_exp(sb_j)
+
+            # ---- Bootstrap after damped (NOT merge-paired here).
+            # Stage B e_ct enters at user_level = max_user_level (12 levels
+            # consumed by ps_exp + 4 damped squarings from a fresh stage-A
+            # bootstrap), leaving no level headroom for merge_bootstrap's
+            # pre-scale multiplies. Use separate bootstrap_safe — at max_abs
+            # = TARGET_MAG = 0.45 (< target_mag 0.49) it skips scaling and
+            # runs bootstrap_inplace directly with no level cost.
+            # Opt 3 attempted: pair these bootstraps via merge_bootstrap to
+            # halve the stage-B bootstrap count (10 -> 5 at nt=75). Rejected
+            # because merge_bootstrap unconditionally multiplies ct2 by sd*i
+            # via multiply_plain+rescale_to_next (bootstrap.py:186-192) —
+            # consumes 1 level even when sd==1.0. At max_user_level inputs,
+            # this raises before bootstrap_inplace. Skipping this opt keeps
+            # correctness; a zero-level pack would need a phantom API for
+            # i-multiplication without rescale, which doesn't exist today. ----
+            e_i = bootstrap_safe(engine, ctx, encoder, e_i,
                                    max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+            if j is not None:
+                e_j = bootstrap_safe(engine, ctx, encoder, e_j,
+                                       max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
 
-        # ---- Stage C: mean-add + mask*safety_scale. ----
-        e_blocks[i] = _stage_c_post(e_i, block_sizes[i])
-        if j is not None:
-            e_blocks[j] = _stage_c_post(e_j, block_sizes[j])
+            # ---- Stage C: mean-add + mask*safety_scale. ----
+            e_blocks[i] = _stage_c_post(e_i, block_sizes[i])
+            if j is not None:
+                e_blocks[j] = _stage_c_post(e_j, block_sizes[j])
 
-        pair_idx += 2
+            pair_idx += 2
     _rec("attn_blocks", t0)
     if verbose:
         if safety_scale < 0.999:
             print(f"    [softmax-scale] safety_scale={safety_scale:.4f} folded into mask")
-        for kk, eb in enumerate(e_blocks):
-            _probe(f"attn post-e[{kk}]", ctx, encoder, sk, eb)
+        for kk, eb in enumerate(e_blocks[:2] + ([e_blocks[-1]] if n_blocks > 2 else [])):
+            _probe(f"attn post-e[{kk if kk < 2 else n_blocks-1}]",
+                   ctx, encoder, sk, eb)
 
-    # Multi-ct softmax aggregation. Encode the per-head first-slot mask
-    # at e_blocks[0]'s chain so multiply_plain inside the call accepts it.
     t0 = _t()
     a_chain_guess = e_blocks[0].chain_index()
     head_first_slot_mask_pt = encoder.encode_double_vector(
         ctx, head_first_slot_mask_slots, SCALE, a_chain_guess)
-    weights_blocks = multi_ct_softmax_finalize(
-        ctx, encoder, relin_key, galois_key,
-        e_blocks, head_first_slot_mask_pt,
-        N_HEADS, D_HEAD, T_MODEL, ITERS, SCALE,
-        sk=sk if verbose else None, verbose=verbose)
+    if use_packed:
+        # Pack post-stage-C e_blocks into one ct, run softmax_correct ONCE,
+        # unpack to per-block weights. ITERS-1 compensates for the unpack
+        # rotate+mask level so the final chain matches Wo IRP plaintexts.
+        packed_e = pack_score_blocks_tree(ctx, galois_key, e_blocks, T_MODEL)
+        if verbose: _probe("attn post-pack-e", ctx, encoder, sk, packed_e)
+        # Use ITERS-1 by default (chain budget at NSL=14); ITERS when chain
+        # headroom is available (NSL>=17 + USER_LEVEL_IRP_ATTN bumped to 11).
+        _packed_iters = ITERS if os.environ.get("PACKED_ITERS_FULL") == "1" else ITERS - 1
+        packed_weights = packed_softmax_finalize(
+            ctx, encoder, relin_key, galois_key,
+            packed_e, head_first_slot_mask_pt,
+            N_HEADS, D_HEAD, T_MODEL, n_blocks, _packed_iters, SCALE,
+            sk=sk if verbose else None, verbose=verbose)
+        if verbose: _probe("attn post-weights[packed]",
+                           ctx, encoder, sk, packed_weights)
+        weights_blocks = unpack_packed_weights(
+            ctx, encoder, galois_key, packed_weights,
+            n_blocks, D_HEAD, D_TOTAL, T_MODEL,
+            packed_weights.chain_index(), SCALE)
+    else:
+        weights_blocks = multi_ct_softmax_finalize(
+            ctx, encoder, relin_key, galois_key,
+            e_blocks, head_first_slot_mask_pt,
+            N_HEADS, D_HEAD, T_MODEL, ITERS, SCALE,
+            sk=sk if verbose else None, verbose=verbose)
     _rec("softmax_finalize", t0)
     if verbose:
-        for kk, wb in enumerate(weights_blocks):
+        for kk, wb in enumerate(weights_blocks[:2]):
             _probe(f"attn post-weights[{kk}]", ctx, encoder, sk, wb)
 
     # score_times_v_irp_multi
@@ -587,11 +1026,24 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     return o_ct
 
 
+_PROBE_DECRYPT_STAGES = os.environ.get("PROBE_DECRYPT_STAGES") == "1"
+_PROBE_DUMP_DIR = os.environ.get("PROBE_DUMP_DIR", "/tmp/probe_stage_dump")
+_PROBE_DUMP_LAYER = [None]  # set per-layer by run_classifier_fhe when verbose
+
+
 def _probe(tag, ctx, encoder, sk, ct):
     v = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
                  dtype=np.float64)
     print(f"    [probe] {tag:30s} chain={ct.chain_index():2d} "
           f"max|.|={np.abs(v).max():.4e} mean|.|={np.abs(v).mean():.4e}")
+    # DIAGNOSTIC ONLY (opt-in via PROBE_DECRYPT_STAGES=1). Dumps the full
+    # decrypted slot vector to disk so an offline harness can compute the
+    # rel-RMS vs plain-math per stage. When the flag is unset this block is
+    # not entered: byte-identical to the original.
+    if _PROBE_DECRYPT_STAGES and _PROBE_DUMP_LAYER[0] is not None:
+        os.makedirs(_PROBE_DUMP_DIR, exist_ok=True)
+        safe = tag.replace("/", "_").replace(" ", "_").replace("[", "").replace("]", "")
+        np.save(f"{_PROBE_DUMP_DIR}/L{_PROBE_DUMP_LAYER[0]}__{safe}.npy", v)
 
 
 # Module-level full-weight cache + lock used as a defensive fallback by
@@ -735,7 +1187,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     sk = engine.secret_key()
     relin_key = engine.relin_key()
     galois_key = engine.galois_key()
-    fresh_ci = engine.user_level_chain_index(0)
+    fresh_ci = engine.freshest_chain_index()
+    # Galois-key target chains were computed against FRESHEST_CHAIN=16; fail
+    # fast if the actual freshest chain has moved (e.g. evalmod_r=4).
+    assert fresh_ci == 16, (
+        f"engine.freshest_chain_index()={fresh_ci} != 16 — "
+        "build_user_steps_mrpc targets need to be updated.")
 
     # ---- Layer-independent IRP masks
     irp_attn_chain = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
@@ -773,6 +1230,20 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
     # ---- Per-layer FHE forward
     NUM_DECODERS = 32
+    # Opt-in autonomous residual stream (mirrors reverted commit 625ea9c
+    # "llama3: bootstrap y_ct forward as next-layer x_ct"). When
+    # AUTONOMOUS_FHE=1, layer >= 1 feeds the PREVIOUS layer's output
+    # ciphertext y_ct forward (bootstrapped to the same fresh chain /
+    # scale / stride-T_MODEL layout that encrypt_layer_inputs_multi
+    # produces for x_ct) instead of re-encrypting pytorch_ref[layer_idx].
+    # K/V/c_per_head still come from the clean numpy ref (x_btd) exactly
+    # as in 625ea9c, so the per-layer decrypt/log now measures the TRUE
+    # drift of the carried encrypted state vs pytorch_ref[layer_idx+1].
+    # Default (unset) leaves the guided path byte-for-byte unchanged.
+    _autonomous_fhe = os.environ.get("AUTONOMOUS_FHE") == "1"
+    _y_ct_carry = None  # bootstrapped y_ct from previous layer -> next x_ct
+    if _autonomous_fhe:
+        print("  [AUTONOMOUS_FHE] carrying y_ct forward (K/V from ref)")
     # Opt 1: pre-encode all 32 layers' R_P-dependent Wq IRPs (and prime
     # rp_indep_cache on first example) BEFORE the layer loop. Moves
     # ~1.5s/layer of encoding work out of the per-layer timer; total work
@@ -959,9 +1430,23 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                     _rp_sub = load_scp_dict_from_disk(_rp_dir)
                     _rp_L = _rp_sub[_L]
                     _w_L = _get_layer_w(_L)
+                    # The cached Wq IRPs bake in R_P = rope_matrix(
+                    # cos_all[P_local], sin_all[P_local]) — i.e. they depend
+                    # on query_position (P_local), NOT just num_tokens. In
+                    # variable-nt P_local == num_tokens-1 so nt alone keyed
+                    # uniquely, but at fixed-nt the query sits at P_local =
+                    # real_nt-1 << num_tokens, so a cache built for one
+                    # (num_tokens, P_local) must NOT be reused for another.
+                    # A stale cache/wq/nt_512/ from a prior run with a
+                    # different query position poisons every layer's Q
+                    # (uniform ~0.3 rel-RMS + L7/L8/L31 ~1e3 blow-ups,
+                    # while fresh-cache fixed-128 / variable-nt are fine).
+                    # Keying on P_local makes the cache correct for every
+                    # config and impossible to cross-contaminate.
                     _wq_dir = os.path.join(
                         os.path.dirname(rp_indep_disk_root),
-                        "wq", f"nt_{num_tokens}", f"layer_{_L:02d}")
+                        "wq", f"nt_{num_tokens}_q{P_local}",
+                        f"layer_{_L:02d}")
                     if has_cache(_wq_dir):
                         _wq_sub = load_scp_dict_from_disk(_wq_dir)
                         _diag_wq = _wq_sub[_L]
@@ -998,6 +1483,16 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             break
         t_layer_start = time.perf_counter()
         verbose = (debug_layer is not None and layer_idx == debug_layer)
+        # DIAGNOSTIC ONLY: tag stage dumps with the current layer so the
+        # offline rel-RMS harness can pick the right file. No-op when
+        # PROBE_DECRYPT_STAGES is unset (verbose is also False here normally).
+        _PROBE_DUMP_LAYER[0] = layer_idx if (verbose and _PROBE_DECRYPT_STAGES) else None
+        if _PROBE_DECRYPT_STAGES:
+            try:
+                import blocks.attention as _att_mod
+                _att_mod._PROBE_DUMP_LAYER[0] = _PROBE_DUMP_LAYER[0]
+            except Exception:
+                pass
         x_btd = pytorch_ref[layer_idx]  # (NUM_TOKENS, D_MODEL) — input to layer L
 
         # Streaming mode: JIT-load this layer's rp_indep SCPs from disk,
@@ -1102,13 +1597,26 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # Threshold = 5e-3 (matches the error budget the existing pipeline
         # tolerates at deg=32 Clenshaw on wide silu domains).
         _SILU_POLY_ERR_BUDGET = 5e-3
-        if silu_deg <= 20 and _best_err <= _SILU_POLY_ERR_BUDGET:
+        # Force Clenshaw at high-magnitude layers (L=30/31 in LLaMA-3.1-8B,
+        # silu_max ≥ 6 there). With NSQ=6, accumulated softmax-path drift
+        # can push some gate slot past the ±1.2·silu_max cushion at those
+        # layers — deg-20 monomial extrapolation past domain is catastrophic
+        # (silu(1.2D=9.5)≈-60 vs true 9.5), causing the L=30 cascade blowup
+        # to 150k+ observed in NSQ=6 sweeps. Clenshaw with deg-32 Chebyshev
+        # basis bounds intermediates by max|t_k| and stays bounded outside
+        # the fit domain. Cost: +2 bootstraps + ~840ms on the dispatched
+        # layers (only 2 of 32) → negligible at the layer-sweep scale.
+        if silu_deg <= 20 and _best_err <= _SILU_POLY_ERR_BUDGET and silu_max <= 6.0:
             silu_t_coeffs = None  # gates fhe_mlp_irp_bootstrap to eval_polynomial
             silu_D = None
             _silu_path = f"poly{silu_deg}"
         else:
             silu_D = silu_domain[1]
-            silu_t_coeffs = fit_silu_chebyshev_basis(silu_domain, deg=32)
+            # Clenshaw deg=32 is sufficient; deg=48 gives no measurable
+            # accuracy gain (verified idx=6: identical max|err| at L=30/31,
+            # confirming silu fit error ≪ accumulated CKKS noise floor).
+            _clenshaw_deg = int(os.environ.get("SILU_CLENSHAW_DEG", "32"))
+            silu_t_coeffs = fit_silu_chebyshev_basis(silu_domain, deg=_clenshaw_deg)
             _silu_path = "clenshaw"
         if verbose or layer_idx == (min_layer if min_layer is not None else 0):
             print(f"  [silu: deg={silu_deg} path={_silu_path} Linf={_best_err:.2e}]")
@@ -1122,11 +1630,43 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                   f"(deg={silu_deg}, Linf-at-CKKS={_best_err:.3e})")
             print(f"  [calib] softmax_safety_scale={max_abs_calib.get('softmax_safety_scale', 1.0):.4f}")
 
-        # Encrypt inputs (multi-ct K, V)
+        # Encrypt inputs (multi-ct K, V). K/V/c_per_head always derive
+        # from the clean numpy x_btd (= pytorch_ref[layer_idx]); only the
+        # encrypted query residual x_ct is carried in autonomous mode.
         t_encrypt0 = time.perf_counter()
         x_ct, k_cts, v_cts, c_per_head, _ = encrypt_layer_inputs_multi(
             ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
             num_tokens, cos_all, sin_all, P_local)
+        # DIAGNOSTIC ONLY (PROBE_DECRYPT_STAGES=1): dump the EXACT live
+        # c_per_head + safety_scale the FHE pipeline uses, so the offline
+        # harness compares decrypted intermediates against the SAME centering
+        # the ciphertext actually got. No-op when the flag is unset.
+        if _PROBE_DECRYPT_STAGES and _PROBE_DUMP_LAYER[0] is not None:
+            os.makedirs(_PROBE_DUMP_DIR, exist_ok=True)
+            np.savez(f"{_PROBE_DUMP_DIR}/L{layer_idx}__calib.npz",
+                     c_per_head=np.asarray(c_per_head, dtype=np.float64),
+                     safety_scale=np.float64(
+                         max_abs_calib.get("softmax_safety_scale", 1.0)),
+                     scores_max=np.float64(max_abs_calib.get("scores", 0.0)),
+                     q_max=np.float64(max_abs_calib.get("q", 0.0)),
+                     num_tokens=np.int64(num_tokens),
+                     query_position=np.int64(P_local))
+        if _autonomous_fhe and layer_idx >= 1:
+            # Mirror reverted 625ea9c: discard the freshly-encrypted x_ct
+            # (from pytorch_ref[layer_idx]) and feed the previous layer's
+            # output ciphertext forward instead. 625ea9c called
+            # engine.bootstrap_inplace(y_ct) directly to refresh it to a
+            # fresh level; the SK-free equivalent here is bootstrap_safe
+            # with the same x_in calibration the pipeline already trusts
+            # for x_ct (line below mirrors the boot_before["rms1"] site).
+            # This restores y_ct to the freshest chain index / SCALE that
+            # encrypt_layer_inputs_multi produces; the stride-T_MODEL slot
+            # layout is already preserved by the decoder pipeline (same
+            # layout that y_full[::T_MODEL][:D_MODEL] decodes).
+            assert _y_ct_carry is not None, "autonomous: missing y_ct carry"
+            x_ct = bootstrap_safe(engine, ctx, encoder, _y_ct_carry,
+                                   max_abs=max_abs_calib.get("x_in", 1.0),
+                                   slot_count=NUM_SLOTS)
         t_encrypt = time.perf_counter() - t_encrypt0
 
         # ---- FHE forward through one decoder layer ----
@@ -1153,7 +1693,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             engine, ctx, encoder, relin_key, galois_key, sk,
             x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
             k_cts, v_cts, c_per_head,
-            num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose)
+            num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose,
+            query_position=P_local)
         if verbose: _probe("post-attention", ctx, encoder, sk, attn_out)
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
@@ -1206,6 +1747,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
               f"[encrypt={t_encrypt*1000:.0f}ms decrypt={t_decrypt*1000:.0f}ms "
               f"fhe={t_fhe_ms:.0f}ms]")
         y_p_fhe = y_p
+        if _autonomous_fhe:
+            # Carry the post-residual2 output ciphertext into the next
+            # layer's x_ct (bootstrapped at the encrypt site above). The
+            # decrypt above is logging-only here (true drift measurement),
+            # exactly as in reverted 625ea9c.
+            _y_ct_carry = y_ct
 
         # Streaming mode: drop this layer's IRPs + raw weights so the
         # pinned-host SCPs (~2.3 GB) and Python heap go back to the OS
