@@ -131,11 +131,21 @@ def _run_one(idx, tok, ds, model_holder, cos_all_full, sin_all_full,
         idx, token_ids)
     pt_pred = "Yes" if yes_pt > no_pt else "No"
 
+    # DIAGNOSTIC ONLY: opt-in single-layer verbose via env vars. When all
+    # three are unset the args are None — byte-identical to the original
+    # `debug_layer=None, max_layer=None, min_layer=None`.
+    def _envint(name):
+        v = os.environ.get(name)
+        return int(v) if v is not None and v != "" else None
+    _dbg_layer = _envint("PROBE_DEBUG_LAYER")
+    _min_layer = _envint("PROBE_MIN_LAYER")
+    _max_layer = _envint("PROBE_MAX_LAYER")
+
     t0 = time.perf_counter()
     yes_logit, no_logit = run_classifier_fhe(
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}",
-        debug_layer=None, max_layer=None, min_layer=None,
+        debug_layer=_dbg_layer, max_layer=_max_layer, min_layer=_min_layer,
         rp_indep_cache=rp_indep_cache, engine=engine,
         rp_indep_disk_root=rp_indep_disk_root)
     elapsed = time.perf_counter() - t0
