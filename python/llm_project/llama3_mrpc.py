@@ -2691,233 +2691,80 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
                                       max_abs=max_abs_calib.get("rms1_out", 1.0),
                                       slot_count=NUM_SLOTS)
-        # Stage 2 dense-rewrite validation gate (ADDITIVE, opt-in via
-        # DENSE_ATTN=1). Layers 0 & 31 are the historically worst
-        # (calibration/magnitude); both must pass rel-RMS <= 1e-3 vs the
-        # verified oracle AND vs the live IRP-FHE scores at the same input.
-        # The IRP path below runs UNCHANGED and still feeds the residual
-        # stream — only an extra read-only decrypt is added when armed.
+        # Dense-layout rewrite: under DENSE_ATTN=1 (--dense) the dense
+        # pipeline (QK^T+softmax+score·V+Wo, then dense BSGS MLP below) is
+        # the SOLE compute path at EVERY layer (0..NUM_DECODERS-1). The IRP
+        # attention/MLP are NOT computed at all in this mode. When
+        # DENSE_ATTN is unset the IRP path runs UNCHANGED and is the sole
+        # path (default production pipeline — byte-identical to pre-rewrite).
+        # Escape hatch: DENSE_GATE_LAYERS (comma-list) restricts dense to
+        # those layer indices (IRP fills the rest); default = ALL layers.
         _dense_gate_here = False
         if _DENSE_ATTN or os.environ.get("DENSE_ATTN") == "1":
             _dg_env = os.environ.get("DENSE_GATE_LAYERS")
-            _dg_layers = ([int(s) for s in _dg_env.split(",")] if _dg_env
-                          else [0, NUM_DECODERS - 1])
-            _dense_gate_here = layer_idx in _dg_layers
-        if _dense_gate_here:
-            _DENSE_IRP_SCORE_SINK["armed"] = True
-            _DENSE_IRP_SCORE_SINK["armed_w"] = True
-            _DENSE_IRP_SCORE_SINK["sk"] = sk
-            _DENSE_IRP_SCORE_SINK["blocks"] = []
-            _DENSE_IRP_SCORE_SINK["weights"] = []
-
-        attn_out = fhe_attention_multi_ct(
-            engine, ctx, encoder, relin_key, galois_key, sk,
-            x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
-            k_cts, v_cts, c_per_head,
-            num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose,
-            query_position=P_local)
-        if verbose: _probe("post-attention", ctx, encoder, sk, attn_out)
+            if _dg_env:
+                _dense_gate_here = layer_idx in [int(s) for s in _dg_env.split(",")]
+            else:
+                _dense_gate_here = True  # dense at ALL layers (default --dense)
 
         if _dense_gate_here:
-            _DENSE_IRP_SCORE_SINK["armed"] = False
-            _DENSE_IRP_SCORE_SINK["armed_w"] = False
-            try:
-                _real_nt_g = _real_nt(num_tokens, P_local)
-                # Derive the SAME teacher-forced Q/K the IRP path used
-                # (mirror encrypt_layer_inputs_multi exactly).
-                _g1 = w["g1"]; _Wq = w["Wq"]; _Wk = w["Wk"]
-                _Wq_baked = _Wq.copy()
-                for _h in range(N_HEADS):
-                    _s, _e = _h * D_HEAD, (_h + 1) * D_HEAD
-                    _Wq_baked[_s:_e, :] = R_P @ _Wq[_s:_e, :]
-                _xn = rmsnorm_np(x_btd, _g1)
-                _K = (_xn @ _Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
-                _K = apply_rope_np(_K, cos_all, sin_all)
-                _K_h = np.repeat(_K, N_KV_GROUPS, axis=1)[:_real_nt_g]
-                _xn_q = _xn[P_local]
-                _dres = fhe_attention_dense_scores(
-                    ctx, encoder, sk, relin_key, galois_key,
-                    _xn_q, _Wq_baked, _K_h, c_per_head,
-                    _real_nt_g, fresh_ci)
-                _fs = _dres["fhe_scores"]
-                _os = _dres["oracle_scores"]
-                # Reassemble live IRP-FHE post-stage-A scores from the
-                # sink. IRP block layout: slot[h*D_HEAD*T_MODEL + tok],
-                # block k -> tokens [k*T_MODEL, k*T_MODEL+blk_size).
-                _irp = np.zeros((_real_nt_g, N_HEADS), dtype=np.float64)
-                _hb = D_HEAD * T_MODEL
-                _tok0 = 0
-                for _blk_size, _vec in _DENSE_IRP_SCORE_SINK["blocks"]:
-                    for _tl in range(_blk_size):
-                        _ta = _tok0 + _tl
-                        if _ta >= _real_nt_g:
-                            break
-                        for _h in range(N_HEADS):
-                            _irp[_ta, _h] = _vec[_h * _hb + _tl]
-                    _tok0 += _blk_size
+            # STANDALONE dense: do NOT compute the IRP attention. attn_out
+            # is produced purely by the dense FHE pipeline in the block
+            # below (it unconditionally rebinds attn_out from _f_out).
+            attn_out = None
+        else:
+            attn_out = fhe_attention_multi_ct(
+                engine, ctx, encoder, relin_key, galois_key, sk,
+                x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
+                k_cts, v_cts, c_per_head,
+                num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose,
+                query_position=P_local)
+            if verbose: _probe("post-attention", ctx, encoder, sk, attn_out)
 
-                def _relrms(a, b):
-                    a = np.asarray(a, np.float64); b = np.asarray(b, np.float64)
-                    d = np.linalg.norm(a - b)
-                    n = np.linalg.norm(b)
-                    return float(d / n) if n > 0 else float(d)
-
-                _ra = _relrms(_fs, _os)
-                _rb = _relrms(_fs, _irp)
-                _GATE = 1e-3
-                _pa = "PASS" if _ra <= _GATE else "FAIL"
-                _pb = "PASS" if _rb <= _GATE else "FAIL"
-                print(f"  [DENSE-GATE L{layer_idx:2d}] P={_dres['P']} "
-                      f"n_shards={_dres['n_shards']} real_nt={_real_nt_g}")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] (a) dense-FHE vs "
-                      f"oracle  rel-RMS={_ra:.3e}  [{_pa}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] (b) dense-FHE vs "
-                      f"IRP-FHE rel-RMS={_rb:.3e}  [{_pb}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] "
-                      f"‖fhe‖={np.linalg.norm(_fs):.4f} "
-                      f"‖oracle‖={np.linalg.norm(_os):.4f} "
-                      f"‖irp‖={np.linalg.norm(_irp):.4f}")
-
-                # ---- Stage 3: dense softmax gate. ----
-                _sres = fhe_attention_dense_softmax(
-                    engine, ctx, encoder, sk, relin_key, galois_key,
-                    _xn_q, _Wq_baked, _K_h, c_per_head,
-                    _real_nt_g, fresh_ci)
-                _fw = _sres["fhe_weights"]
-                _ow = _sres["oracle_weights"]
-                _hsum = _sres["head_sums"]
-                # Reassemble live IRP-FHE softmax weights from the sink.
-                # IRP weights-block layout: slot[h*D_HEAD*T_MODEL + tok],
-                # block k -> tokens [k*T_MODEL, k*T_MODEL+blk_size).
-                _irpw = np.zeros((_real_nt_g, N_HEADS), dtype=np.float64)
-                _tok0 = 0
-                for _blk_size, _vec in _DENSE_IRP_SCORE_SINK["weights"]:
-                    for _tl in range(_blk_size):
-                        _ta = _tok0 + _tl
-                        if _ta >= _real_nt_g:
-                            break
-                        for _h in range(N_HEADS):
-                            _irpw[_ta, _h] = _vec[_h * _hb + _tl]
-                    _tok0 += _blk_size
-
-                _sa = _relrms(_fw, _ow)
-                _sb = _relrms(_fw, _irpw)
-                # diagnostic: is dense-vs-oracle error just the inherent
-                # FHE-vs-oracle softmax fidelity the IRP path ALSO has?
-                _irp_vs_ora = _relrms(_irpw, _ow)
-                _hmax = float(np.max(np.abs(1.0 - _hsum)))
-                _psa = "PASS" if _sa <= _GATE else "FAIL"
-                _psb = "PASS" if _sb <= _GATE else "FAIL"
-                _psh = "PASS" if _hmax <= _GATE else "FAIL"
-                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax (a) vs "
-                      f"oracle  rel-RMS={_sa:.3e}  [{_psa}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax (b) vs "
-                      f"IRP-FHE rel-RMS={_sb:.3e}  [{_psb}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax "
-                      f"per-head-sum max|1-Σ|={_hmax:.3e}  [{_psh}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax "
-                      f"‖fhe_w‖={np.linalg.norm(_fw):.4f} "
-                      f"‖oracle_w‖={np.linalg.norm(_ow):.4f} "
-                      f"‖irp_w‖={np.linalg.norm(_irpw):.4f}")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax DIAG: "
-                      f"IRP-FHE vs oracle rel-RMS={_irp_vs_ora:.3e} "
-                      f"(inherent FHE softmax fidelity floor) | "
-                      f"dense-FHE adds {max(_sa - _irp_vs_ora, 0.0):.3e} "
-                      f"over that floor")
-
-                # ---- Stage 4: dense score·V + BSGS Wo (close the block).
-                # Teacher-forced V (GQA-expanded, NO rope) on the same
-                # numpy inputs encrypt_layer_inputs_multi uses; Wo carries
-                # NO R_P. Wv is in the 5-key hot subset; Wo is an
-                # R_P-independent weight NOT in the per-example subset and
-                # the shared _full_cache may already hold the 5-key subset
-                # (poisoning w["Wo"] -> KeyError), so load Wo directly off
-                # disk via the subset loader (one (4096,4096) fp64 array).
-                _Wv = w["Wv"]
-                _Wo = load_layer_weights_subset(
-                    layer_idx, keys=("Wo",))["Wo"]
-                _V = (_xn @ _Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
-                _V_h = np.repeat(_V, N_KV_GROUPS, axis=1)[:_real_nt_g]
-                _fres = fhe_attention_dense_full(
-                    engine, ctx, encoder, sk, relin_key, galois_key,
-                    _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
-                    _real_nt_g, fresh_ci)
-                _f_sv = _fres["fhe_attn_o"]          # (N_HEADS, D_HEAD)
-                _o_sv = _fres["oracle_attn_o"]       # (N_HEADS, D_HEAD)
-                _f_out = _fres["fhe_out"]            # (D_MODEL,)
-                _o_out = _fres["oracle_out"]         # (D_MODEL,)
-                # IRP reference for score·V: the LIVE IRP softmax weights
-                # (captured in the sink) applied to the teacher-forced V —
-                # semantically the IRP path's score·V. attn_irp_o[h,j] =
-                # Σ_tok irpw[tok,h]·V[tok,h,j].
-                _irp_sv = np.einsum(
-                    'th,thj->hj', _irpw, _V_h).astype(np.float64)
-                # IRP reference for post-Wo attn output: decrypt the LIVE
-                # IRP attn_out ciphertext (stride-T_MODEL layout, same as
-                # the residual stream / y_full[::T_MODEL][:D_MODEL]).
-                _irp_o_full = np.array(
-                    encoder.decode_double_vector(
-                        ctx, sk.decrypt(ctx, attn_out)),
-                    dtype=np.float64)
-                _irp_out = _irp_o_full[::T_MODEL][:D_MODEL]
-
-                _va = _relrms(_f_sv, _o_sv)
-                _vb = _relrms(_f_sv, _irp_sv)
-                _oa = _relrms(_f_out, _o_out)
-                _ob = _relrms(_f_out, _irp_out)
-                _LIN_GATE = 1e-3
-                print(f"  [DENSE-GATE L{layer_idx:2d}] score·V (a) vs "
-                      f"oracle  rel-RMS={_va:.3e}  "
-                      f"[{'PASS' if _va <= _LIN_GATE else 'FAIL'}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] score·V (b) vs "
-                      f"IRP-FHE rel-RMS={_vb:.3e}  "
-                      f"[{'PASS' if _vb <= _LIN_GATE else 'FAIL'}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] attn-out(post-Wo) "
-                      f"(a) vs oracle  rel-RMS={_oa:.3e}  "
-                      f"[{'PASS' if _oa <= _LIN_GATE else 'FAIL'}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] attn-out(post-Wo) "
-                      f"(b) vs IRP-FHE rel-RMS={_ob:.3e}  "
-                      f"[{'PASS' if _ob <= _LIN_GATE else 'FAIL'}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] "
-                      f"‖svf‖={np.linalg.norm(_f_sv):.4f} "
-                      f"‖svo‖={np.linalg.norm(_o_sv):.4f} "
-                      f"‖outf‖={np.linalg.norm(_f_out):.4f} "
-                      f"‖outo‖={np.linalg.norm(_o_out):.4f}")
-
-                # ---- WIRE END-TO-END: the dense attention output BECOMES
-                # the layer's attention output that flows into residual1.
-                # The IRP attn_out computed above is DISCARDED at gate
-                # layers. Layout bridge: the dense BSGS Wo output is
-                # replicated-block period-D_TOTAL (o_ct decoded[i]==O[i]
-                # for i<D_MODEL); the residual stream / x_ct is
-                # stride-T_MODEL (slot[i*T_MODEL]==x[i], cf.
-                # encrypt_layer_inputs_multi x_slots). Re-encode O into
-                # stride-T_MODEL and re-encrypt at fresh_ci — the SAME
-                # teacher-forcing layout bridge the per-layer pipeline
-                # already applies to its inputs (encrypt_layer_inputs_multi
-                # re-encrypts from clean numpy each layer). ALL the dense
-                # FHE compute (QK^T + softmax + score·V + BSGS Wo) happens
-                # BEFORE this bridge, so the `Layer {L}` rel-RMS vs
-                # pytorch_ref[L+1] below now reflects the FULL DENSE
-                # pipeline's numerical fidelity, NOT the IRP path.
-                _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-                _attn_slots[::T_MODEL][:D_MODEL] = _f_out
-                attn_out = sk.encrypt_symmetric(
-                    ctx, encoder.encode_double_vector(
-                        ctx, _attn_slots, SCALE, fresh_ci))
-                print(f"  [DENSE-GATE L{layer_idx:2d}] WIRED: dense "
-                      f"attn-out -> residual stream (IRP attn_out "
-                      f"discarded at this gate layer; Layer {layer_idx} "
-                      f"rel-RMS below reflects the DENSE pipeline)")
-            except Exception as _de:
-                import traceback
-                print(f"  [DENSE-GATE L{layer_idx:2d}] ERROR: "
-                      f"{type(_de).__name__}: {_de}")
-                traceback.print_exc()
-            finally:
-                _DENSE_IRP_SCORE_SINK["sk"] = None
-                _DENSE_IRP_SCORE_SINK["blocks"] = []
-                _DENSE_IRP_SCORE_SINK["weights"] = []
+        if _dense_gate_here:
+            # ---- STANDALONE dense attention: QK^T + softmax + score·V +
+            # BSGS Wo, all FHE, NO IRP compute. fhe_attention_dense_full
+            # runs the complete dense block internally; its _f_out becomes
+            # the layer's attention output feeding residual1. Teacher-forced
+            # Q/K/V mirror encrypt_layer_inputs_multi exactly (same numpy
+            # x_btd / weights / rope the IRP path's inputs were built from).
+            # Wo / (Wv via w) are R_P-independent; Wo is NOT in the per-
+            # example hot subset and the shared _full_cache may hold only
+            # the 5-key subset (w["Wo"] -> KeyError), so load Wo directly
+            # off disk via the subset loader (one (4096,4096) fp64 array).
+            # Layout bridge: dense BSGS Wo output is replicated-block
+            # period-D_TOTAL; the residual stream / x_ct is stride-T_MODEL
+            # (slot[i*T_MODEL]==x[i], cf. encrypt_layer_inputs_multi). Re-
+            # encode into stride-T_MODEL and re-encrypt at fresh_ci — the
+            # SAME teacher-forcing layout bridge the per-layer pipeline
+            # already applies to its inputs each layer. The `Layer {L}`
+            # rel-RMS vs pytorch_ref[L+1] below is the standalone validation
+            # metric (the SAME metric the IRP path was held to).
+            _real_nt_g = _real_nt(num_tokens, P_local)
+            _g1 = w["g1"]; _Wq = w["Wq"]; _Wk = w["Wk"]; _Wv = w["Wv"]
+            _Wq_baked = _Wq.copy()
+            for _h in range(N_HEADS):
+                _s, _e = _h * D_HEAD, (_h + 1) * D_HEAD
+                _Wq_baked[_s:_e, :] = R_P @ _Wq[_s:_e, :]
+            _xn = rmsnorm_np(x_btd, _g1)
+            _K = (_xn @ _Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+            _K = apply_rope_np(_K, cos_all, sin_all)
+            _K_h = np.repeat(_K, N_KV_GROUPS, axis=1)[:_real_nt_g]
+            _xn_q = _xn[P_local]
+            _Wo = load_layer_weights_subset(
+                layer_idx, keys=("Wo",))["Wo"]
+            _V = (_xn @ _Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+            _V_h = np.repeat(_V, N_KV_GROUPS, axis=1)[:_real_nt_g]
+            _fres = fhe_attention_dense_full(
+                engine, ctx, encoder, sk, relin_key, galois_key,
+                _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
+                _real_nt_g, fresh_ci)
+            _f_out = _fres["fhe_out"]            # (D_MODEL,)
+            _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+            _attn_slots[::T_MODEL][:D_MODEL] = _f_out
+            attn_out = sk.encrypt_symmetric(
+                ctx, encoder.encode_double_vector(
+                    ctx, _attn_slots, SCALE, fresh_ci))
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
@@ -2935,184 +2782,114 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                                            max_abs=max_abs_calib.get("rms2_out", 1.0),
                                            slot_count=NUM_SLOTS)
         if _dense_gate_here:
-            # ---- Stage 5: dense BSGS MLP (replaces IRP MLP at gate layers).
+            # ---- STANDALONE dense BSGS MLP (Stage 5). This is the SOLE
+            # MLP compute under --dense; the IRP MLP does NOT run here.
             # Input: x_mid_norm in stride-T_MODEL layout (rmsnorm output).
-            # Contract: dense BSGS needs replicated-block period D_PAD_MLP.
-            # Layout bridge: decrypt x_mid_norm, build period-D_PAD_MLP
-            # replicated-block slots, re-encrypt at fresh_ci — mirrors the
-            # Stage 4 attn-out bridge exactly.
+            # Contract: dense BSGS needs replicated-block period D_PAD_MLP,
+            # so decrypt x_mid_norm, build period-D_PAD_MLP replicated-block
+            # slots, re-encrypt at fresh_ci — the SAME teacher-forcing
+            # layout bridge the standalone dense attention output uses.
             # All galois steps (baby_steps=128, d_pad=D_PAD_MLP=16384) are
             # already provisioned by irp_required_steps_rect — ZERO new keys.
+            # Standalone validation = the `Layer {L}` rel-RMS vs
+            # pytorch_ref[L+1] below (same metric the IRP path was held to).
             _DENSE_MLP_BABY_STEPS = 128  # divides 16384; steps={1,2,4,...,64,128} ⊆ provisioned
             # Wgate/Wup/Wdown are R_P-independent and may not be in w's hot
-            # subset (same situation as Wo at Stage 4) — load via subset loader.
+            # subset (same situation as Wo) — load via subset loader.
             _mlp_ws = load_layer_weights_subset(
                 layer_idx, keys=("Wgate", "Wup", "Wdown"))
             _Wgate = np.asarray(_mlp_ws["Wgate"], dtype=np.float64)  # (D_HIDDEN, D_MODEL)
             _Wup   = np.asarray(_mlp_ws["Wup"],   dtype=np.float64)  # (D_HIDDEN, D_MODEL)
             _Wdown = np.asarray(_mlp_ws["Wdown"], dtype=np.float64)  # (D_MODEL,  D_HIDDEN)
 
-            try:
-                # -- numpy oracle for DENSE-GATE diagnostics --
-                _xn2_raw = np.array(
-                    encoder.decode_double_vector(ctx, sk.decrypt(ctx, x_mid_norm)),
-                    dtype=np.float64)
-                _xn2_p = _xn2_raw[::T_MODEL][:D_MODEL]   # stride-T_MODEL decode
-                _gate_np   = _xn2_p @ _Wgate.T            # (D_HIDDEN,)
-                _up_np     = _xn2_p @ _Wup.T              # (D_HIDDEN,)
-                _silu_np   = _gate_np / (1.0 + np.exp(-_gate_np))  # silu element-wise
-                _h_np      = _silu_np * _up_np             # (D_HIDDEN,)
-                _down_np   = _h_np @ _Wdown.T              # (D_MODEL,)
+            # -- input bridge: decrypt x_mid_norm (stride-T_MODEL) and
+            #    re-encode as replicated-block period D_PAD_MLP --
+            _xn2_raw = np.array(
+                encoder.decode_double_vector(ctx, sk.decrypt(ctx, x_mid_norm)),
+                dtype=np.float64)
+            _xn2_p = _xn2_raw[::T_MODEL][:D_MODEL]   # stride-T_MODEL decode
+            _mlp_in_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+            _periods_in = NUM_SLOTS // D_PAD_MLP   # = 2
+            for _k in range(_periods_in):
+                _mlp_in_slots[_k * D_PAD_MLP : _k * D_PAD_MLP + D_MODEL] = _xn2_p
+            _mlp_in_ct = sk.encrypt_symmetric(
+                ctx, encoder.encode_double_vector(
+                    ctx, _mlp_in_slots, SCALE, fresh_ci))
 
-                # -- input bridge: stride-T_MODEL -> replicated-block period D_PAD_MLP --
-                _mlp_in_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-                _periods_in = NUM_SLOTS // D_PAD_MLP   # = 2
-                for _k in range(_periods_in):
-                    _mlp_in_slots[_k * D_PAD_MLP : _k * D_PAD_MLP + D_MODEL] = _xn2_p
-                _mlp_in_ct = sk.encrypt_symmetric(
-                    ctx, encoder.encode_double_vector(
-                        ctx, _mlp_in_slots, SCALE, fresh_ci))
+            # -- BSGS Wgate: (D_HIDDEN×D_MODEL) zero-padded to d_pad=D_PAD_MLP --
+            _wgate_flat = _Wgate.ravel().tolist()
+            _gate_diags = phantom.pre_encode_bsgs_diagonals(
+                ctx, encoder, _wgate_flat,
+                D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+            _gate_ct = phantom.bsgs_matmul_preencoded(
+                ctx, galois_key, _mlp_in_ct, _gate_diags)
 
-                # -- BSGS Wgate: (D_HIDDEN×D_MODEL) zero-padded to d_pad=D_PAD_MLP --
-                _wgate_flat = _Wgate.ravel().tolist()
-                _gate_diags = phantom.pre_encode_bsgs_diagonals(
-                    ctx, encoder, _wgate_flat,
-                    D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
-                _gate_ct = phantom.bsgs_matmul_preencoded(
-                    ctx, galois_key, _mlp_in_ct, _gate_diags)
+            # -- BSGS Wup: reuse same baby rotations of _mlp_in_ct --
+            _wup_flat = _Wup.ravel().tolist()
+            _up_diags = phantom.pre_encode_bsgs_diagonals(
+                ctx, encoder, _wup_flat,
+                D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+            _up_ct = phantom.bsgs_matmul_preencoded(
+                ctx, galois_key, _mlp_in_ct, _up_diags)
 
-                # -- BSGS Wup: reuse same baby rotations of _mlp_in_ct --
-                _wup_flat = _Wup.ravel().tolist()
-                _up_diags = phantom.pre_encode_bsgs_diagonals(
-                    ctx, encoder, _wup_flat,
-                    D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
-                _up_ct = phantom.bsgs_matmul_preencoded(
-                    ctx, galois_key, _mlp_in_ct, _up_diags)
+            # -- silu(gate): slot-wise, layout-invariant.
+            #    IRP-PARITY dispatch (mirrors fhe_mlp_irp_bootstrap in
+            #    llama3.py): at high-magnitude layers (L30/31, silu_max>6)
+            #    the harness sets silu_t_coeffs/silu_D and the BOUNDED
+            #    Chebyshev-basis Clenshaw path is taken. The deg<=20
+            #    monomial silu_coeffs catastrophically extrapolates past
+            #    the ±1.2·silu_max fit domain (silu(9.5)≈-60 vs ≈9.5),
+            #    so the dense path MUST honor silu_t_coeffs/silu_D too. --
+            if silu_t_coeffs is not None and silu_D is not None:
+                from blocks.silu import silu_clenshaw
+                _silu_ct = silu_clenshaw(
+                    engine, ctx, encoder, relin_key, _gate_ct,
+                    silu_D, silu_t_coeffs, NUM_SLOTS,
+                    galois_key=galois_key)
+            else:
+                _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
+                                coeffs=silu_coeffs,
+                                norm_factor=silu_norm_factor,
+                                slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
 
-                # -- DIAGNOSTIC (DENSE_MLP_PROBE=1; default byte-identical):
-                #    decrypt each dense MLP sub-stage period-0 -> numpy oracle.
-                #    Localizes WHERE an L31 explosion first appears. --
-                _DMP = os.environ.get("DENSE_MLP_PROBE") == "1"
-                def _dmp(_tag, _ct, _ref):
-                    if not _DMP:
-                        return
-                    _v = np.array(
-                        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _ct)),
-                        dtype=np.float64)[:len(_ref)]
-                    _rr = float(np.linalg.norm(_v - _ref)
-                                / (np.linalg.norm(_ref) + 1e-30))
-                    print(f"  [DENSE-MLP-PROBE L{layer_idx:2d}] {_tag:<14s} "
-                          f"rel-RMS={_rr:.3e}  max|fhe|={np.abs(_v).max():.3e}  "
-                          f"max|ref|={np.abs(_ref).max():.3e}")
-                _dmp("gate", _gate_ct, _gate_np)
-                _dmp("up",   _up_ct,   _up_np)
+            # -- h = silu(gate) * up --
+            _s_ci = _silu_ct.chain_index()
+            _u_ci = _up_ct.chain_index()
+            if _u_ci < _s_ci:
+                _up_ct = phantom.mod_switch_to(ctx, _up_ct, _s_ci)
+            elif _u_ci > _s_ci:
+                _silu_ct = phantom.mod_switch_to(ctx, _silu_ct, _u_ci)
+            _silu_ct.set_scale(_up_ct.scale())
+            _h_ct = phantom.multiply_and_relin(ctx, _silu_ct, _up_ct, relin_key)
+            _h_ct = phantom.rescale_to_next(ctx, _h_ct)
+            _h_ct.set_scale(SCALE)
 
-                # -- silu(gate): slot-wise, layout-invariant.
-                #    IRP-PARITY dispatch (mirrors fhe_mlp_irp_bootstrap in
-                #    llama3.py): at high-magnitude layers (L30/31, silu_max>6)
-                #    the harness sets silu_t_coeffs/silu_D and the IRP MLP
-                #    takes the BOUNDED Chebyshev-basis Clenshaw path. The
-                #    deg<=20 monomial silu_coeffs catastrophically extrapolates
-                #    past the ±1.2·silu_max fit domain (silu(9.5)≈-60 vs ≈9.5),
-                #    so the dense path MUST honor silu_t_coeffs/silu_D too. --
-                if silu_t_coeffs is not None and silu_D is not None:
-                    from blocks.silu import silu_clenshaw
-                    _silu_ct = silu_clenshaw(
-                        engine, ctx, encoder, relin_key, _gate_ct,
-                        silu_D, silu_t_coeffs, NUM_SLOTS,
-                        galois_key=galois_key)
-                else:
-                    _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
-                                    coeffs=silu_coeffs,
-                                    norm_factor=silu_norm_factor,
-                                    slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
-                _dmp("silu(gate)", _silu_ct, _silu_np)
+            # -- bootstrap h (mirrors IRP MLP bootstrap before down-proj) --
+            _h_calib = max_abs_calib.get("h", 1.26) if max_abs_calib else 1.26
+            _h_ct = bootstrap_safe(engine, ctx, encoder, _h_ct,
+                                   max_abs=_h_calib, slot_count=NUM_SLOTS)
 
-                # -- h = silu(gate) * up --
-                _s_ci = _silu_ct.chain_index()
-                _u_ci = _up_ct.chain_index()
-                if _u_ci < _s_ci:
-                    _up_ct = phantom.mod_switch_to(ctx, _up_ct, _s_ci)
-                elif _u_ci > _s_ci:
-                    _silu_ct = phantom.mod_switch_to(ctx, _silu_ct, _u_ci)
-                _silu_ct.set_scale(_up_ct.scale())
-                _h_ct = phantom.multiply_and_relin(ctx, _silu_ct, _up_ct, relin_key)
-                _h_ct = phantom.rescale_to_next(ctx, _h_ct)
-                _h_ct.set_scale(SCALE)
-                _dmp("h=silu*up", _h_ct, _h_np)
+            # -- BSGS Wdown: (D_MODEL×D_HIDDEN) zero-padded to d_pad=D_PAD_MLP --
+            _wdown_flat = _Wdown.ravel().tolist()
+            _down_diags = phantom.pre_encode_bsgs_diagonals(
+                ctx, encoder, _wdown_flat,
+                D_MODEL, D_HIDDEN, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+            _down_ct = phantom.bsgs_matmul_preencoded(
+                ctx, galois_key, _h_ct, _down_diags)
 
-                # -- bootstrap h (mirrors IRP MLP bootstrap before down-proj) --
-                _h_calib = max_abs_calib.get("h", 1.26) if max_abs_calib else 1.26
-                _h_ct = bootstrap_safe(engine, ctx, encoder, _h_ct,
-                                       max_abs=_h_calib, slot_count=NUM_SLOTS)
-                _dmp("h_post_boot", _h_ct, _h_np)
+            # -- decode down_ct period-0 -> dense MLP out (D_MODEL,) --
+            _down_raw = np.array(
+                encoder.decode_double_vector(ctx, sk.decrypt(ctx, _down_ct)),
+                dtype=np.float64)
+            _fhe_down = _down_raw[:D_MODEL]
 
-                # -- BSGS Wdown: (D_MODEL×D_HIDDEN) zero-padded to d_pad=D_PAD_MLP --
-                _wdown_flat = _Wdown.ravel().tolist()
-                _down_diags = phantom.pre_encode_bsgs_diagonals(
-                    ctx, encoder, _wdown_flat,
-                    D_MODEL, D_HIDDEN, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
-                _down_ct = phantom.bsgs_matmul_preencoded(
-                    ctx, galois_key, _h_ct, _down_diags)
-
-                # -- FHE diagnostics: decode down_ct period-0 -> dense MLP out --
-                _down_raw = np.array(
-                    encoder.decode_double_vector(ctx, sk.decrypt(ctx, _down_ct)),
-                    dtype=np.float64)
-                _fhe_down = _down_raw[:D_MODEL]
-
-                _mlp_vs_oracle = float(
-                    np.linalg.norm(_fhe_down - _down_np)
-                    / (np.linalg.norm(_down_np) + 1e-30))
-
-                # IRP MLP decode for vs-IRP comparison
-                _irp_mlp_dummy = fhe_mlp_irp_bootstrap(
-                    engine, ctx, encoder, relin_key, galois_key,
-                    x_mid_norm,
-                    diag_gate_irp, diag_up_irp, diag_down_irp,
-                    sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-                    max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
-                    silu_norm_factor=silu_norm_factor,
-                    silu_t_coeffs=silu_t_coeffs, silu_D=silu_D)
-                _irp_out_raw = np.array(
-                    encoder.decode_double_vector(ctx, sk.decrypt(ctx, _irp_mlp_dummy)),
-                    dtype=np.float64)
-                _irp_down = _irp_out_raw[::T_MODEL][:D_MODEL]
-                _mlp_vs_irp = float(
-                    np.linalg.norm(_fhe_down - _irp_down)
-                    / (np.linalg.norm(_irp_down) + 1e-30))
-
-                _DENSE_MLP_GATE = 1e-2  # MLP linear+SiLU: expect ~1e-3; report honestly
-                print(f"  [DENSE-GATE L{layer_idx:2d}] dense-MLP vs oracle  "
-                      f"rel-RMS={_mlp_vs_oracle:.3e}  "
-                      f"[{'PASS' if _mlp_vs_oracle <= _DENSE_MLP_GATE else 'FAIL'}]")
-                print(f"  [DENSE-GATE L{layer_idx:2d}] dense-MLP vs IRP-FHE "
-                      f"rel-RMS={_mlp_vs_irp:.3e}  "
-                      f"[{'PASS' if _mlp_vs_irp <= _DENSE_MLP_GATE else 'FAIL'}]")
-
-                # -- output bridge: replicated-block period D_PAD_MLP -> stride-T_MODEL --
-                # pack _fhe_down into stride-T_MODEL layout, re-encrypt at fresh_ci
-                _mlp_out_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-                _mlp_out_slots[::T_MODEL][:D_MODEL] = _fhe_down
-                mlp_out = sk.encrypt_symmetric(
-                    ctx, encoder.encode_double_vector(
-                        ctx, _mlp_out_slots, SCALE, fresh_ci))
-                print(f"  [DENSE-GATE L{layer_idx:2d}] WIRED: dense MLP-out "
-                      f"-> residual2 (IRP MLP discarded; FULL dense layer)")
-            except Exception as _me:
-                import traceback
-                print(f"  [DENSE-GATE L{layer_idx:2d}] dense-MLP ERROR: "
-                      f"{type(_me).__name__}: {_me}")
-                traceback.print_exc()
-                # fall back to IRP MLP on error
-                mlp_out = fhe_mlp_irp_bootstrap(
-                    engine, ctx, encoder, relin_key, galois_key,
-                    x_mid_norm,
-                    diag_gate_irp, diag_up_irp, diag_down_irp,
-                    sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-                    max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
-                    silu_norm_factor=silu_norm_factor,
-                    silu_t_coeffs=silu_t_coeffs, silu_D=silu_D)
+            # -- output bridge: replicated-block period D_PAD_MLP -> stride-T_MODEL --
+            # pack _fhe_down into stride-T_MODEL layout, re-encrypt at fresh_ci
+            _mlp_out_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+            _mlp_out_slots[::T_MODEL][:D_MODEL] = _fhe_down
+            mlp_out = sk.encrypt_symmetric(
+                ctx, encoder.encode_double_vector(
+                    ctx, _mlp_out_slots, SCALE, fresh_ci))
         else:
             mlp_out = fhe_mlp_irp_bootstrap(
                 engine, ctx, encoder, relin_key, galois_key,
