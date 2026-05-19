@@ -41,22 +41,19 @@ sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/build/lib")
 import pyPhantom as phantom
 
 sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
+# Dense pipeline rotation-step builders (IRP machinery deleted; the dense
+# token-major path is the SOLE compute path). All four cover exactly the
+# galois steps the dense kernels rotate:
+#   - qkt_required_steps  -> phantom.compute_qkt inner-sum(d_head)
+#   - score_v_required_steps -> phantom.score_times_v broadcast+accumulate
+#   - broadcast_required_steps -> optional DENSE_SMX_BCAST per-head fold
+#   - bsgs_required_steps(64) -> Wq/Wo/MLP BSGS (phantom C++ primitive)
 from blocks.attention import (
-    compute_qkt_irp_multi, multi_ct_softmax_finalize, score_times_v_irp_multi,
-    qkt_irp_mask_scale_plaintext, qkt_irp_per_head_sub_plaintext,
-    score_v_irp_output_mask_plaintext,
-    sdpa_irp_required_steps,
-    pack_score_blocks_tree, packed_softmax_finalize, unpack_packed_weights,
+    qkt_required_steps, score_v_required_steps, broadcast_required_steps,
 )
 from blocks.bootstrap import bootstrap_safe
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
-)
-from blocks.irp import (
-    encode_irp_diagonals_host, irp_matvec_host,
-    encode_irp_mask, irp_required_steps,
-    encode_irp_diagonals_rect_host, irp_matvec_rect_host,
-    encode_irp_mask_rect, irp_required_steps_rect,
 )
 from blocks.kv_layout import pack_kv_blocks
 from blocks import kv_layout_dense as _dense_oracle
@@ -68,7 +65,9 @@ from blocks.rmsnorm import (
     setup_rmsnorm_weights,
 )
 from blocks.silu import silu, fit_silu_coeffs, fit_silu_chebyshev_basis
-from blocks.softmax import softmax_damping_schedule, sum_reduce_stride
+from blocks.softmax import (
+    softmax_damping_schedule, softmax_required_steps, sum_reduce_stride,
+)
 from llama3 import (
     LOG_N, N, NUM_SLOTS, SCALE, SPARSE_HW,
     D_MODEL, D_HEAD, N_HEADS, N_KV_HEADS, N_KV_GROUPS, D_TOTAL,
@@ -81,8 +80,7 @@ from llama3 import (
     rmsnorm_np, apply_rope_np, rope_matrix_np, silu_np,
     rms_z_window, compute_layer_z, compute_layer_max_abs,
     forward_decoder_np,
-    load_layer_weights, load_layer_weights_subset, encode_layer_irps,
-    fhe_mlp_irp_bootstrap,
+    load_layer_weights, load_layer_weights_subset,
 )
 
 
@@ -311,88 +309,75 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
 
 
 def build_user_steps_mrpc():
-    """Galois rotation steps needed for the multi-ct MRPC pipeline at
-    NUM_TOKENS_PER_BLOCK=T_MODEL=8.
+    """Galois rotation steps for the dense token-major MRPC pipeline.
 
-    Returns (user_steps, step_categories) where step_categories is a dict
-    of step subsets used by setup_engine for per-step target chain
-    assignment.
+    The IRP machinery is gone; the dense path is the SOLE compute path.
+    Every step below is a rotation a dense FHE kernel actually performs
+    (verified: the dense pipeline rotates exactly this set, a subset of
+    the rotations the deleted IRP step builders used to provision, so the
+    galois-key set is unchanged in coverage):
+
+      rms_steps      rmsnorm_required_steps_stride_t  -> stride-t rmsnorm
+                       {8,16,...,16384}
+      bsgs_steps     phantom.bsgs_required_steps(64)  -> Wq/Wo/MLP BSGS
+                       (bsgs_matmul_preencoded, d_pad in {D_TOTAL,D_PAD_MLP},
+                        baby_steps in {64,128}; required steps {1,2,...,64})
+      qkt_steps      qkt_required_steps(D_HEAD)       -> phantom.compute_qkt
+                       inner-sum over d_head {1,2,...,64}
+      smx_steps      softmax_required_steps(P,D_TOTAL)-> dense softmax
+                       sum_reduce_stride(stride=D_TOTAL,count=P) {4096,8192,16384}
+      score_v_steps  score_v_required_steps(D_HEAD,   -> phantom.score_times_v
+                       D_TOTAL,P)  {-1,..,-64, 4096,8192,16384}
+      bcast_steps    broadcast_required_steps(N_HEADS)-> optional per-head
+                       softmax fold (env DENSE_SMX_BCAST) {-1,..,-16}
+
+    Returns (user_steps, step_categories); step_categories buckets steps
+    by the chain depth they fire at for setup_engine's per-step galois
+    target-chain assignment.
     """
-    log_t = int(round(math.log2(T_MODEL)))
-    log_d_head = int(round(math.log2(D_HEAD)))
+    # Full positions per ciphertext frame (dense token-major layout):
+    # NUM_SLOTS / D_TOTAL frames; the dense softmax sum_reduce_stride folds
+    # these P frames at stride D_TOTAL.
+    P_frames = NUM_SLOTS // D_TOTAL
 
-    rms_steps = rmsnorm_required_steps_stride_t(D_MODEL, T_MODEL)
-    sdpa_steps = sdpa_irp_required_steps(D_HEAD, D_TOTAL, T_MODEL, T_MODEL)
-    irp_attn_steps = irp_required_steps(NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE)
-    irp_mlp_w_steps = irp_required_steps_rect(NUM_SLOTS, D_MODEL, D_PAD_MLP,
-                                                baby_steps=BABY_STEPS_IRP_MLP)
-    irp_mlp_t_steps = irp_required_steps_rect(NUM_SLOTS, D_PAD_MLP, D_MODEL,
-                                                baby_steps=BABY_STEPS_IRP_MLP)
-    # Multi-ct softmax: within-block + broadcast doubling
-    softmax_steps = []
-    for s in range(log_t):
-        softmax_steps.append(int(1 << s))
-        softmax_steps.append(-int(1 << s))
-
-    # Packed-score softmax (single-ct path, all blocks packed via tree
-    # rotation). Adds log2(packed_nt) sum_reduce + log2(packed_nt) broadcast
-    # rotations, plus BSGS unpack rotations when PACKED_SOFTMAX_NT_MAX is set
-    # (typical value: 512). For n_blocks_max=64 the unpack uses BSGS
-    # (baby_count=8, giant_count=8): 7 baby + 7 giant = 14 positive multiples
-    # of T_MODEL instead of the naive 63. Pack rotations reuse the existing
-    # sdpa_score_v_broadcast keys {-T, -2T, ..., -32T} so no new negative
-    # multiples of T are needed.
-    packed_nt_max_env = os.environ.get("PACKED_SOFTMAX_NT_MAX")
-    packed_sum_reduce_set = set()
-    packed_broadcast_set = set()
-    packed_unpack_set = set()
-    extra_packed_steps = []
-    if packed_nt_max_env:
-        packed_nt_max = int(packed_nt_max_env)
-        if packed_nt_max <= 0 or (packed_nt_max & (packed_nt_max - 1)) != 0:
-            raise ValueError(
-                f"PACKED_SOFTMAX_NT_MAX must be a positive power of 2, "
-                f"got {packed_nt_max}")
-        if packed_nt_max % T_MODEL != 0:
-            raise ValueError(
-                f"PACKED_SOFTMAX_NT_MAX={packed_nt_max} must be multiple of "
-                f"T_MODEL={T_MODEL}")
-        n_blocks_max = packed_nt_max // T_MODEL
-        log_packed_nt = int(round(math.log2(packed_nt_max)))
-        packed_sum_reduce_set = {int(1 << s) for s in range(log_packed_nt)}
-        packed_broadcast_set = {-int(1 << s) for s in range(log_packed_nt)}
-        # BSGS unpack: baby_count chosen so baby_count*giant_count >= n_blocks_max
-        # with baby_count + giant_count minimized. For n_blocks_max=64 use
-        # baby_count=8 (covers 8*8=64) -> 7 baby + 7 giant = 14 keys.
-        BSGS_BABY_COUNT = 8
-        bsgs_giant_count = (n_blocks_max + BSGS_BABY_COUNT - 1) // BSGS_BABY_COUNT
-        packed_unpack_set = (
-            {int(T_MODEL * b) for b in range(1, BSGS_BABY_COUNT)}
-            | {int(T_MODEL * BSGS_BABY_COUNT * g)
-               for g in range(1, bsgs_giant_count)}
-        )
-        extra_packed_steps = (list(packed_sum_reduce_set)
-                              + list(packed_broadcast_set)
-                              + list(packed_unpack_set))
+    rms_steps      = list(rmsnorm_required_steps_stride_t(D_MODEL, T_MODEL))
+    bsgs_steps     = [int(s) for s in phantom.bsgs_required_steps(64)]
+    qkt_steps      = list(qkt_required_steps(D_HEAD))
+    smx_steps      = list(softmax_required_steps(P_frames, D_TOTAL))
+    score_v_steps  = list(score_v_required_steps(D_HEAD, D_TOTAL, P_frames))
+    # The DENSE_SMX_BCAST per-head fold is OFF by default; provision its
+    # keys unconditionally so toggling the env var never needs an engine
+    # rebuild (5 negative single-step keys, already a subset of score_v's
+    # negative broadcast set — zero extra distinct galois elements).
+    bcast_steps    = list(broadcast_required_steps(N_HEADS))
 
     user_steps = sorted(set(
-        list(rms_steps) + list(sdpa_steps) +
-        list(irp_attn_steps) + list(irp_mlp_w_steps) + list(irp_mlp_t_steps) +
-        softmax_steps + extra_packed_steps
+        rms_steps + bsgs_steps + qkt_steps + smx_steps
+        + score_v_steps + bcast_steps
     ))
+    # Chain-depth buckets (dense pipeline trace, restarts at 16 each
+    # bootstrap): BSGS Wq + compute_qkt inner-sum fire post-bootstrap at
+    # chain 16 (qkt-class); the dense-softmax sum_reduce_stride fires
+    # post-mask at chain 17 (finalize-class); score_times_v's broadcast
+    # fires post-softmax at chain 23 (score_v-class). rms steps fire at 16.
+    qkt_bucket = set(bsgs_steps) | set(qkt_steps)
+    smx_bucket = set(smx_steps)
+    # score_v's positive accumulate steps coincide with smx sum_reduce
+    # ({4096,8192,16384}); the broadcast (negative) steps are score_v-only.
+    score_v_neg = {s for s in score_v_steps if s < 0} | set(bcast_steps)
     step_categories = {
         "rms": set(rms_steps),
-        "sdpa": set(sdpa_steps),
-        "irp_attn": set(irp_attn_steps),
-        "irp_mlp_w": set(irp_mlp_w_steps),
-        "irp_mlp_t": set(irp_mlp_t_steps),
-        "softmax_within_block": {int(1 << s) for s in range(log_t)},
-        "softmax_cross_block_doubling": {-int(1 << s) for s in range(log_t)},
-        "qkt_q_preprocess": {-int(1 << s) for s in range(log_t)},
-        "sdpa_score_v_broadcast": {-int(T_MODEL * (1 << s)) for s in range(log_d_head)},
-        "packed_softmax_sum_reduce": packed_sum_reduce_set,
-        "packed_softmax_broadcast": packed_broadcast_set,
-        "packed_unpack": packed_unpack_set,
+        "sdpa": set(),
+        "irp_attn": set(),
+        "irp_mlp_w": set(),
+        "irp_mlp_t": set(),
+        "softmax_within_block": smx_bucket,
+        "softmax_cross_block_doubling": set(),
+        "qkt_q_preprocess": qkt_bucket,
+        "sdpa_score_v_broadcast": score_v_neg,
+        "packed_softmax_sum_reduce": set(),
+        "packed_softmax_broadcast": set(),
+        "packed_unpack": set(),
     }
     return user_steps, step_categories
 
@@ -593,36 +578,24 @@ def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
 
 
 # ===========================================================================
-# Stage 2 (dense-layout rewrite) — FHE dense QK^T.  ADDITIVE / opt-in.
+# FHE dense token-major attention — THE compute path (IRP machinery deleted).
 #
-# Selected by env DENSE_ATTN=1 (or --dense). When unset, NONE of this runs
-# and the IRP path / residual stream is byte-identical.
-#
-# Reuses the SAME kernel contract attention_forward_llama uses for Stage A:
+# Kernel contract (same primitives attention_forward_llama uses for Stage A):
 #   phantom.bsgs_matmul_preencoded (Wq, d_pad == D_TOTAL, replicated-block I/O)
 #   -> phantom.compute_qkt(q, k_shard_list, d_head)  (the multi-shard loop)
 #   -> fused multiply_plain (1/sqrt(d_head) * per-head mask * pad-token-zero)
 #   -> per-head sub_plain (c_per_head centering).
 #
 # baby_steps=64 for the d_pad=4096 Wq BSGS: bsgs_required_steps(64) ==
-# {1,2,4,8,16,32,64} == inner_sum(D_HEAD=128) steps, ALL already provisioned
-# by build_user_steps_mrpc -> ZERO new galois keys, engine untouched.
+# {1,2,4,8,16,32,64} == inner_sum(D_HEAD=128) steps, all provisioned by
+# build_user_steps_mrpc (now built directly from the dense step builders).
 #
-# Slot geometry is byte-identical to the verified Stage-1 numpy oracle
-# blocks.kv_layout_dense (commit 744e61f). Validated by the caller against
-# (a) kv_layout_dense.dense_qkt on the same Q/K and (b) the IRP path scores.
+# Slot geometry is byte-identical to the verified numpy oracle
+# blocks.kv_layout_dense (commit 744e61f); the caller validates each layer
+# against kv_layout_dense.dense_qkt on the same Q/K.
 # ===========================================================================
 
-_DENSE_ATTN = os.environ.get("DENSE_ATTN") == "1"
-_DENSE_WQ_BABY_STEPS = 64  # bsgs_required_steps(64) ⊆ already-provisioned steps
-
-# Read-only sink for the LIVE IRP path's post-stage-A scores (gate (b):
-# measured-FHE dense vs measured-FHE IRP at the SAME layer/input). Armed
-# ONLY under DENSE_ATTN at the probe layer; when disarmed _stage_a_premask
-# is byte-identical (the capture block is not entered). One extra decrypt
-# per block, ZERO change to the IRP ciphertext computation.
-_DENSE_IRP_SCORE_SINK = {"armed": False, "armed_w": False,
-                         "blocks": [], "weights": [], "sk": None}
+_DENSE_WQ_BABY_STEPS = 64  # bsgs_required_steps(64) ⊆ provisioned steps
 
 
 def fhe_attention_dense_scores(ctx, encoder, sk, relin_key, galois_key,
@@ -1566,466 +1539,6 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     }
 
 
-def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
-                             x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
-                             k_cts, v_cts, c_per_head,
-                             num_tokens, max_abs_calib, head_first_slot_mask_slots,
-                             stage_times=None, verbose=False, query_position=None):
-    """Multi-ct attention block. Same shape as fhe_attention_irp_bootstrap
-    but using compute_qkt_irp_multi + per-block softmax pipeline +
-    multi_ct_softmax_finalize + score_times_v_irp_multi.
-
-    For a single block (n_blocks=1, NUM_TOKENS<=T_MODEL=8) this reduces to
-    the single-ct flow (within FHE noise tolerance) — Stage 3b-f-1 sanity.
-    """
-    def _t(): return time.perf_counter()
-    def _rec(name, t0):
-        if stage_times is None: return
-        stage_times.setdefault(name, 0.0)
-        stage_times[name] += (time.perf_counter() - t0) * 1000.0
-
-    n_blocks = len(k_cts)
-    _calib = {"q": 2.5, "scores": 45.10}
-    if max_abs_calib is not None:
-        _calib.update({k: max_abs_calib[k] for k in ("q", "scores") if k in max_abs_calib})
-
-    # mod_switch x_norm to USER_LEVEL_IRP_ATTN chain
-    t0 = _t()
-    irp_attn_ci = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
-    if x_norm.chain_index() < irp_attn_ci:
-        x_irp = phantom.mod_switch_to(ctx, x_norm, irp_attn_ci)
-    else:
-        x_irp = x_norm
-    _rec("layout_shift", t0)
-
-    # Wq IRP -> q_ct
-    t0 = _t()
-    q_ct = irp_matvec_host(ctx, encoder, galois_key, x_irp, diag_wq_irp,
-                            NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE,
-                            mask_pt=mask_attn_pt)
-    q_ct = phantom.rescale_to_next(ctx, q_ct)
-    q_ct.set_scale(SCALE)
-    _rec("wq_irp", t0)
-
-    if verbose: _probe("attn post-Wq", ctx, encoder, sk, q_ct)
-    # Bootstrap q_ct
-    t0 = _t()
-    q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
-                           max_abs=_calib["q"], slot_count=NUM_SLOTS)
-    _rec("bootstrap", t0)
-    if verbose: _probe("attn post-q-boot", ctx, encoder, sk, q_ct)
-
-    # Causal-correctness clip for padded fixed-nt. The query only ever
-    # attends real keys [0, real_nt); EOS-pad keys [real_nt, num_tokens)
-    # must be excluded from the ENTIRE attention path.
-    #
-    # CRITICAL: do this BEFORE the mod_switch loop and the QK^T. The
-    # EOS-pad K is packed at full block width by pack_kv_blocks (it keys
-    # on the padded num_tokens), so a pad block's QK^T is a real dot
-    # product whose magnitude, at embedding-scale early layers, overflows
-    # the CKKS scale inside compute_qkt_irp_multi. If the pad k_cts are
-    # fed to compute_qkt_irp_multi (even though their score blocks are
-    # later masked/dropped), the overflowed intermediates corrupt the
-    # shared relin/rescale path and degrade EVERY block's accuracy — the
-    # damage scales with the number of pad blocks (survivable at
-    # fixed-128's 8 pad blocks, fatal at fixed-512's 56: observed uniform
-    # ~0.3 rel-RMS + L7/L8/L31 ~1e3 blow-ups). Truncating k_cts/v_cts to
-    # exactly the real blocks here makes compute_qkt_irp_multi see only
-    # the real prefix — structurally and numerically identical to running
-    # variable-nt at num_tokens=real_nt (fixed-128 AND fixed-512 -> the
-    # same 8-block variable-nt-60 layout). BSGS matmul/rotation/diagonal
-    # decomposition is unchanged: we feed it fewer (real-only) blocks,
-    # never a modified algorithm. Variable-nt: real_nt == num_tokens so
-    # the guard is skipped entirely -> byte-identical.
-    real_nt = _real_nt(num_tokens, query_position)
-    if real_nt < num_tokens:
-        n_real_blocks = math.ceil(real_nt / T_MODEL)
-        k_cts = k_cts[:n_real_blocks]
-        v_cts = v_cts[:n_real_blocks]
-        eff_num_tokens = real_nt
-    else:
-        eff_num_tokens = num_tokens
-
-    # compute_qkt_irp_multi — produces n_blocks score blocks
-    t0 = _t()
-    for k_ct in k_cts:
-        phantom.mod_switch_to_inplace(ctx, k_ct, q_ct.chain_index())
-    score_blocks, block_sizes = compute_qkt_irp_multi(
-        ctx, encoder, relin_key, galois_key,
-        q_ct, k_cts, D_HEAD, D_TOTAL, T_MODEL, num_tokens=eff_num_tokens)
-    if real_nt < num_tokens:
-        # block_sizes from eff_num_tokens=real_nt is already the exact
-        # variable-nt-real_nt layout (e.g. [8]*7+[4] for real_nt=60); the
-        # last block is partial and masked downstream by stage-A as usual.
-        print(f"  [fixed-nt clip] block_sizes -> {block_sizes} "
-              f"(real_nt={real_nt}, num_tokens={num_tokens}, "
-              f"n_blocks {len(score_blocks)})")
-
-    if verbose:
-        for kk, sb in enumerate(score_blocks):
-            _probe(f"attn post-qkt[{kk}]", ctx, encoder, sk, sb)
-
-    # Per-block softmax pipeline, restructured to pair bootstraps across
-    # consecutive blocks via merge_bootstrap (saves 6/12 bootstraps for
-    # n_blocks=6: 3 stage-A pairs + 3 stage-B pairs, ~1s/layer).
-    from blocks.bootstrap import merge_bootstrap
-    # K_CACHE_SCALE: K is pre-scaled by this factor at packing time (see
-    # encrypt_layer_inputs_multi → pack_kv_blocks). post-QKT err is
-    # Cauchy-Schwarz-bounded by err_Q · ||K_h||_2, so scaling K down by 4×
-    # at encoding drops cascade post-QKT err 4× (1.16 → 0.29 measured).
-    # Math is invariant: inv_sqrt_d is divided by K_CACHE_SCALE so the
-    # post-stage-A scores are bit-identical (effective `inv_sqrt_d/K_scale ·
-    # (K · K_scale) = K · inv_sqrt_d`).
-    inv_sqrt_d = (1.0 / math.sqrt(float(D_HEAD))) / K_CACHE_SCALE
-    safety_scale = max_abs_calib.get("softmax_safety_scale", 1.0) if max_abs_calib else 1.0
-    # ps_exp_init's lead = EXTRA_SCALE * t^(-1/2^NSQ) and softmax_damping_schedule's
-    # per-step damps share that SAME t: the damping derivation makes
-    # f_sq*d = TARGET_MAG by construction only when both use one token
-    # count. The t^(-1) it bakes in is the softmax denominator
-    # pre-normalization and must be the REAL summed-key count (real_nt),
-    # not the padded N (which over-normalizes by N/real_nt). These two
-    # therefore MUST move together (changing only one breaks the analytic
-    # cancellation). Variable-nt: real_nt == num_tokens -> byte-identical.
-    damps = softmax_damping_schedule(NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
-    # Mean is dominated by unpopulated slots (~96% of NUM_SLOTS), which equal
-    # TARGET_MAG=0.45 after damping (pipeline(score=0) = TARGET_MAG by construction).
-    # NumPy simulation: 0.4225 (nt=64) ↔ 0.4435 (nt=16) across NSQ — varies with
-    # fill rate. 0.4487 is a safe single constant; for tighter bootstrap centering
-    # set the empirical mean from max_abs_calib["pre_finsmx_mean"] when provided.
-    _PRE_FINSMX_MEAN = 0.4487  # OLD hardcoded value (functional baseline)
-
-    def _stage_a_premask(sb, blk_size):
-        """mask*scale + sub_C (block-aware)."""
-        nominal = sb.scale()
-        ms_pt = qkt_irp_mask_scale_plaintext(
-            ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
-            inv_sqrt_d, sb.chain_index(), SCALE)
-        sb = phantom.multiply_plain(ctx, sb, ms_pt)
-        sb = phantom.rescale_to_next(ctx, sb)
-        sb.set_scale(nominal)
-        sub_pt = qkt_irp_per_head_sub_plaintext(
-            ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
-            c_per_head, sb.chain_index(), sb.scale())
-        sb = phantom.sub_plain(ctx, sb, sub_pt)
-        # gate (b) read-only capture: decrypt the LIVE IRP post-stage-A
-        # block. No-op (not entered) unless armed by run_classifier_fhe.
-        if _DENSE_IRP_SCORE_SINK["armed"] and _DENSE_IRP_SCORE_SINK["sk"] is not None:
-            _sk = _DENSE_IRP_SCORE_SINK["sk"]
-            _v = np.array(
-                encoder.decode_double_vector(ctx, _sk.decrypt(ctx, sb)),
-                dtype=np.float64)
-            _DENSE_IRP_SCORE_SINK["blocks"].append((blk_size, _v))
-        return sb
-
-    def _stage_b_ps_exp(sb):
-        """ps_exp_init + damped squarings + mean-sub."""
-        # real_nt (NOT padded num_tokens) — paired with the damps above;
-        # see the softmax_damping_schedule comment. No-op for variable-nt.
-        e_ct = phantom.ps_exp_init(
-            ctx, encoder, relin_key, sb,
-            real_nt, NUM_SQUARINGS, EXTRA_SCALE)
-        phantom.square_iterations_damped_inplace(
-            ctx, encoder, relin_key, e_ct, damps)
-        mean_pt = encoder.encode_double_vector(
-            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
-            e_ct.scale(), e_ct.chain_index())
-        return phantom.sub_plain(ctx, e_ct, mean_pt)
-
-    def _stage_c_post(e_ct, blk_size):
-        """mean-add + mask*safety_scale."""
-        mean_pt = encoder.encode_double_vector(
-            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
-            e_ct.scale(), e_ct.chain_index())
-        e_ct = phantom.add_plain(ctx, e_ct, mean_pt)
-        e_nominal = e_ct.scale()
-        mask_pt = qkt_irp_mask_scale_plaintext(
-            ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
-            safety_scale, e_ct.chain_index(), SCALE)
-        e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
-        e_ct = phantom.rescale_to_next(ctx, e_ct)
-        e_ct.set_scale(e_nominal)
-        return e_ct
-
-    n_blocks = len(score_blocks)
-
-    # Packed-score softmax: pack all n_blocks score cts into ONE ct via
-    # tree-rotation, then run stage A/B/C + Goldschmidt + unpack on that
-    # single ct. Saves (n_blocks - 1) stage-A bootstraps, (n_blocks - 1)
-    # stage-B bootstraps, (n_blocks - 1) ps_exp+damped polynomials, and
-    # (n_blocks - 1) Goldschmidt invocations vs the per-block pipeline.
-    # Required galois keys are pre-generated when PACKED_SOFTMAX_NT_MAX is
-    # set at engine build (see build_user_steps_mrpc).
-    use_packed = (os.environ.get("PACKED_SOFTMAX") == "1"
-                  and n_blocks >= 2
-                  and (n_blocks & (n_blocks - 1)) == 0
-                  and num_tokens == n_blocks * T_MODEL
-                  and all(bs == T_MODEL for bs in block_sizes))
-    # Packed path: pack AFTER stage C. e_blocks at that point have ~1e-7
-    # noise at unpopulated slots (stage-C mask*safety on bounded values is
-    # clean), so the tree pack stays contamination-free. Pack-before-A
-    # (with or without N strict 0/1 cleanse masks; empirically tested
-    # N=0,1,2) doesn't work — the CKKS multiplicative noise floor at
-    # "zero" mask slots is stable around junk*ε ≈ 0.07 per slot regardless
-    # of cleanse passes, and the tree pack accumulates n_blocks copies of
-    # that, blowing per-head sum past Goldschmidt's |a|<2 window.
-
-    # PACKED_STAGE_B (Phase 1, architect plan): pack AFTER stage A's
-    # premask but BEFORE stage B. Stage A produces clean encoded zeros at
-    # off-block slots (qkt_irp_mask_scale_plaintext zeros everything but
-    # the per-head first-blk_size slots), so pack-with-use_mask=False is
-    # safe — no leakage to accumulate. Splits 64 blocks across TWO packed
-    # cts (32 blocks each = 8192 populated / 32768 slots per ct) and runs
-    # stage B / stage C twice instead of 64×. After stage C, the two
-    # packed cts are merged into one via a single tree-pack round and the
-    # existing post-stage-C `use_packed` finalize + unpack path takes
-    # over unchanged.
-    # Generalized from the original hardcoded `n_blocks == 64` to any
-    # pow2 n_blocks >= 2 (mirrors the use_packed guard style at :649-650).
-    # Regression invariant: at n_blocks == 64 this guard, the grouping
-    # below, and PACKED_BLK_SIZE are byte-identical to the original
-    # 2-way [0:32]/[32:64] split with PACKED_BLK_SIZE = 32*T_MODEL.
-    use_packed_stage_b = (os.environ.get("PACKED_STAGE_B") == "1"
-                          and n_blocks >= 2
-                          and (n_blocks & (n_blocks - 1)) == 0
-                          and num_tokens == n_blocks * T_MODEL
-                          and all(bs == T_MODEL for bs in block_sizes))
-
-    pair_idx = 0
-    e_blocks = [None] * n_blocks
-    if use_packed_stage_b:
-        # Pack-after-stage-A (Phase 1) — see architect rationale in the
-        # comment block above. Runs stage A 64× (cheap; 2 levels each, no
-        # bootstrap), packs the stage-A outputs into TWO packed cts
-        # (32 blocks per ct), bootstraps each packed ct, runs stage B
-        # ONCE per packed ct, bootstraps each, runs stage C ONCE per
-        # packed ct (with blk_size = 32*T_MODEL = 256 — the mask
-        # plaintext naturally extends), then merges the two stage-C
-        # outputs into ONE packed ct via a 2-element tree-pack. The
-        # downstream finalize path consumes e_blocks=[merged_ct] (a
-        # single-element list) so pack_score_blocks_tree at the existing
-        # use_packed branch becomes a no-op pass-through.
-        # Geometric safety: every group packs group_blocks*T_MODEL tokens
-        # into the per-head region of width head_block = D_HEAD*T_MODEL
-        # (= 1024). The largest group is GROUP=32 blocks (or all n_blocks
-        # when n_blocks < GROUP), so n_blocks*T_MODEL must not exceed
-        # head_block or the packed region would spill into the next head's
-        # slots and silently corrupt the score layout. Guard, don't trust.
-        head_block = D_HEAD * T_MODEL
-        if n_blocks * T_MODEL > head_block:
-            raise ValueError(
-                f"use_packed_stage_b: n_blocks*T_MODEL="
-                f"{n_blocks * T_MODEL} exceeds head_block={head_block} "
-                f"(D_HEAD*T_MODEL); packed region would spill into the "
-                f"next head. Reduce n_blocks or disable PACKED_STAGE_B.")
-
-        sb_pre = [_stage_a_premask(score_blocks[k], block_sizes[k])
-                  for k in range(n_blocks)]
-        # General G-grouping: split the n_blocks stage-A premasked cts into
-        # G = ceil(n_blocks / GROUP) consecutive groups of <= GROUP blocks
-        # each, then run the pack -> bootstrap -> stage B -> bootstrap ->
-        # stage C pipeline once per group. Regression invariant: with
-        # GROUP=32 and n_blocks==64, G==2 and the two groups are exactly
-        # sb_pre[0:32] and sb_pre[32:64] — byte-identical to the original
-        # hardcoded 2-way split. For n_blocks==8 (nt=64): G==1, a single
-        # group of 8 blocks, one packed ct, and the final merge over a
-        # 1-element list is a no-op (pack_score_blocks_tree returns it
-        # unchanged).
-        GROUP = 32
-        G = math.ceil(n_blocks / GROUP)
-        groups = [sb_pre[g * GROUP:(g + 1) * GROUP] for g in range(G)]
-        packed_c_groups = []
-        # Per-group PACKED_BLK_SIZE = (#blocks in that group) * T_MODEL.
-        # For a full GROUP=32 group this is 32*T_MODEL = 256 (identical to
-        # the original constant); a trailing short group uses its actual
-        # block count (e.g. n_blocks==8 -> 8*T_MODEL = 64).
-        group_blk_sizes = []
-        for group in groups:
-            group_blocks = len(group)
-            group_blk_size = group_blocks * T_MODEL
-            group_blk_sizes.append(group_blk_size)
-            # use_mask=False: stage-A premask zeros off-block slots cleanly,
-            # so the tree-pack does not accumulate noise. Saves
-            # log2(group_blocks) levels per packed ct.
-            packed_ct = pack_score_blocks_tree(ctx, galois_key, group,
-                                               T_MODEL)
-            packed_ct = bootstrap_safe(engine, ctx, encoder, packed_ct,
-                                          max_abs=_calib["scores"],
-                                          slot_count=NUM_SLOTS)
-            # Stage B on the packed ct (operates slot-wise, layout-agnostic).
-            packed_e = _stage_b_ps_exp(packed_ct)
-            # Post-stage-B bootstrap (mirror per-block path at :622-624).
-            packed_e = bootstrap_safe(engine, ctx, encoder, packed_e,
-                                        max_abs=TARGET_MAG,
-                                        slot_count=NUM_SLOTS)
-            # Stage C with blk_size = group_blk_size. The mask plaintext
-            # qkt_irp_mask_scale_plaintext takes num_tokens=group_blk_size
-            # and naturally writes value at slot[h*d_head*t + tok] for
-            # tok < group_blk_size per head — exactly the populated range
-            # after the group_blocks-block pack.
-            packed_c_groups.append(_stage_c_post(packed_e, group_blk_size))
-
-        # Merge the G stage-C outputs into one packed ct. The merge stride
-        # is the per-group PACKED_BLK_SIZE (all full groups share the same
-        # GROUP*T_MODEL stride; a single trailing short group never needs a
-        # merge). For n_blocks==64: G==2, stride = 32*T_MODEL = 256 — one
-        # rotation step, identical to the original. For G==1 this is a
-        # 1-element list and pack_score_blocks_tree returns it unchanged
-        # (no-op, verified at attention.py:365-366). Both halves are clean
-        # at off-block slots (stage-C mask zeroes everything outside the
-        # populated range), so use_mask=False is safe.
-        merge_stride = group_blk_sizes[0]
-        merged_packed_e = pack_score_blocks_tree(
-            ctx, galois_key, packed_c_groups, merge_stride)
-        # Hand off to the existing finalize path as a 1-element list.
-        # pack_score_blocks_tree on a 1-element list returns it unchanged,
-        # so the existing pack at the use_packed branch is a no-op.
-        e_blocks = [merged_packed_e]
-        use_packed = True
-    else:
-        # Process blocks in PAIRS to share bootstrap_inplace calls.
-        while pair_idx < n_blocks:
-            i = pair_idx
-            j = pair_idx + 1 if pair_idx + 1 < n_blocks else None
-
-            # ---- Stage A: mask + sub_C for each block in pair. ----
-            sb_i = _stage_a_premask(score_blocks[i], block_sizes[i])
-            if j is not None:
-                sb_j = _stage_a_premask(score_blocks[j], block_sizes[j])
-
-            # ---- Bootstrap before damped squarings (merge-paired). ----
-            # At NSL>=20 with NUM_SQUARINGS=6, stage A (2 levels) + stage B
-            # (16 levels) = 18 levels — fits in max_user_level=19. We can skip
-            # the stage A bootstrap entirely, saving 32 paired bootstraps per
-            # layer (~5.4s). Opt-in via SKIP_STAGE_A_BOOT=1.
-            if os.environ.get("SKIP_STAGE_A_BOOT") != "1":
-                if j is not None:
-                    sb_i, sb_j = merge_bootstrap(
-                        engine, ctx, encoder, sb_i, sb_j,
-                        max_abs=_calib["scores"], slot_count=NUM_SLOTS,
-                        galois_key=galois_key)
-                else:
-                    sb_i = bootstrap_safe(engine, ctx, encoder, sb_i,
-                                            max_abs=_calib["scores"], slot_count=NUM_SLOTS)
-
-            # ---- Stage B: ps_exp + damped + mean-sub. ----
-            e_i = _stage_b_ps_exp(sb_i)
-            if j is not None:
-                e_j = _stage_b_ps_exp(sb_j)
-
-            # ---- Bootstrap after damped (NOT merge-paired here).
-            # Stage B e_ct enters at user_level = max_user_level (12 levels
-            # consumed by ps_exp + 4 damped squarings from a fresh stage-A
-            # bootstrap), leaving no level headroom for merge_bootstrap's
-            # pre-scale multiplies. Use separate bootstrap_safe — at max_abs
-            # = TARGET_MAG = 0.45 (< target_mag 0.49) it skips scaling and
-            # runs bootstrap_inplace directly with no level cost.
-            # Opt 3 attempted: pair these bootstraps via merge_bootstrap to
-            # halve the stage-B bootstrap count (10 -> 5 at nt=75). Rejected
-            # because merge_bootstrap unconditionally multiplies ct2 by sd*i
-            # via multiply_plain+rescale_to_next (bootstrap.py:186-192) —
-            # consumes 1 level even when sd==1.0. At max_user_level inputs,
-            # this raises before bootstrap_inplace. Skipping this opt keeps
-            # correctness; a zero-level pack would need a phantom API for
-            # i-multiplication without rescale, which doesn't exist today. ----
-            e_i = bootstrap_safe(engine, ctx, encoder, e_i,
-                                   max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
-            if j is not None:
-                e_j = bootstrap_safe(engine, ctx, encoder, e_j,
-                                       max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
-
-            # ---- Stage C: mean-add + mask*safety_scale. ----
-            e_blocks[i] = _stage_c_post(e_i, block_sizes[i])
-            if j is not None:
-                e_blocks[j] = _stage_c_post(e_j, block_sizes[j])
-
-            pair_idx += 2
-    _rec("attn_blocks", t0)
-    if verbose:
-        if safety_scale < 0.999:
-            print(f"    [softmax-scale] safety_scale={safety_scale:.4f} folded into mask")
-        for kk, eb in enumerate(e_blocks[:2] + ([e_blocks[-1]] if n_blocks > 2 else [])):
-            _probe(f"attn post-e[{kk if kk < 2 else n_blocks-1}]",
-                   ctx, encoder, sk, eb)
-
-    t0 = _t()
-    a_chain_guess = e_blocks[0].chain_index()
-    head_first_slot_mask_pt = encoder.encode_double_vector(
-        ctx, head_first_slot_mask_slots, SCALE, a_chain_guess)
-    if use_packed:
-        # Pack post-stage-C e_blocks into one ct, run softmax_correct ONCE,
-        # unpack to per-block weights. ITERS-1 compensates for the unpack
-        # rotate+mask level so the final chain matches Wo IRP plaintexts.
-        packed_e = pack_score_blocks_tree(ctx, galois_key, e_blocks, T_MODEL)
-        if verbose: _probe("attn post-pack-e", ctx, encoder, sk, packed_e)
-        # Use ITERS-1 by default (chain budget at NSL=14); ITERS when chain
-        # headroom is available (NSL>=17 + USER_LEVEL_IRP_ATTN bumped to 11).
-        _packed_iters = ITERS if os.environ.get("PACKED_ITERS_FULL") == "1" else ITERS - 1
-        packed_weights = packed_softmax_finalize(
-            ctx, encoder, relin_key, galois_key,
-            packed_e, head_first_slot_mask_pt,
-            N_HEADS, D_HEAD, T_MODEL, n_blocks, _packed_iters, SCALE,
-            sk=sk if verbose else None, verbose=verbose)
-        if verbose: _probe("attn post-weights[packed]",
-                           ctx, encoder, sk, packed_weights)
-        weights_blocks = unpack_packed_weights(
-            ctx, encoder, galois_key, packed_weights,
-            n_blocks, D_HEAD, D_TOTAL, T_MODEL,
-            packed_weights.chain_index(), SCALE)
-    else:
-        weights_blocks = multi_ct_softmax_finalize(
-            ctx, encoder, relin_key, galois_key,
-            e_blocks, head_first_slot_mask_pt,
-            N_HEADS, D_HEAD, T_MODEL, ITERS, SCALE,
-            sk=sk if verbose else None, verbose=verbose)
-    _rec("softmax_finalize", t0)
-    if verbose:
-        for kk, wb in enumerate(weights_blocks[:2]):
-            _probe(f"attn post-weights[{kk}]", ctx, encoder, sk, wb)
-
-    # gate (b) read-only capture: decrypt the LIVE IRP softmax weights
-    # blocks. No-op (not entered) unless armed by run_classifier_fhe. IRP
-    # weights-block layout: slot[h*D_HEAD*T_MODEL + tok_local], block k ->
-    # tokens [k*T_MODEL, k*T_MODEL+block_sizes[k]). Zero change to the IRP
-    # ciphertext math (decrypt only).
-    if (_DENSE_IRP_SCORE_SINK["armed_w"]
-            and _DENSE_IRP_SCORE_SINK["sk"] is not None):
-        _skw = _DENSE_IRP_SCORE_SINK["sk"]
-        for _bk, _wb in enumerate(weights_blocks):
-            _wv = np.array(
-                encoder.decode_double_vector(ctx, _skw.decrypt(ctx, _wb)),
-                dtype=np.float64)
-            _bsz = block_sizes[_bk] if _bk < len(block_sizes) else T_MODEL
-            _DENSE_IRP_SCORE_SINK["weights"].append((_bsz, _wv))
-
-    # score_times_v_irp_multi
-    t0 = _t()
-    weights_ci = weights_blocks[0].chain_index()
-    for v_ct in v_cts:
-        phantom.mod_switch_to_inplace(ctx, v_ct, weights_ci)
-    sv_mask = score_v_irp_output_mask_plaintext(
-        ctx, encoder, D_HEAD, D_TOTAL, T_MODEL,
-        weights_ci + 1, SCALE)
-    attn_irp = score_times_v_irp_multi(
-        ctx, encoder, relin_key, galois_key,
-        weights_blocks, v_cts,
-        D_HEAD, D_TOTAL, T_MODEL, sv_mask)
-    _rec("score_v", t0)
-    if verbose: _probe("attn post-score_v", ctx, encoder, sk, attn_irp)
-
-    # Wo IRP
-    t0 = _t()
-    irp_attn_ci = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
-    if attn_irp.chain_index() < irp_attn_ci:
-        attn_irp = phantom.mod_switch_to(ctx, attn_irp, irp_attn_ci)
-    o_ct = irp_matvec_host(ctx, encoder, galois_key, attn_irp, diag_wo_irp,
-                            NUM_SLOTS, D_TOTAL, baby_steps=BABY_STEPS_IRP_SQUARE,
-                            mask_pt=mask_attn_pt)
-    o_ct = phantom.rescale_to_next(ctx, o_ct)
-    o_ct.set_scale(SCALE)
-    _rec("wo_irp", t0)
-    return o_ct
-
-
 _PROBE_DECRYPT_STAGES = os.environ.get("PROBE_DECRYPT_STAGES") == "1"
 _PROBE_DUMP_DIR = os.environ.get("PROBE_DUMP_DIR", "/tmp/probe_stage_dump")
 _PROBE_DUMP_LAYER = [None]  # set per-layer by run_classifier_fhe when verbose
@@ -2194,23 +1707,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         f"engine.freshest_chain_index()={fresh_ci} != 16 — "
         "build_user_steps_mrpc targets need to be updated.")
 
-    # ---- Layer-independent IRP masks
-    irp_attn_chain = engine.user_level_chain_index(USER_LEVEL_IRP_ATTN)
-    irp_mlp_chain = engine.user_level_chain_index(USER_LEVEL_IRP_MLP)
-    mask_attn_pt = encode_irp_mask(ctx, encoder, NUM_SLOTS, D_TOTAL, SCALE, irp_attn_chain)
-    sub_mask_mlp_wide_pt = encode_irp_mask_rect(
-        ctx, encoder, NUM_SLOTS, D_MODEL, D_PAD_MLP, SCALE, irp_mlp_chain)
-    sub_mask_mlp_tall_pt = encode_irp_mask_rect(
-        ctx, encoder, NUM_SLOTS, D_PAD_MLP, D_MODEL, SCALE, irp_mlp_chain + 1)
-    input_mask_mlp_pt = encode_irp_mask(ctx, encoder, NUM_SLOTS, D_MODEL,
-                                          SCALE, irp_mlp_chain)
-
-    # head_first_slot_mask: 1.0 at slot[h*D_HEAD*T_MODEL + 0] for h in [0, N_HEADS).
-    # Encode at runtime at the correct chain (depends on intermediate level
-    # usage; passed as raw slot vector to fhe_attention_multi_ct).
-    hf_mask_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-    for h in range(N_HEADS):
-        hf_mask_slots[h * D_HEAD * T_MODEL] = 1.0
+    # (IRP layer-independent masks removed — the dense token-major path
+    # builds its plaintext masks per-shard inside the dense kernels.)
 
     # ---- Bootstrap placement (same as llama3.py)
     NSL_MAX = NUM_SCALE_LEVELS - 1
@@ -2244,236 +1742,36 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     _y_ct_carry = None  # bootstrapped y_ct from previous layer -> next x_ct
     if _autonomous_fhe:
         print("  [AUTONOMOUS_FHE] carrying y_ct forward (K/V from ref)")
-    # Opt 1: pre-encode all 32 layers' R_P-dependent Wq IRPs (and prime
-    # rp_indep_cache on first example) BEFORE the layer loop. Moves
-    # ~1.5s/layer of encoding work out of the per-layer timer; total work
-    # is unchanged but the per-layer printed time becomes a clean view of
-    # FHE compute. rp_indep_cache fills lazily inside encode_layer_irps;
-    # on subsequent examples the call is Wq-only (~1.5s/layer).
+    # Per-layer weight-subset preload. The dense token-major pipeline
+    # rebuilds Q/K/V/Wo/Wgate/Wup/Wdown directly from the numpy weights
+    # each layer (no pre-encoded IRP plaintexts), so all that is needed
+    # up front is the small per-example-hot subset (Wq/Wk/Wv + g1/g2,
+    # used by encrypt_layer_inputs_multi & rmsnorm). The big R_P-indep
+    # matrices (Wo/Wgate/Wup/Wdown) are loaded per-layer via
+    # load_layer_weights_subset inside the dense attention / MLP blocks.
     #
-    # Opt 1b: optional process-wide shared_wq_cache keyed by num_tokens.
-    # R_P depends only on num_tokens (and the RoPE tables, which are
-    # process-global), so across a 408-MRPC sweep where ~40 distinct
-    # num_tokens exist, the same wq_cache entries can be reused ~10x on
-    # average. Per-num_tokens Event coordinates concurrent threads so
-    # only one thread encodes each (num_tokens) value; others wait.
-    # The cache is a 2-level dict: shared_wq_cache[num_tokens][layer_idx].
-    # layer_weights is local: encode_layer_irps needs `w` for Wq_baked,
-    # but the encoded plaintexts are the heavy artifact (32 layers of
-    # SCP tuples), so caching just those is enough.
+    # The shared_wq_cache* / rp_indep_cache / rp_indep_disk_root params
+    # are retained for call-signature compatibility with the sweep
+    # drivers but are inert now that the IRP machinery is gone (the
+    # pre-encoded-IRP cache they fed no longer exists).
     t_wq_encode0 = time.perf_counter()
-    layer_weights = {}  # layer_idx -> w (cache weight loads too)
-    _shared_hit = False
-    _stream_rp_indep = False
-    # Streaming mode: when rp_indep_disk_root is set, skip the upfront
-    # 32-layer build pass entirely. Each layer's IRPs are loaded from
-    # disk and encoded just before that layer's compute, then dropped
-    # immediately after. Keeps peak host RSS bounded to ~5 GB instead
-    # of ~73 GB on small-RAM boxes (the 62 GB 5090).
-    if rp_indep_disk_root is not None:
-        assert shared_wq_cache is None, (
-            "rp_indep_disk_root incompatible with shared_wq_cache "
-            "(streaming + cross-thread sharing don't mix)")
-        wq_cache = {}
-        _stream_rp_indep = True
-        t_wq_encode = time.perf_counter() - t_wq_encode0
-        print(f"[wq encode: streaming-rp_indep mode, no upfront build "
-              f"(setup {t_wq_encode:.1f}s)]")
-    elif shared_wq_cache is not None and num_tokens in shared_wq_cache:
-        wq_cache = shared_wq_cache[num_tokens]
-        _shared_hit = True
-        print(f"[wq encode: HIT shared_wq_cache nt={num_tokens}]")
-    elif shared_wq_cache is not None:
-        # Coordinate concurrent encoders for the same num_tokens.
-        # The lock protects only the Event-creation step; encoding
-        # happens outside the lock so different num_tokens parallelize.
-        assert shared_wq_cache_lock is not None, \
-            "shared_wq_cache requires shared_wq_cache_lock"
-        assert shared_wq_cache_events is not None, \
-            "shared_wq_cache requires shared_wq_cache_events"
-        with shared_wq_cache_lock:
-            if num_tokens in shared_wq_cache:
-                # Another thread completed encoding while we waited.
-                wq_cache = shared_wq_cache[num_tokens]
-                _shared_hit = True
-                ev = None
-                owner = False
-            elif num_tokens in shared_wq_cache_events:
-                # Another thread is currently encoding for this num_tokens.
-                ev = shared_wq_cache_events[num_tokens]
-                owner = False
-            else:
-                # We are the first; create the Event so peers wait for us.
-                ev = threading.Event()
-                shared_wq_cache_events[num_tokens] = ev
-                owner = True
-        if _shared_hit:
-            print(f"[wq encode: HIT shared_wq_cache nt={num_tokens}]")
-        elif not owner:
-            # Wait for the owner thread to publish the encoded cache.
-            print(f"[wq encode: WAIT shared_wq_cache nt={num_tokens}]")
-            ev.wait()
-            wq_cache = shared_wq_cache[num_tokens]
-            _shared_hit = True
-        else:
-            # Owner: encode all 32 layers, publish, then signal.
-            # Memory accounting: Wq IRP = 256 SCPs * 512 KB = 128 MB/layer.
-            # 32 layers * ~40 distinct num_tokens * 128 MB = ~160 GB total
-            # for the shared cache (fits in 256 GB host alongside the
-            # ~36 GB rp_indep_cache). Wq_baked (the numpy matrix returned
-            # by encode_layer_irps) is dropped from the cached entry: it
-            # is not used downstream in run_classifier_fhe and would add
-            # another 32 * 40 * 128 MB = 160 GB if retained.
-            wq_cache = {}
-            for _li in range(NUM_DECODERS):
-                if min_layer is not None and _li < min_layer:
-                    continue
-                if max_layer is not None and _li > max_layer:
-                    break
-                _w = _get_layer_w(_li)
-                # Store only the small per-example-hot subset (Wq/Wk/Wv +
-                # g1/g2 used by encrypt_layer_inputs_multi & rmsnorm).
-                # The big matrices (Wo/Wgate/Wup/Wdown ~1.5 GB/layer) are
-                # already encoded into the wq_cache / rp_indep_cache; if
-                # the compute loop needs them again (compute_layer_calib_n
-                # when precomputed_calib is None), it reloads per-layer.
-                # Storing the full _w here piles up 32 * 1.9 GB = 60 GB
-                # Python heap and OOMs 62 GB boxes.
-                layer_weights[_li] = {
-                    k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2")
-                    if k in _w
-                }
-                del _w
-                _tup = encode_layer_irps(
-                    ctx, encoder, _w, R_P,
-                    rp_indep_cache=rp_indep_cache, layer_idx=_li)
-                # _tup = (Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp,
-                #         diag_up_irp, diag_down_irp). Drop Wq_baked (unused
-                # in the layer body) to save ~160 GB across the sweep.
-                wq_cache[_li] = (None,) + tuple(_tup[1:])
-            shared_wq_cache[num_tokens] = wq_cache
-            ev.set()
-    if not _shared_hit and shared_wq_cache is None and not _stream_rp_indep:
-        # No shared cache: legacy local-only path.
-        # Store only the small per-example-hot subset; full weights are
-        # reloaded inside the compute loop per layer if needed
-        # (compute_layer_calib_n path).
-        wq_cache = {}
-        for _li in range(NUM_DECODERS):
-            if min_layer is not None and _li < min_layer:
-                continue
-            if max_layer is not None and _li > max_layer:
-                break
-            _w = _get_layer_w(_li)
-            layer_weights[_li] = {
-                k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2") if k in _w
-            }
-            wq_cache[_li] = encode_layer_irps(
-                ctx, encoder, _w, R_P,
-                rp_indep_cache=rp_indep_cache, layer_idx=_li)
-            del _w
-    # On a shared-cache hit we still need per-layer weights for downstream
-    # (rmsnorm, lm_head, calib). Load just the subset — full weights are
-    # reloaded per layer inside the compute loop if needed.
-    if _shared_hit:
-        for _li in range(NUM_DECODERS):
-            if min_layer is not None and _li < min_layer:
-                continue
-            if max_layer is not None and _li > max_layer:
-                break
-            if _li not in layer_weights:
-                _w = _get_layer_w(_li)
-                layer_weights[_li] = {
-                    k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2") if k in _w
-                }
-                del _w
-    if not _stream_rp_indep:
-        t_wq_encode = time.perf_counter() - t_wq_encode0
-        print(f"[wq encode: {t_wq_encode:.1f}s]")
+    layer_weights = {}  # layer_idx -> {Wq,Wk,Wv,g1,g2} subset
+    for _li in range(NUM_DECODERS):
+        if min_layer is not None and _li < min_layer:
+            continue
+        if max_layer is not None and _li > max_layer:
+            break
+        _w = _get_layer_w(_li)
+        layer_weights[_li] = {
+            k: _w[k] for k in ("Wq", "Wk", "Wv", "g1", "g2") if k in _w
+        }
+        del _w
+    t_wq_encode = time.perf_counter() - t_wq_encode0
+    print(f"[weight-subset preload: {t_wq_encode:.1f}s]")
 
     print(f"\nRunning {NUM_DECODERS} decoder layers...")
     layer_times = []
     y_p_fhe = None  # final hidden state at P (post-residual2 of last layer)
-
-    # Streaming pipeline: a background thread prefetches layer L+1's
-    # disk artifacts (rp_indep SCPs + full weight dict + wq IRPs) while
-    # the main thread runs FHE compute for layer L. With both disk
-    # caches populated, per-layer prep is ~5-8 s of disk reads while
-    # FHE compute is ~3-5 s, so wall-time becomes max(prep, compute).
-    if _stream_rp_indep:
-        import queue as _queue_mod
-        # Prefetch depth. Each in-flight layer holds ~4.3 GB (2.3 GB
-        # rp_indep + 0.13 GB wq SCPs in pinned host + 1.9 GB full
-        # weight dict in numpy heap). Default 4 → ~17 GB peak buffer,
-        # fits comfortably in 62 GB (5090 dev) or 256 GB (A100 host).
-        # Override via STREAM_QUEUE_DEPTH env var; bump higher when the
-        # producer hits disk-I/O variance you want to absorb.
-        _qdepth = max(1, int(os.environ.get("STREAM_QUEUE_DEPTH", 4)))
-        _stream_queue = _queue_mod.Queue(maxsize=_qdepth)
-        _stream_stop = threading.Event()
-        _stream_err = []
-        print(f"[stream pipeline: prefetch_depth={_qdepth}]")
-
-        def _stream_producer():
-            from blocks.scp_disk_cache import (load_scp_dict_from_disk,
-                                                  has_cache)
-            for _L in range(NUM_DECODERS):
-                if _stream_stop.is_set():
-                    return
-                if min_layer is not None and _L < min_layer:
-                    continue
-                if max_layer is not None and _L > max_layer:
-                    break
-                try:
-                    _rp_dir = os.path.join(rp_indep_disk_root,
-                                            f"layer_{_L:02d}")
-                    _rp_sub = load_scp_dict_from_disk(_rp_dir)
-                    _rp_L = _rp_sub[_L]
-                    _w_L = _get_layer_w(_L)
-                    # The cached Wq IRPs bake in R_P = rope_matrix(
-                    # cos_all[P_local], sin_all[P_local]) — i.e. they depend
-                    # on query_position (P_local), NOT just num_tokens. In
-                    # variable-nt P_local == num_tokens-1 so nt alone keyed
-                    # uniquely, but at fixed-nt the query sits at P_local =
-                    # real_nt-1 << num_tokens, so a cache built for one
-                    # (num_tokens, P_local) must NOT be reused for another.
-                    # A stale cache/wq/nt_512/ from a prior run with a
-                    # different query position poisons every layer's Q
-                    # (uniform ~0.3 rel-RMS + L7/L8/L31 ~1e3 blow-ups,
-                    # while fresh-cache fixed-128 / variable-nt are fine).
-                    # Keying on P_local makes the cache correct for every
-                    # config and impossible to cross-contaminate.
-                    _wq_dir = os.path.join(
-                        os.path.dirname(rp_indep_disk_root),
-                        "wq", f"nt_{num_tokens}_q{P_local}",
-                        f"layer_{_L:02d}")
-                    if has_cache(_wq_dir):
-                        _wq_sub = load_scp_dict_from_disk(_wq_dir)
-                        _diag_wq = _wq_sub[_L]
-                        _wo, _gate, _up, _down = _rp_L
-                        _tup_L = (None, _diag_wq, _wo, _gate, _up, _down)
-                    else:
-                        _raw = encode_layer_irps(
-                            ctx, encoder, _w_L, R_P,
-                            rp_indep_cache={_L: _rp_L}, layer_idx=_L)
-                        _tup_L = (None,) + tuple(_raw[1:])
-                    # block on full queue; honor stop event so we don't
-                    # deadlock when the main thread bails out
-                    while not _stream_stop.is_set():
-                        try:
-                            _stream_queue.put((_L, _w_L, _rp_L, _tup_L),
-                                                timeout=1.0)
-                            break
-                        except _queue_mod.Full:
-                            continue
-                except Exception as _e:
-                    _stream_err.append((_L, _e))
-                    _stream_stop.set()
-                    return
-
-        _producer_thread = threading.Thread(
-            target=_stream_producer, name="rp_indep-producer", daemon=True)
-        _producer_thread.start()
 
     for layer_idx in range(NUM_DECODERS):
         if min_layer is not None and layer_idx < min_layer:
@@ -2496,38 +1794,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 pass
         x_btd = pytorch_ref[layer_idx]  # (NUM_TOKENS, D_MODEL) — input to layer L
 
-        # Streaming mode: JIT-load this layer's rp_indep SCPs from disk,
-        # then encode wq, just before we need it. Dropped at the end of
-        # this iteration. Keeps host RSS bounded to one layer's worth.
-        # We keep the FULL weight dict (not just the subset) for one
-        # iteration so compute_layer_calib_n (when precomputed_calib is
-        # None) reuses it without re-reading 1.9 GB from disk.
-        if _stream_rp_indep and layer_idx not in wq_cache:
-            # Producer-consumer pipeline: pop the prefetched data the
-            # background thread already loaded for this layer. The
-            # producer is one layer ahead so disk I/O overlapped the
-            # previous layer's FHE compute.
-            _t_wait0 = time.perf_counter()
-            _L_q, _w_q, _rp_q, _tup_q = _stream_queue.get()
-            _t_wait = time.perf_counter() - _t_wait0
-            assert _L_q == layer_idx, (
-                f"producer order mismatch: expected {layer_idx} got {_L_q}")
-            if _stream_err:
-                _ferr_L, _ferr_e = _stream_err[0]
-                raise RuntimeError(
-                    f"stream producer failed at L={_ferr_L}: "
-                    f"{type(_ferr_e).__name__}: {_ferr_e}")
-            layer_weights[layer_idx] = _w_q
-            rp_indep_cache[layer_idx] = _rp_q
-            wq_cache[layer_idx] = _tup_q
-            if verbose or layer_idx == (min_layer if min_layer is not None else 0):
-                print(f"  [stream L={layer_idx:02d}: "
-                      f"queue_wait={_t_wait:.1f}s]")
-
-        # Per-layer real weights + IRP encoding (pre-encoded above)
+        # Per-layer weights (the {Wq,Wk,Wv,g1,g2} subset preloaded above).
+        # The dense path reloads the big R_P-indep matrices
+        # (Wo/Wgate/Wup/Wdown) per-layer inside the attention / MLP blocks.
         w = layer_weights[layer_idx]
-        Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
-            wq_cache[layer_idx]
 
         # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware).
         # When `precomputed_calib` is supplied (parallel sweep), skip the
@@ -2538,16 +1808,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # touches Wq/Wk/Wv/g1/g2 directly.
         if precomputed_calib is not None:
             z1_l, z2_l, max_abs_calib = precomputed_calib[layer_idx]
-        elif _stream_rp_indep:
-            # In streaming mode `w` is the FULL weight dict (kept alive for
-            # this iteration), so calib uses it directly — no second disk
-            # read. The streaming-end block below drops it.
-            z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
-                x_btd, w, cos_all, sin_all, num_tokens, P_local)
         else:
-            # Non-streaming legacy path: layer_weights[layer_idx] is the
-            # subset; reload the full dict per-layer and drop after calib
-            # so the heap doesn't grow to 60 GB across the 32-layer loop.
+            # layer_weights[layer_idx] is the subset; reload the full dict
+            # per-layer and drop after calib so the heap doesn't grow to
+            # 60 GB across the 32-layer loop.
             _w_full = load_layer_weights(layer_idx)
             z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
                 x_btd, _w_full, cos_all, sin_all, num_tokens, P_local)
@@ -2691,80 +1955,48 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
                                       max_abs=max_abs_calib.get("rms1_out", 1.0),
                                       slot_count=NUM_SLOTS)
-        # Dense-layout rewrite: under DENSE_ATTN=1 (--dense) the dense
-        # pipeline (QK^T+softmax+score·V+Wo, then dense BSGS MLP below) is
-        # the SOLE compute path at EVERY layer (0..NUM_DECODERS-1). The IRP
-        # attention/MLP are NOT computed at all in this mode. When
-        # DENSE_ATTN is unset the IRP path runs UNCHANGED and is the sole
-        # path (default production pipeline — byte-identical to pre-rewrite).
-        # Escape hatch: DENSE_GATE_LAYERS (comma-list) restricts dense to
-        # those layer indices (IRP fills the rest); default = ALL layers.
-        _dense_gate_here = False
-        if _DENSE_ATTN or os.environ.get("DENSE_ATTN") == "1":
-            _dg_env = os.environ.get("DENSE_GATE_LAYERS")
-            if _dg_env:
-                _dense_gate_here = layer_idx in [int(s) for s in _dg_env.split(",")]
-            else:
-                _dense_gate_here = True  # dense at ALL layers (default --dense)
-
-        if _dense_gate_here:
-            # STANDALONE dense: do NOT compute the IRP attention. attn_out
-            # is produced purely by the dense FHE pipeline in the block
-            # below (it unconditionally rebinds attn_out from _f_out).
-            attn_out = None
-        else:
-            attn_out = fhe_attention_multi_ct(
-                engine, ctx, encoder, relin_key, galois_key, sk,
-                x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
-                k_cts, v_cts, c_per_head,
-                num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose,
-                query_position=P_local)
-            if verbose: _probe("post-attention", ctx, encoder, sk, attn_out)
-
-        if _dense_gate_here:
-            # ---- STANDALONE dense attention: QK^T + softmax + score·V +
-            # BSGS Wo, all FHE, NO IRP compute. fhe_attention_dense_full
-            # runs the complete dense block internally; its _f_out becomes
-            # the layer's attention output feeding residual1. Teacher-forced
-            # Q/K/V mirror encrypt_layer_inputs_multi exactly (same numpy
-            # x_btd / weights / rope the IRP path's inputs were built from).
-            # Wo / (Wv via w) are R_P-independent; Wo is NOT in the per-
-            # example hot subset and the shared _full_cache may hold only
-            # the 5-key subset (w["Wo"] -> KeyError), so load Wo directly
-            # off disk via the subset loader (one (4096,4096) fp64 array).
-            # Layout bridge: dense BSGS Wo output is replicated-block
-            # period-D_TOTAL; the residual stream / x_ct is stride-T_MODEL
-            # (slot[i*T_MODEL]==x[i], cf. encrypt_layer_inputs_multi). Re-
-            # encode into stride-T_MODEL and re-encrypt at fresh_ci — the
-            # SAME teacher-forcing layout bridge the per-layer pipeline
-            # already applies to its inputs each layer. The `Layer {L}`
-            # rel-RMS vs pytorch_ref[L+1] below is the standalone validation
-            # metric (the SAME metric the IRP path was held to).
-            _real_nt_g = _real_nt(num_tokens, P_local)
-            _g1 = w["g1"]; _Wq = w["Wq"]; _Wk = w["Wk"]; _Wv = w["Wv"]
-            _Wq_baked = _Wq.copy()
-            for _h in range(N_HEADS):
-                _s, _e = _h * D_HEAD, (_h + 1) * D_HEAD
-                _Wq_baked[_s:_e, :] = R_P @ _Wq[_s:_e, :]
-            _xn = rmsnorm_np(x_btd, _g1)
-            _K = (_xn @ _Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
-            _K = apply_rope_np(_K, cos_all, sin_all)
-            _K_h = np.repeat(_K, N_KV_GROUPS, axis=1)[:_real_nt_g]
-            _xn_q = _xn[P_local]
-            _Wo = load_layer_weights_subset(
-                layer_idx, keys=("Wo",))["Wo"]
-            _V = (_xn @ _Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
-            _V_h = np.repeat(_V, N_KV_GROUPS, axis=1)[:_real_nt_g]
-            _fres = fhe_attention_dense_full(
-                engine, ctx, encoder, sk, relin_key, galois_key,
-                _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
-                _real_nt_g, fresh_ci)
-            _f_out = _fres["fhe_out"]            # (D_MODEL,)
-            _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-            _attn_slots[::T_MODEL][:D_MODEL] = _f_out
-            attn_out = sk.encrypt_symmetric(
-                ctx, encoder.encode_double_vector(
-                    ctx, _attn_slots, SCALE, fresh_ci))
+        # Dense token-major attention (THE compute path — IRP deleted).
+        # QK^T + softmax + score·V + BSGS Wo, all FHE.
+        # fhe_attention_dense_full runs the complete dense block
+        # internally; its _f_out is the layer's attention output feeding
+        # residual1. Teacher-forced Q/K/V mirror encrypt_layer_inputs_multi
+        # exactly (same numpy x_btd / weights / rope). Wo / (Wv via w) are
+        # R_P-independent; Wo is NOT in the per-example hot subset and the
+        # shared cache may hold only the 5-key subset (w["Wo"] -> KeyError),
+        # so load Wo directly off disk via the subset loader (one
+        # (4096,4096) fp64 array). Layout bridge: dense BSGS Wo output is
+        # replicated-block period-D_TOTAL; the residual stream / x_ct is
+        # stride-T_MODEL (slot[i*T_MODEL]==x[i], cf.
+        # encrypt_layer_inputs_multi). Re-encode into stride-T_MODEL and
+        # re-encrypt at fresh_ci — the SAME teacher-forcing layout bridge
+        # the per-layer pipeline already applies to its inputs each layer.
+        # The `Layer {L}` rel-RMS vs pytorch_ref[L+1] below is the
+        # validation metric.
+        _real_nt_g = _real_nt(num_tokens, P_local)
+        _g1 = w["g1"]; _Wq = w["Wq"]; _Wk = w["Wk"]; _Wv = w["Wv"]
+        _Wq_baked = _Wq.copy()
+        for _h in range(N_HEADS):
+            _s, _e = _h * D_HEAD, (_h + 1) * D_HEAD
+            _Wq_baked[_s:_e, :] = R_P @ _Wq[_s:_e, :]
+        _xn = rmsnorm_np(x_btd, _g1)
+        _K = (_xn @ _Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+        _K = apply_rope_np(_K, cos_all, sin_all)
+        _K_h = np.repeat(_K, N_KV_GROUPS, axis=1)[:_real_nt_g]
+        _xn_q = _xn[P_local]
+        _Wo = load_layer_weights_subset(
+            layer_idx, keys=("Wo",))["Wo"]
+        _V = (_xn @ _Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+        _V_h = np.repeat(_V, N_KV_GROUPS, axis=1)[:_real_nt_g]
+        _fres = fhe_attention_dense_full(
+            engine, ctx, encoder, sk, relin_key, galois_key,
+            _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
+            _real_nt_g, fresh_ci)
+        _f_out = _fres["fhe_out"]            # (D_MODEL,)
+        _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+        _attn_slots[::T_MODEL][:D_MODEL] = _f_out
+        attn_out = sk.encrypt_symmetric(
+            ctx, encoder.encode_double_vector(
+                ctx, _attn_slots, SCALE, fresh_ci))
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
@@ -2781,124 +2013,111 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             x_mid_norm = bootstrap_safe(engine, ctx, encoder, x_mid_norm,
                                            max_abs=max_abs_calib.get("rms2_out", 1.0),
                                            slot_count=NUM_SLOTS)
-        if _dense_gate_here:
-            # ---- STANDALONE dense BSGS MLP (Stage 5). This is the SOLE
-            # MLP compute under --dense; the IRP MLP does NOT run here.
-            # Input: x_mid_norm in stride-T_MODEL layout (rmsnorm output).
-            # Contract: dense BSGS needs replicated-block period D_PAD_MLP,
-            # so decrypt x_mid_norm, build period-D_PAD_MLP replicated-block
-            # slots, re-encrypt at fresh_ci — the SAME teacher-forcing
-            # layout bridge the standalone dense attention output uses.
-            # All galois steps (baby_steps=128, d_pad=D_PAD_MLP=16384) are
-            # already provisioned by irp_required_steps_rect — ZERO new keys.
-            # Standalone validation = the `Layer {L}` rel-RMS vs
-            # pytorch_ref[L+1] below (same metric the IRP path was held to).
-            _DENSE_MLP_BABY_STEPS = 128  # divides 16384; steps={1,2,4,...,64,128} ⊆ provisioned
-            # Wgate/Wup/Wdown are R_P-independent and may not be in w's hot
-            # subset (same situation as Wo) — load via subset loader.
-            _mlp_ws = load_layer_weights_subset(
-                layer_idx, keys=("Wgate", "Wup", "Wdown"))
-            _Wgate = np.asarray(_mlp_ws["Wgate"], dtype=np.float64)  # (D_HIDDEN, D_MODEL)
-            _Wup   = np.asarray(_mlp_ws["Wup"],   dtype=np.float64)  # (D_HIDDEN, D_MODEL)
-            _Wdown = np.asarray(_mlp_ws["Wdown"], dtype=np.float64)  # (D_MODEL,  D_HIDDEN)
+        # ---- Dense BSGS MLP (THE compute path — IRP MLP deleted).
+        # Input: x_mid_norm in stride-T_MODEL layout (rmsnorm output).
+        # Contract: dense BSGS needs replicated-block period D_PAD_MLP,
+        # so decrypt x_mid_norm, build period-D_PAD_MLP replicated-block
+        # slots, re-encrypt at fresh_ci — the SAME teacher-forcing layout
+        # bridge the dense attention output uses. All galois steps
+        # (baby_steps=128, d_pad=D_PAD_MLP=16384) are a subset of the
+        # bsgs_required_steps the engine now provisions — ZERO new keys.
+        # Validation = the `Layer {L}` rel-RMS vs pytorch_ref[L+1] below.
+        _DENSE_MLP_BABY_STEPS = 128  # divides 16384; steps={1,2,4,...,64,128} ⊆ provisioned
+        # Wgate/Wup/Wdown are R_P-independent and may not be in w's hot
+        # subset (same situation as Wo) — load via subset loader.
+        _mlp_ws = load_layer_weights_subset(
+            layer_idx, keys=("Wgate", "Wup", "Wdown"))
+        _Wgate = np.asarray(_mlp_ws["Wgate"], dtype=np.float64)  # (D_HIDDEN, D_MODEL)
+        _Wup   = np.asarray(_mlp_ws["Wup"],   dtype=np.float64)  # (D_HIDDEN, D_MODEL)
+        _Wdown = np.asarray(_mlp_ws["Wdown"], dtype=np.float64)  # (D_MODEL,  D_HIDDEN)
 
-            # -- input bridge: decrypt x_mid_norm (stride-T_MODEL) and
-            #    re-encode as replicated-block period D_PAD_MLP --
-            _xn2_raw = np.array(
-                encoder.decode_double_vector(ctx, sk.decrypt(ctx, x_mid_norm)),
-                dtype=np.float64)
-            _xn2_p = _xn2_raw[::T_MODEL][:D_MODEL]   # stride-T_MODEL decode
-            _mlp_in_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-            _periods_in = NUM_SLOTS // D_PAD_MLP   # = 2
-            for _k in range(_periods_in):
-                _mlp_in_slots[_k * D_PAD_MLP : _k * D_PAD_MLP + D_MODEL] = _xn2_p
-            _mlp_in_ct = sk.encrypt_symmetric(
-                ctx, encoder.encode_double_vector(
-                    ctx, _mlp_in_slots, SCALE, fresh_ci))
+        # -- input bridge: decrypt x_mid_norm (stride-T_MODEL) and
+        #    re-encode as replicated-block period D_PAD_MLP --
+        _xn2_raw = np.array(
+            encoder.decode_double_vector(ctx, sk.decrypt(ctx, x_mid_norm)),
+            dtype=np.float64)
+        _xn2_p = _xn2_raw[::T_MODEL][:D_MODEL]   # stride-T_MODEL decode
+        _mlp_in_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+        _periods_in = NUM_SLOTS // D_PAD_MLP   # = 2
+        for _k in range(_periods_in):
+            _mlp_in_slots[_k * D_PAD_MLP : _k * D_PAD_MLP + D_MODEL] = _xn2_p
+        _mlp_in_ct = sk.encrypt_symmetric(
+            ctx, encoder.encode_double_vector(
+                ctx, _mlp_in_slots, SCALE, fresh_ci))
 
-            # -- BSGS Wgate: (D_HIDDEN×D_MODEL) zero-padded to d_pad=D_PAD_MLP --
-            _wgate_flat = _Wgate.ravel().tolist()
-            _gate_diags = phantom.pre_encode_bsgs_diagonals(
-                ctx, encoder, _wgate_flat,
-                D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
-            _gate_ct = phantom.bsgs_matmul_preencoded(
-                ctx, galois_key, _mlp_in_ct, _gate_diags)
+        # -- BSGS Wgate: (D_HIDDEN×D_MODEL) zero-padded to d_pad=D_PAD_MLP --
+        _wgate_flat = _Wgate.ravel().tolist()
+        _gate_diags = phantom.pre_encode_bsgs_diagonals(
+            ctx, encoder, _wgate_flat,
+            D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+        _gate_ct = phantom.bsgs_matmul_preencoded(
+            ctx, galois_key, _mlp_in_ct, _gate_diags)
 
-            # -- BSGS Wup: reuse same baby rotations of _mlp_in_ct --
-            _wup_flat = _Wup.ravel().tolist()
-            _up_diags = phantom.pre_encode_bsgs_diagonals(
-                ctx, encoder, _wup_flat,
-                D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
-            _up_ct = phantom.bsgs_matmul_preencoded(
-                ctx, galois_key, _mlp_in_ct, _up_diags)
+        # -- BSGS Wup: reuse same baby rotations of _mlp_in_ct --
+        _wup_flat = _Wup.ravel().tolist()
+        _up_diags = phantom.pre_encode_bsgs_diagonals(
+            ctx, encoder, _wup_flat,
+            D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+        _up_ct = phantom.bsgs_matmul_preencoded(
+            ctx, galois_key, _mlp_in_ct, _up_diags)
 
-            # -- silu(gate): slot-wise, layout-invariant.
-            #    IRP-PARITY dispatch (mirrors fhe_mlp_irp_bootstrap in
-            #    llama3.py): at high-magnitude layers (L30/31, silu_max>6)
-            #    the harness sets silu_t_coeffs/silu_D and the BOUNDED
-            #    Chebyshev-basis Clenshaw path is taken. The deg<=20
-            #    monomial silu_coeffs catastrophically extrapolates past
-            #    the ±1.2·silu_max fit domain (silu(9.5)≈-60 vs ≈9.5),
-            #    so the dense path MUST honor silu_t_coeffs/silu_D too. --
-            if silu_t_coeffs is not None and silu_D is not None:
-                from blocks.silu import silu_clenshaw
-                _silu_ct = silu_clenshaw(
-                    engine, ctx, encoder, relin_key, _gate_ct,
-                    silu_D, silu_t_coeffs, NUM_SLOTS,
-                    galois_key=galois_key)
-            else:
-                _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
-                                coeffs=silu_coeffs,
-                                norm_factor=silu_norm_factor,
-                                slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
-
-            # -- h = silu(gate) * up --
-            _s_ci = _silu_ct.chain_index()
-            _u_ci = _up_ct.chain_index()
-            if _u_ci < _s_ci:
-                _up_ct = phantom.mod_switch_to(ctx, _up_ct, _s_ci)
-            elif _u_ci > _s_ci:
-                _silu_ct = phantom.mod_switch_to(ctx, _silu_ct, _u_ci)
-            _silu_ct.set_scale(_up_ct.scale())
-            _h_ct = phantom.multiply_and_relin(ctx, _silu_ct, _up_ct, relin_key)
-            _h_ct = phantom.rescale_to_next(ctx, _h_ct)
-            _h_ct.set_scale(SCALE)
-
-            # -- bootstrap h (mirrors IRP MLP bootstrap before down-proj) --
-            _h_calib = max_abs_calib.get("h", 1.26) if max_abs_calib else 1.26
-            _h_ct = bootstrap_safe(engine, ctx, encoder, _h_ct,
-                                   max_abs=_h_calib, slot_count=NUM_SLOTS)
-
-            # -- BSGS Wdown: (D_MODEL×D_HIDDEN) zero-padded to d_pad=D_PAD_MLP --
-            _wdown_flat = _Wdown.ravel().tolist()
-            _down_diags = phantom.pre_encode_bsgs_diagonals(
-                ctx, encoder, _wdown_flat,
-                D_MODEL, D_HIDDEN, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
-            _down_ct = phantom.bsgs_matmul_preencoded(
-                ctx, galois_key, _h_ct, _down_diags)
-
-            # -- decode down_ct period-0 -> dense MLP out (D_MODEL,) --
-            _down_raw = np.array(
-                encoder.decode_double_vector(ctx, sk.decrypt(ctx, _down_ct)),
-                dtype=np.float64)
-            _fhe_down = _down_raw[:D_MODEL]
-
-            # -- output bridge: replicated-block period D_PAD_MLP -> stride-T_MODEL --
-            # pack _fhe_down into stride-T_MODEL layout, re-encrypt at fresh_ci
-            _mlp_out_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-            _mlp_out_slots[::T_MODEL][:D_MODEL] = _fhe_down
-            mlp_out = sk.encrypt_symmetric(
-                ctx, encoder.encode_double_vector(
-                    ctx, _mlp_out_slots, SCALE, fresh_ci))
+        # -- silu(gate): slot-wise, layout-invariant.
+        #    At high-magnitude layers (L30/31, silu_max>6) the harness
+        #    sets silu_t_coeffs/silu_D and the BOUNDED Chebyshev-basis
+        #    Clenshaw path is taken. The deg<=20 monomial silu_coeffs
+        #    catastrophically extrapolates past the ±1.2·silu_max fit
+        #    domain (silu(9.5)≈-60 vs ≈9.5), so the dense path MUST honor
+        #    silu_t_coeffs/silu_D too. --
+        if silu_t_coeffs is not None and silu_D is not None:
+            from blocks.silu import silu_clenshaw
+            _silu_ct = silu_clenshaw(
+                engine, ctx, encoder, relin_key, _gate_ct,
+                silu_D, silu_t_coeffs, NUM_SLOTS,
+                galois_key=galois_key)
         else:
-            mlp_out = fhe_mlp_irp_bootstrap(
-                engine, ctx, encoder, relin_key, galois_key,
-                x_mid_norm,
-                diag_gate_irp, diag_up_irp, diag_down_irp,
-                sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-                max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
-                silu_norm_factor=silu_norm_factor,
-                silu_t_coeffs=silu_t_coeffs, silu_D=silu_D)
+            _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
+                            coeffs=silu_coeffs,
+                            norm_factor=silu_norm_factor,
+                            slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
+
+        # -- h = silu(gate) * up --
+        _s_ci = _silu_ct.chain_index()
+        _u_ci = _up_ct.chain_index()
+        if _u_ci < _s_ci:
+            _up_ct = phantom.mod_switch_to(ctx, _up_ct, _s_ci)
+        elif _u_ci > _s_ci:
+            _silu_ct = phantom.mod_switch_to(ctx, _silu_ct, _u_ci)
+        _silu_ct.set_scale(_up_ct.scale())
+        _h_ct = phantom.multiply_and_relin(ctx, _silu_ct, _up_ct, relin_key)
+        _h_ct = phantom.rescale_to_next(ctx, _h_ct)
+        _h_ct.set_scale(SCALE)
+
+        # -- bootstrap h (before down-proj) --
+        _h_calib = max_abs_calib.get("h", 1.26) if max_abs_calib else 1.26
+        _h_ct = bootstrap_safe(engine, ctx, encoder, _h_ct,
+                               max_abs=_h_calib, slot_count=NUM_SLOTS)
+
+        # -- BSGS Wdown: (D_MODEL×D_HIDDEN) zero-padded to d_pad=D_PAD_MLP --
+        _wdown_flat = _Wdown.ravel().tolist()
+        _down_diags = phantom.pre_encode_bsgs_diagonals(
+            ctx, encoder, _wdown_flat,
+            D_MODEL, D_HIDDEN, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+        _down_ct = phantom.bsgs_matmul_preencoded(
+            ctx, galois_key, _h_ct, _down_diags)
+
+        # -- decode down_ct period-0 -> dense MLP out (D_MODEL,) --
+        _down_raw = np.array(
+            encoder.decode_double_vector(ctx, sk.decrypt(ctx, _down_ct)),
+            dtype=np.float64)
+        _fhe_down = _down_raw[:D_MODEL]
+
+        # -- output bridge: replicated-block period D_PAD_MLP -> stride-T_MODEL --
+        # pack _fhe_down into stride-T_MODEL layout, re-encrypt at fresh_ci
+        _mlp_out_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+        _mlp_out_slots[::T_MODEL][:D_MODEL] = _fhe_down
+        mlp_out = sk.encrypt_symmetric(
+            ctx, encoder.encode_double_vector(
+                ctx, _mlp_out_slots, SCALE, fresh_ci))
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
         # residual2
         y_ct = residual(ctx, x_mid_ct, mlp_out)
@@ -2938,30 +2157,6 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             # decrypt above is logging-only here (true drift measurement),
             # exactly as in reverted 625ea9c.
             _y_ct_carry = y_ct
-
-        # Streaming mode: drop this layer's IRPs + raw weights so the
-        # pinned-host SCPs (~2.3 GB) and Python heap go back to the OS
-        # before the next layer's load. malloc_trim returns glibc
-        # uncoalesced free chunks; Phantom SCP destructors release
-        # cudaMallocHost-pinned pages directly.
-        if _stream_rp_indep:
-            wq_cache.pop(layer_idx, None)
-            rp_indep_cache.pop(layer_idx, None)
-            layer_weights.pop(layer_idx, None)
-            import gc as _gc
-            _gc.collect()
-            _malloc_trim()
-
-    # Signal producer to stop and reap the thread.
-    if _stream_rp_indep:
-        _stream_stop.set()
-        # Drain the queue in case producer is blocked on a put.
-        try:
-            while True:
-                _stream_queue.get_nowait()
-        except _queue_mod.Empty:
-            pass
-        _producer_thread.join(timeout=10)
 
     # ---- LM head (host-side)
     yes_logit, no_logit = yes_no_logits_np(y_p_fhe, final_norm_g, lm_head_yesno,
@@ -3130,13 +2325,7 @@ if __name__ == "__main__":
                     help="Skip layers before this index (uses PT ref as input)")
     ap.add_argument("--truncate-to", type=int, default=None,
                     help="Truncate the MRPC prompt to first N tokens (for num_tokens sweep)")
-    ap.add_argument("--dense", action="store_true",
-                    help="Stage 2 dense-rewrite gate: run + validate the FHE "
-                         "dense QK^T at layers 0 & 31 (sets DENSE_ATTN=1). "
-                         "ADDITIVE — IRP path/output unchanged.")
     args = ap.parse_args()
-    if args.dense:
-        os.environ["DENSE_ATTN"] = "1"  # gate reads env at runtime
     DEBUG_LAYER = args.debug_layer
     MAX_LAYER = args.max_layer
     MIN_LAYER = args.min_layer
