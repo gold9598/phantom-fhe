@@ -58,6 +58,7 @@ from blocks.bootstrap_placement import (
 from blocks.kv_layout import pack_kv_blocks
 from blocks import kv_layout_dense as _dense_oracle
 from blocks import kv_layout_dense_fhe as _dense_fhe
+from blocks import dense_bsgs_cache as _dense_bsgs_cache
 from blocks.lm_head import yes_no_logits_np
 from blocks.residual import residual
 from blocks.rmsnorm import (
@@ -1217,7 +1218,8 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
 
 def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
                               xn_query, Wq_baked, K_full_h, V_full_h, Wo,
-                              c_per_head, real_nt, chain_index):
+                              c_per_head, real_nt, chain_index,
+                              layer_idx=None, P_local=None):
     """Stage 4 (dense-layout rewrite): close the dense attention block.
 
     Runs the FULL dense token-major attention pipeline end-to-end, ENTIRELY
@@ -1280,8 +1282,13 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     n_shards = _dense_fhe.n_shards_for(real_nt, P)
 
     # ---- QK^T (identical to fhe_attention_dense_softmax). ----
-    wq_diags = _dense_fhe.bsgs_wq_diags_dense(
-        ctx, encoder, Wq_baked, D, _DENSE_WQ_BABY_STEPS, SCALE)
+    if layer_idx is not None and P_local is not None:
+        wq_diags = _dense_bsgs_cache.wq_diags_cached(
+            ctx, encoder, np.asarray(Wq_baked, dtype=np.float64), D,
+            _DENSE_WQ_BABY_STEPS, SCALE, layer_idx, P_local)
+    else:
+        wq_diags = _dense_fhe.bsgs_wq_diags_dense(
+            ctx, encoder, Wq_baked, D, _DENSE_WQ_BABY_STEPS, SCALE)
     x_ct = _dense_fhe.encrypt_x_replicated_block(
         ctx, encoder, sk, xn_query, D, NUM_SLOTS, SCALE, chain_index)
     q_ct = phantom.bsgs_matmul_preencoded(ctx, galois_key, x_ct, wq_diags)
@@ -1493,9 +1500,15 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # cyclic broadcast) == exactly the input layout BSGS consumes
     # (verified: contiguous-only input -> 0.69 relrms garbage; replicated
     # -> ~1.5e-6). Output: replicated-block period D_TOTAL. ----
-    wo_diags = _dense_fhe.bsgs_wq_diags_dense(
-        ctx, encoder, np.asarray(Wo, dtype=np.float64), D,
-        _DENSE_WQ_BABY_STEPS, SCALE)
+    if layer_idx is not None:
+        _Wo_np = np.asarray(Wo, dtype=np.float64)
+        wo_diags = _dense_bsgs_cache.matrix_diags_cached(
+            ctx, encoder, _Wo_np, _Wo_np.shape[0], _Wo_np.shape[1], D,
+            _DENSE_WQ_BABY_STEPS, SCALE, "wo", layer_idx)
+    else:
+        wo_diags = _dense_fhe.bsgs_wq_diags_dense(
+            ctx, encoder, np.asarray(Wo, dtype=np.float64), D,
+            _DENSE_WQ_BABY_STEPS, SCALE)
     o_ct = phantom.bsgs_matmul_preencoded(ctx, galois_key, attn_h, wo_diags)
 
     _ov = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, o_ct)),
@@ -1990,7 +2003,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         _fres = fhe_attention_dense_full(
             engine, ctx, encoder, sk, relin_key, galois_key,
             _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
-            _real_nt_g, fresh_ci)
+            _real_nt_g, fresh_ci, layer_idx=layer_idx, P_local=P_local)
         _f_out = _fres["fhe_out"]            # (D_MODEL,)
         _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
         _attn_slots[::T_MODEL][:D_MODEL] = _f_out
@@ -2046,18 +2059,16 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 ctx, _mlp_in_slots, SCALE, fresh_ci))
 
         # -- BSGS Wgate: (D_HIDDEN×D_MODEL) zero-padded to d_pad=D_PAD_MLP --
-        _wgate_flat = _Wgate.ravel().tolist()
-        _gate_diags = phantom.pre_encode_bsgs_diagonals(
-            ctx, encoder, _wgate_flat,
-            D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+        _gate_diags = _dense_bsgs_cache.matrix_diags_cached(
+            ctx, encoder, _Wgate, D_HIDDEN, D_MODEL, D_PAD_MLP,
+            _DENSE_MLP_BABY_STEPS, SCALE, "gate", layer_idx)
         _gate_ct = phantom.bsgs_matmul_preencoded(
             ctx, galois_key, _mlp_in_ct, _gate_diags)
 
         # -- BSGS Wup: reuse same baby rotations of _mlp_in_ct --
-        _wup_flat = _Wup.ravel().tolist()
-        _up_diags = phantom.pre_encode_bsgs_diagonals(
-            ctx, encoder, _wup_flat,
-            D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+        _up_diags = _dense_bsgs_cache.matrix_diags_cached(
+            ctx, encoder, _Wup, D_HIDDEN, D_MODEL, D_PAD_MLP,
+            _DENSE_MLP_BABY_STEPS, SCALE, "up", layer_idx)
         _up_ct = phantom.bsgs_matmul_preencoded(
             ctx, galois_key, _mlp_in_ct, _up_diags)
 
@@ -2098,10 +2109,9 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                                max_abs=_h_calib, slot_count=NUM_SLOTS)
 
         # -- BSGS Wdown: (D_MODEL×D_HIDDEN) zero-padded to d_pad=D_PAD_MLP --
-        _wdown_flat = _Wdown.ravel().tolist()
-        _down_diags = phantom.pre_encode_bsgs_diagonals(
-            ctx, encoder, _wdown_flat,
-            D_MODEL, D_HIDDEN, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+        _down_diags = _dense_bsgs_cache.matrix_diags_cached(
+            ctx, encoder, _Wdown, D_MODEL, D_HIDDEN, D_PAD_MLP,
+            _DENSE_MLP_BABY_STEPS, SCALE, "down", layer_idx)
         _down_ct = phantom.bsgs_matmul_preencoded(
             ctx, galois_key, _h_ct, _down_diags)
 

@@ -532,12 +532,31 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     // ===== BSGS-diagonal matrix-vector multiply =====
     py::class_<phantom::BsgsDiagonals>(m, "bsgs_diagonals")
+            // Reconstruct a BsgsDiagonals from cached SCPs (the ~44 s/layer
+            // encode payload). giant_steps replicates src/bsgs.cu:124's
+            // `d_pad / baby_steps` exactly (baby_steps divides d_pad).
+            // Used by the dense BSGS disk cache to skip the encode on a hit.
+            .def(py::init([](std::vector<phantom::SingleChainPlaintext> diags,
+                             std::size_t d_pad, std::size_t baby_steps) {
+                     phantom::BsgsDiagonals b;
+                     b.diagonals = std::move(diags);
+                     b.d_pad = d_pad;
+                     b.baby_steps = baby_steps;
+                     b.giant_steps = d_pad / baby_steps;
+                     return b;
+                 }),
+                 py::arg("diagonals"), py::arg("d_pad"), py::arg("baby_steps"))
             .def_property_readonly("d_pad",
                                    [](const phantom::BsgsDiagonals &d) { return d.d_pad; })
             .def_property_readonly("baby_steps",
                                    [](const phantom::BsgsDiagonals &d) { return d.baby_steps; })
             .def_property_readonly("giant_steps",
-                                   [](const phantom::BsgsDiagonals &d) { return d.giant_steps; });
+                                   [](const phantom::BsgsDiagonals &d) { return d.giant_steps; })
+            // The std::vector<SingleChainPlaintext> encode payload. Each
+            // element round-trips via the existing coeffs_bytes()/
+            // scp_from_bytes() machinery (the dense BSGS disk cache).
+            .def_property_readonly("diagonals",
+                                   [](const phantom::BsgsDiagonals &d) { return d.diagonals; });
 
     m.def("pre_encode_bsgs_diagonals",
           [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
