@@ -81,7 +81,7 @@ from llama3 import (
     rmsnorm_np, apply_rope_np, rope_matrix_np, silu_np,
     rms_z_window, compute_layer_z, compute_layer_max_abs,
     forward_decoder_np,
-    load_layer_weights, encode_layer_irps,
+    load_layer_weights, load_layer_weights_subset, encode_layer_irps,
     fhe_mlp_irp_bootstrap,
 )
 
@@ -869,6 +869,77 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
     safety_scale = (_SOFTMAX_TARGET / _max_head_denom
                     if _max_head_denom > _SOFTMAX_TARGET else 1.0)
 
+    # ---- Dense-layout-correct per-shard pre-bootstrap mean (H2 fix). ----
+    # bootstrap_safe assumes a ~mean-zero input; the mean-sub-before /
+    # mean-add-after pair must use the shard ciphertext's TRUE mean. The
+    # old hardcoded 0.4487 is the IRP head-major layout's empirical mean;
+    # the dense token-major shard layout has a different populated/junk
+    # fill (per shard: nH base slots per REAL token-frame hold the real
+    # pipeline-exp value `_pe_s[tok,h]`; ALL other NUM_SLOTS slots — j>0
+    # within real frames AND every slot of padded frames — hold the
+    # off-support constant v0 = pipeline(score=0)). Decrypt-probe showed
+    # the true per-shard mean is ~0.4466 vs the hardcoded 0.4487 (a
+    # consistent -0.0021 mis-centering that biased every post-bootstrap
+    # `e` value -> the dominant ~2.6e-3 dense-softmax excess over the IRP
+    # floor). Compute it analytically with the SAME ps_exp Chebyshev +
+    # damping primitives already used for `_pe_s` (v0 = `_pe_s` evaluated
+    # at score 0). ADDITIVE; DENSE_PRE_MEAN_FIX=0 restores the 0.4487
+    # functional baseline.
+    _pre_mean_fix = os.environ.get("DENSE_PRE_MEAN_FIX", "1") == "1"
+    _v0 = 0.0
+    for _c in reversed(_cf_s):
+        _v0 = _v0 * 0.0 + _c
+    for _d in _dmp_s:
+        _v0 = _v0 * _v0
+        if abs(_d - 1.0) > 1e-12:
+            _v0 = _v0 * _d
+    _v0 = float(_v0)
+    _dense_pre_mean = np.full(n_shards, 0.4487, dtype=np.float64)
+    if _pre_mean_fix:
+        for _b in range(n_shards):
+            _t0 = _b * P
+            _t1 = min(_t0 + P, real_nt)
+            _n_real_frames = max(_t1 - _t0, 0)
+            _pop_sum = float(_pe_s[_t0:_t1, :].sum())
+            _n_pop = _n_real_frames * nH
+            _n_junk = NUM_SLOTS - _n_pop
+            _dense_pre_mean[_b] = (_pop_sum + _n_junk * _v0) / NUM_SLOTS
+    if os.environ.get("PROBE_DENSE_SMX") == "1":
+        print(f"  [PROBE-SMX] v0(pipeline@0)={_v0:.6f}  "
+              f"dense per-shard pre-mean (fix={_pre_mean_fix}): "
+              f"{np.array2string(_dense_pre_mean, precision=6)}")
+
+    # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): compute the IRP path's safety_scale
+    # estimator (compute_layer_calib_n L274-280: exp(scores).sum().max() *
+    # TARGET_MAG) on the IDENTICAL scores and report it next to the dense
+    # estimator (cheb-poly + damped squarings sum). Pure numpy, zero
+    # ciphertext effect. When unset this block is not entered.
+    if os.environ.get("PROBE_DENSE_SMX") == "1":
+        _irp_sum_t_exp = np.exp(_scc_s).sum(axis=0)            # per-head Σ exp
+        _irp_expected_max = float(_irp_sum_t_exp.max() * TARGET_MAG)
+        _irp_safety = (_SOFTMAX_TARGET / _irp_expected_max
+                       if _irp_expected_max > _SOFTMAX_TARGET else 1.0)
+        # Post-pipeline per-head denom magnitude the Goldschmidt `a` SEES,
+        # i.e. after folding each estimator's safety_scale (a == that estimate
+        # * safety, the value softmax_correct must keep inside (0,2)).
+        _dense_a_max = _max_head_denom * safety_scale
+        _irp_a_max = _irp_expected_max * _irp_safety
+        # Per-head dense `a` distribution (numpy proxy = the simulated denom):
+        _ph = _pe_s.sum(axis=0) * safety_scale
+        print(f"  [PROBE-SMX] real_nt={real_nt} P={P} n_shards={n_shards}")
+        print(f"  [PROBE-SMX] DENSE estimator: max_head_denom(cheb+damp)="
+              f"{_max_head_denom:.6f}  safety_scale={safety_scale:.6f}")
+        print(f"  [PROBE-SMX] IRP   estimator: expected_max(exp*TM)="
+              f"{_irp_expected_max:.6f}  safety_scale={_irp_safety:.6f}")
+        print(f"  [PROBE-SMX] safety_scale RATIO dense/irp="
+              f"{(safety_scale / _irp_safety if _irp_safety else 0.0):.6f}")
+        print(f"  [PROBE-SMX] post-fold a_max  DENSE={_dense_a_max:.6f}  "
+              f"IRP={_irp_a_max:.6f}  (Goldschmidt window (0,2), target 1.5)")
+        print(f"  [PROBE-SMX] dense per-head a (post-fold) numpy proxy: "
+              f"min={_ph.min():.5f} max={_ph.max():.5f} "
+              f"mean={_ph.mean():.5f} >1.9:{int((_ph>1.9).sum())} "
+              f">1.99:{int((_ph>1.99).sum())} <0.05:{int((_ph<0.05).sum())}")
+
     # ---- Stage B: ps_exp_init + damped squarings, per shard. ----
     # real_nt (NOT nt_pad): paired with the damps; matches IRP _stage_b_ps_exp
     # + softmax_damping_schedule (the t^(-1) baked in must be the real summed
@@ -894,7 +965,24 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
         # _PRE_FINSMX_MEAN first centres the signal for the bootstrap, then
         # adding it back restores the true pipeline values. _PRE_FINSMX_MEAN
         # is the SAME functional-baseline constant the IRP path uses.
-        _PRE_FINSMX_MEAN = 0.4487
+        # H2 FIX: use the dense-layout-correct per-shard mean (computed
+        # above from the same ps_exp+damping primitives) instead of the
+        # IRP-tuned 0.4487 so the bootstrap input is actually mean-zero.
+        _PRE_FINSMX_MEAN = float(_dense_pre_mean[b])
+        # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): decrypt this dense shard ct's
+        # TRUE mean right before the mean-sub. bootstrap_safe assumes an
+        # ~mean-zero input; `_PRE_FINSMX_MEAN` should equal this true mean.
+        # Any gap is added uniformly to every slot by the mean-add-back and
+        # de-centers the bootstrap input -> value-independent absolute `e`
+        # error (H2). Decrypt only; zero ciphertext effect.
+        if os.environ.get("PROBE_DENSE_SMX") == "1":
+            _pre = np.array(
+                encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                dtype=np.float64)
+            print(f"  [PROBE-SMX] shard {b} e PRE-meansub: true ct "
+                  f"mean={_pre.mean():.6f}  hardcoded={_PRE_FINSMX_MEAN:.6f}"
+                  f"  gap(true-hc)={_pre.mean() - _PRE_FINSMX_MEAN:+.6f}  "
+                  f"max|.|={np.abs(_pre).max():.4e}")
         _mean_pt = encoder.encode_double_vector(
             ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
             e_ct.scale(), e_ct.chain_index())
@@ -927,6 +1015,37 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
         e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
         e_ct = phantom.rescale_to_next(ctx, e_ct)
         e_ct.set_scale(e_nominal)
+        # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): decrypt this shard's post-
+        # bootstrap-masked `e` (the softmax NUMERATOR Goldschmidt consumes)
+        # and compare to the analytic target TARGET_MAG*exp(scores_post_C)*
+        # safety_scale on the SAME shard's tokens. Localizes whether the
+        # softmax error is in `e` (ps_exp/bootstrap/mask) or in the e/a
+        # division. Decrypt only; zero ciphertext effect.
+        if os.environ.get("PROBE_DENSE_SMX") == "1":
+            _ev = np.array(
+                encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                dtype=np.float64)
+            _e_fhe, _e_ana = [], []
+            for _tl in range(P):
+                _ta = tok_start + _tl
+                if _ta >= real_nt:
+                    break
+                for _h in range(nH):
+                    _e_fhe.append(_ev[_tl * D + _h * H])
+                    _e_ana.append(
+                        TARGET_MAG
+                        * math.exp(float(_scc_s[_ta, _h]))
+                        * safety_scale)
+            if _e_fhe:
+                _ef = np.asarray(_e_fhe); _ea = np.asarray(_e_ana)
+                _den = np.linalg.norm(_ea)
+                _rr = (float(np.linalg.norm(_ef - _ea) / _den)
+                       if _den > 0 else 0.0)
+                print(f"  [PROBE-SMX] shard {b} e (FHE post-mask) vs "
+                      f"analytic TM*exp*ss: rel-RMS={_rr:.4e} "
+                      f"‖efhe‖={np.linalg.norm(_ef):.5f} "
+                      f"‖eana‖={_den:.5f} "
+                      f"max_abs_err={float(np.abs(_ef-_ea).max()):.3e}")
         e_cts.append(e_ct)
 
     # ---- Stage C: per-shard partial sum -> cross-shard ADD -> reciprocal. ----
@@ -964,6 +1083,38 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
     a_total = phantom.multiply_plain(ctx, a_total, _a_mask_pt)
     a_total = phantom.rescale_to_next(ctx, a_total)
     a_total.set_scale(engine.user_scale())
+
+    # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): decrypt the ACTUAL FHE per-head
+    # denominator `a_total` the dense Goldschmidt softmax_correct will consume,
+    # read at the base slots (tok*D + h*H) for the populated tokens. This is
+    # the real `a` whose magnitude vs the (0,2)/1.5 window determines the
+    # Goldschmidt noise floor. Decrypt only — zero ciphertext effect.
+    if os.environ.get("PROBE_DENSE_SMX") == "1":
+        _av = np.array(
+            encoder.decode_double_vector(ctx, sk.decrypt(ctx, a_total)),
+            dtype=np.float64)
+        _a_base = []
+        for _b in range(n_shards):
+            _ts = _b * P
+            for _tl in range(P):
+                _ta = _ts + _tl
+                if _ta >= real_nt:
+                    break
+                for _h in range(nH):
+                    _a_base.append(_av[_tl * D + _h * H])
+        _a_base = np.asarray(_a_base, dtype=np.float64)
+        # Per-head Σ over tokens of the decrypted base-slot `a` (each base
+        # slot ALREADY holds the per-head total after sum_reduce+cross-add,
+        # so the per-head a == the value at any one base slot of that head;
+        # collapse over tokens via the first token's row).
+        _a_head = _av[np.array([0 * D + _h * H for _h in range(nH)])]
+        print(f"  [PROBE-SMX] FHE a_total (decrypted, base slots, real "
+              f"tokens): min={_a_base.min():.6f} max={_a_base.max():.6f} "
+              f"mean={_a_base.mean():.6f}")
+        print(f"  [PROBE-SMX] FHE per-head a (tok0 row, nH={nH}): "
+              f"min={_a_head.min():.6f} max={_a_head.max():.6f} "
+              f">1.9:{int((_a_head>1.9).sum())} >1.99:{int((_a_head>1.99).sum())} "
+              f">=2.0:{int((_a_head>=2.0).sum())} <0.05:{int((_a_head<0.05).sum())}")
 
     # Intra-head broadcast of the per-head sum across the d_head block
     # (mirrors the verified oracle kv_layout_dense._broadcast_within_heads
@@ -1005,9 +1156,35 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
 
     a_chain = a_total.chain_index()
     fhe_weights = np.zeros((real_nt, nH), dtype=np.float64)
+    _probe_smx = os.environ.get("PROBE_DENSE_SMX") == "1"
+    _w_recon = np.zeros((real_nt, nH), dtype=np.float64) if _probe_smx else None
+    if _probe_smx:
+        _a_dec = np.array(
+            encoder.decode_double_vector(ctx, sk.decrypt(ctx, a_total)),
+            dtype=np.float64)
     for b, e_ct in enumerate(e_cts):
         if e_ct.chain_index() != a_chain:
             e_ct = phantom.mod_switch_to(ctx, e_ct, a_chain)
+        # DIAGNOSTIC ONLY: decrypt the EXACT `e` fed to Goldschmidt (post
+        # mod-switch) and reconstruct w = e/a in numpy at the base slots.
+        # If w_recon ≈ oracle but the FHE softmax_correct output diverges,
+        # the residual is the FHE Goldschmidt division; if w_recon already
+        # diverges, the residual is in `e`/`a` (ps_exp domain). Decrypt
+        # only; the ciphertext path is unchanged.
+        if _probe_smx:
+            _e_dec = np.array(
+                encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
+                dtype=np.float64)
+            _ts = b * P
+            for _tl in range(P):
+                _ta = _ts + _tl
+                if _ta >= real_nt:
+                    break
+                for _h in range(nH):
+                    _sl = _tl * D + _h * H
+                    _ad = _a_dec[_sl]
+                    _w_recon[_ta, _h] = (_e_dec[_sl] / _ad
+                                         if abs(_ad) > 1e-30 else 0.0)
         wb = phantom.softmax_correct(
             ctx, encoder, relin_key, e_ct, a_total, ITERS)
         wv = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, wb)),
@@ -1039,10 +1216,351 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
     _oe = np.exp(_os)
     oracle_weights = _oe / _oe.sum(axis=0, keepdims=True)
 
+    # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): w_recon = (decrypted e)/(decrypted
+    # a) vs oracle and vs the FHE softmax_correct output. Splits the dense
+    # softmax error into (i) e/a-domain (ps_exp+bootstrap+mask) and (ii) the
+    # FHE Goldschmidt division residual.
+    if os.environ.get("PROBE_DENSE_SMX") == "1" and _w_recon is not None:
+        def _rr(a, b):
+            a = np.asarray(a, np.float64); b = np.asarray(b, np.float64)
+            n = np.linalg.norm(b)
+            return float(np.linalg.norm(a - b) / n) if n > 0 else 0.0
+        print(f"  [PROBE-SMX] w_recon(e_dec/a_dec) vs oracle  "
+              f"rel-RMS={_rr(_w_recon, oracle_weights):.4e}")
+        print(f"  [PROBE-SMX] w_recon(e_dec/a_dec) vs FHE_w   "
+              f"rel-RMS={_rr(_w_recon, fhe_weights):.4e}  "
+              f"(FHE Goldschmidt-division residual)")
+        print(f"  [PROBE-SMX] FHE_w vs oracle (gate softmax (a)) "
+              f"rel-RMS={_rr(fhe_weights, oracle_weights):.4e}")
+
     return {
         "fhe_weights": fhe_weights,
         "oracle_weights": oracle_weights,
         "head_sums": head_sums,
+        "P": P,
+        "n_shards": n_shards,
+    }
+
+
+def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
+                              xn_query, Wq_baked, K_full_h, V_full_h, Wo,
+                              c_per_head, real_nt, chain_index):
+    """Stage 4 (dense-layout rewrite): close the dense attention block.
+
+    Runs the FULL dense token-major attention pipeline end-to-end, ENTIRELY
+    in FHE, returning the post-Wo attention-output ciphertext (replicated-
+    block period D_TOTAL) so the caller can wire it into the residual stream:
+
+      QK^T (compute_qkt)  ->  scale*mask + per-head sub(C)  ->  bootstrap
+        ->  ps_exp_init + damped squarings  ->  bootstrap (mean-centered)
+        ->  STRICT 0/1 base-slot re-mask (the poly(0) trap fix)
+        ->  per-shard sum_reduce(stride=D, count=P) -> cross-shard ADD
+        ->  a-reset mask + Goldschmidt softmax_correct  (== exp / Σexp)
+            [softmax weights kept ENCRYPTED per shard — token-major]
+        ->  score_times_v (src/attention.cu kernel, AS-IS) over the
+            softmax-weight cts + token-major V shards: mask base ->
+            negative-stride d_head broadcast -> ×V -> +d_total accumulate
+            over P -> cross-shard ADD.  Because P*D == NUM_SLOTS exactly
+            (8*4096 == 32768), the kernel's step-4 accumulate doubling is a
+            full cyclic sum-reduce that REPLICATES the per-head attention
+            output into ALL NUM_SLOTS/D_TOTAL periods -> slot[k*D + h*H + j]
+            = Σ_tok w[tok,h]·V[tok,h,j] for every period k.  That IS the
+            replicated-block period-D_pad layout BSGS Wo consumes (identical
+            to encrypt_x_replicated_block's Wq input) — no phantom.replicate
+            needed (its -4096/-8192 galois steps are NOT provisioned).
+        ->  BSGS Wo (bsgs_matmul_preencoded, d_pad == D_TOTAL,
+            baby_steps == _DENSE_WQ_BABY_STEPS == 64; bsgs_required_steps(64)
+            = {1,2,4,8,16,32,64} ALL already provisioned -> ZERO new keys).
+            Output: replicated-block period D_TOTAL, o_ct[k*D + i] = O[i].
+
+    The QK^T -> softmax stages are byte-identical to fhe_attention_dense_
+    softmax (same constants, same bootstraps, same poly(0)-trap re-mask,
+    same safety_scale, same a-reset); the ONLY difference is the softmax
+    weights are NOT decrypted — they stay as per-shard token-major
+    ciphertexts fed straight into the score_times_v kernel.
+
+    Args:
+      xn_query : (D_MODEL,) rmsnormed hidden at the query position.
+      Wq_baked : (D_TOTAL, D_MODEL) Wq with R_P (rope@query) pre-applied.
+      K_full_h : (real_nt, N_HEADS, D_HEAD) rope-applied + GQA-expanded K.
+      V_full_h : (real_nt, N_HEADS, D_HEAD) GQA-expanded V (NO rope).
+      Wo       : (D_MODEL, D_TOTAL) output projection (NO R_P).
+      c_per_head : (N_HEADS,) per-head softmax shift (real-key max + 0.5).
+      real_nt  : real token count (== num_tokens for variable-nt).
+      chain_index : fresh chain to encode/encrypt the dense inputs at.
+
+    Returns dict:
+      'o_ct'        : post-Wo attention-output ciphertext (replicated-block
+                      period D_TOTAL); o_ct decoded[i] == attn_out[i] for
+                      i in [0, D_MODEL).  THIS is wired into the residual.
+      'fhe_attn_o'  : (N_HEADS, D_HEAD) decrypted score·V output (pre-Wo)
+      'oracle_attn_o': (N_HEADS, D_HEAD) kv_layout_dense.dense_score_v on
+                       the IDENTICAL Q/K/V softmax weights (trusted spec)
+      'fhe_out'     : (D_MODEL,) decrypted post-Wo attention output
+      'oracle_out'  : (D_MODEL,) numpy Wo @ (flattened oracle score·V)
+      'P', 'n_shards'
+    """
+    D = D_TOTAL
+    H = D_HEAD
+    nH = N_HEADS
+    P = _dense_fhe.positions_per_ct(real_nt, NUM_SLOTS, D)
+    n_shards = _dense_fhe.n_shards_for(real_nt, P)
+
+    # ---- QK^T (identical to fhe_attention_dense_softmax). ----
+    wq_diags = _dense_fhe.bsgs_wq_diags_dense(
+        ctx, encoder, Wq_baked, D, _DENSE_WQ_BABY_STEPS, SCALE)
+    x_ct = _dense_fhe.encrypt_x_replicated_block(
+        ctx, encoder, sk, xn_query, D, NUM_SLOTS, SCALE, chain_index)
+    q_ct = phantom.bsgs_matmul_preencoded(ctx, galois_key, x_ct, wq_diags)
+    k_cts = _dense_fhe.encrypt_k_dense_shards(
+        ctx, encoder, sk, K_full_h, real_nt, P, nH, H,
+        NUM_SLOTS, SCALE, chain_index)
+    for kc in k_cts:
+        phantom.mod_switch_to_inplace(ctx, kc, q_ct.chain_index())
+    raw_score_cts = phantom.compute_qkt(
+        ctx, relin_key, galois_key, q_ct, k_cts, H)
+
+    inv_sqrt_d = 1.0 / math.sqrt(float(H))
+
+    # ---- Stage A: fused scale*mask + per-head sub(C), per shard. ----
+    score_cts = []
+    for b, sc in enumerate(raw_score_cts):
+        tok_start = b * P
+        nominal = sc.scale()
+        ms_slots = _dense_fhe.dense_scale_mask_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, inv_sqrt_d)
+        ms_pt = encoder.encode_double_vector(
+            ctx, ms_slots, SCALE, sc.chain_index())
+        sc = phantom.multiply_plain(ctx, sc, ms_pt)
+        sc = phantom.rescale_to_next(ctx, sc)
+        sc.set_scale(nominal)
+        sub_slots = _dense_fhe.dense_per_head_sub_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, c_per_head)
+        sub_pt = encoder.encode_double_vector(
+            ctx, sub_slots, sc.scale(), sc.chain_index())
+        sc = phantom.sub_plain(ctx, sc, sub_pt)
+        score_cts.append(sc)
+
+    # ---- Bootstrap after stage A (before ps_exp). Same static bound the
+    # IRP path / fhe_attention_dense_softmax uses. ----
+    _SCORES_CALIB = 45.10
+    score_cts = [
+        bootstrap_safe(engine, ctx, encoder, sc,
+                       max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS)
+        for sc in score_cts
+    ]
+
+    # ---- Safety scale (identical derivation to fhe_attention_dense_
+    # softmax: from the SAME teacher-forced numpy oracle, NOT decrypted
+    # FHE). Keeps the peaky-head Goldschmidt denominator inside (0,2). ----
+    _SOFTMAX_TARGET = 1.5
+    _Qd_s = (np.asarray(xn_query, np.float64)
+             @ np.asarray(Wq_baked, np.float64).T).reshape(nH, H)
+    _qs_s = _dense_oracle.pack_q_dense(_Qd_s, P)
+    _ks_s, _ = _dense_oracle.pack_kv_dense_shards(
+        np.asarray(K_full_h, np.float64),
+        np.asarray(K_full_h, np.float64), real_nt, P, nH)
+    _osc_s = _dense_oracle.dense_qkt(
+        [_qs_s] * n_shards, _ks_s, nH, H, real_nt, P, inv_sqrt_d)
+    _scc_s = _osc_s - np.asarray(c_per_head, np.float64)[None, :]
+    _EC_S = [1.0000000000000002, 0.9999999011179665, 0.49999999014536933,
+             0.16666798420023443, 0.04166679798739991, 0.008328598903862764,
+             0.001388416857145537, 0.00020469833492755798,
+             2.542872206845459e-05]
+    _se_s = 2.0 ** NUM_SQUARINGS
+    _lead_s = EXTRA_SCALE * (float(real_nt) ** (-1.0 / _se_s))
+    _cf_s = [_lead_s * _EC_S[i] * ((1.0 / _se_s) ** i)
+             for i in range(len(_EC_S))]
+    _pe_s = np.zeros_like(_scc_s)
+    for i, c in enumerate(_cf_s):
+        _pe_s = _pe_s + c * np.power(_scc_s, i)
+    _dmp_s = softmax_damping_schedule(
+        NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    for d in _dmp_s:
+        _pe_s = _pe_s * _pe_s
+        if abs(d - 1.0) > 1e-12:
+            _pe_s = _pe_s * d
+    _max_head_denom = float(_pe_s.sum(axis=0).max())
+    safety_scale = (_SOFTMAX_TARGET / _max_head_denom
+                    if _max_head_denom > _SOFTMAX_TARGET else 1.0)
+
+    # ---- Dense-layout-correct per-shard pre-bootstrap mean (H2 fix). ----
+    # See fhe_attention_dense_softmax for the full rationale. The end-to-end
+    # path flows through THIS function, so the same correction must apply
+    # here. ADDITIVE; DENSE_PRE_MEAN_FIX=0 restores the 0.4487 baseline.
+    _pre_mean_fix = os.environ.get("DENSE_PRE_MEAN_FIX", "1") == "1"
+    _v0 = 0.0
+    for _c in reversed(_cf_s):
+        _v0 = _v0 * 0.0 + _c
+    for _d in _dmp_s:
+        _v0 = _v0 * _v0
+        if abs(_d - 1.0) > 1e-12:
+            _v0 = _v0 * _d
+    _v0 = float(_v0)
+    _dense_pre_mean = np.full(n_shards, 0.4487, dtype=np.float64)
+    if _pre_mean_fix:
+        for _b in range(n_shards):
+            _t0 = _b * P
+            _t1 = min(_t0 + P, real_nt)
+            _n_real_frames = max(_t1 - _t0, 0)
+            _pop_sum = float(_pe_s[_t0:_t1, :].sum())
+            _n_pop = _n_real_frames * nH
+            _n_junk = NUM_SLOTS - _n_pop
+            _dense_pre_mean[_b] = (_pop_sum + _n_junk * _v0) / NUM_SLOTS
+
+    # ---- Stage B: ps_exp_init + damped squarings + mean-centered
+    # bootstrap + STRICT 0/1 base-slot re-mask (poly(0) trap fix), per
+    # shard. Byte-identical to fhe_attention_dense_softmax. ----
+    damps = softmax_damping_schedule(
+        NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    e_cts = []
+    for b, sc in enumerate(score_cts):
+        e_ct = phantom.ps_exp_init(
+            ctx, encoder, relin_key, sc,
+            real_nt, NUM_SQUARINGS, EXTRA_SCALE)
+        phantom.square_iterations_damped_inplace(
+            ctx, encoder, relin_key, e_ct, damps)
+        # H2 FIX: dense-layout-correct per-shard mean (see
+        # fhe_attention_dense_softmax). Restores mean-zero bootstrap input.
+        _PRE_FINSMX_MEAN = float(_dense_pre_mean[b])
+        _mean_pt = encoder.encode_double_vector(
+            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+            e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
+        e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
+                              max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+        _mean_pt2 = encoder.encode_double_vector(
+            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+            e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.add_plain(ctx, e_ct, _mean_pt2)
+        tok_start = b * P
+        mask_slots = _dense_fhe.dense_real_base_mask_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, keep_value=safety_scale)
+        e_nominal = e_ct.scale()
+        mask_pt = encoder.encode_double_vector(
+            ctx, mask_slots, SCALE, e_ct.chain_index())
+        e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
+        e_ct = phantom.rescale_to_next(ctx, e_ct)
+        e_ct.set_scale(e_nominal)
+        e_cts.append(e_ct)
+
+    # ---- Stage C: per-shard partial sum -> cross-shard ADD -> a-reset
+    # mask -> Goldschmidt softmax_correct. Byte-identical to
+    # fhe_attention_dense_softmax EXCEPT weights stay ENCRYPTED. ----
+    a_total = None
+    for e_ct in e_cts:
+        partial = sum_reduce_stride(ctx, galois_key, e_ct, D, P)
+        if a_total is None:
+            a_total = partial
+        else:
+            a_total = phantom.add(ctx, a_total, partial)
+
+    _a_reset_slots = _dense_fhe.dense_real_base_mask_slots(
+        NUM_SLOTS, H, D, 0, P, P * n_shards, keep_value=1.0)
+    _a_mask_pt = encoder.encode_double_vector(
+        ctx, _a_reset_slots, SCALE, a_total.chain_index())
+    a_total = phantom.multiply_plain(ctx, a_total, _a_mask_pt)
+    a_total = phantom.rescale_to_next(ctx, a_total)
+    a_total.set_scale(engine.user_scale())
+
+    if os.environ.get("DENSE_SMX_BCAST") == "1":
+        a_bc = a_total
+        s = 1
+        while s < H:
+            rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
+            a_bc = phantom.add(ctx, a_bc, rot)
+            s <<= 1
+        a_total = a_bc
+
+    a_chain = a_total.chain_index()
+    weight_cts = []
+    for e_ct in e_cts:
+        if e_ct.chain_index() != a_chain:
+            e_ct = phantom.mod_switch_to(ctx, e_ct, a_chain)
+        wb = phantom.softmax_correct(
+            ctx, encoder, relin_key, e_ct, a_total, ITERS)
+        weight_cts.append(wb)
+
+    # ---- score·V via the C++ kernel AS-IS (src/attention.cu:30-98). ----
+    # mask_pt: strict 0/1 at base slots tok*D+h*H of REAL tokens — the
+    # kernel masks, then negative-stride d_head//2..1 broadcasts w[tok,h]
+    # across the head block, ×V, then +d_total accumulates over the P
+    # positions (cyclic over P*D == NUM_SLOTS -> replicates to all
+    # periods), then cross-shard adds. Identical geometry to the trusted
+    # numpy oracle kv_layout_dense.dense_score_v. Per-shard mask: the
+    # kernel applies ONE mask_pt to every shard, so the mask must keep
+    # base slots for ALL P frames (real_nt guard handled by per-shard
+    # token packing — pad tokens were already zeroed upstream). Use
+    # shard_tok_start=0 + real_nt=P*n_shards so every base slot in every
+    # frame is kept (matches the oracle's per-shard mask, which keeps
+    # base[tok_local*D + h*H] for all tok_local in [0,P)).
+    sv_mask_slots = _dense_fhe.dense_real_base_mask_slots(
+        NUM_SLOTS, H, D, 0, P, P * n_shards, keep_value=1.0)
+    w_chain = weight_cts[0].chain_index()
+    sv_mask_pt = encoder.encode_double_vector(
+        ctx, sv_mask_slots, SCALE, w_chain)
+    v_cts = _dense_fhe.encrypt_k_dense_shards(
+        ctx, encoder, sk, V_full_h, real_nt, P, nH, H,
+        NUM_SLOTS, SCALE, chain_index)
+    attn_h = phantom.score_times_v(
+        ctx, relin_key, galois_key, weight_cts, v_cts,
+        sv_mask_pt, H, D, P)
+
+    # Decrypt the pre-Wo score·V output for the per-stage diagnostic.
+    _av = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, attn_h)),
+                   dtype=np.float64)
+    fhe_attn_o = np.zeros((nH, H), dtype=np.float64)
+    for h in range(nH):
+        fhe_attn_o[h, :] = _av[h * H:h * H + H]
+
+    # ---- BSGS Wo: bsgs_matmul_preencoded, d_pad == D_TOTAL, baby_steps
+    # == _DENSE_WQ_BABY_STEPS == 64 (bsgs_required_steps(64) ⊆ provisioned
+    # -> ZERO new galois keys). score·V output is replicated-block period
+    # D_TOTAL (P*D == NUM_SLOTS makes the kernel's accumulate a full
+    # cyclic broadcast) == exactly the input layout BSGS consumes
+    # (verified: contiguous-only input -> 0.69 relrms garbage; replicated
+    # -> ~1.5e-6). Output: replicated-block period D_TOTAL. ----
+    wo_diags = _dense_fhe.bsgs_wq_diags_dense(
+        ctx, encoder, np.asarray(Wo, dtype=np.float64), D,
+        _DENSE_WQ_BABY_STEPS, SCALE)
+    o_ct = phantom.bsgs_matmul_preencoded(ctx, galois_key, attn_h, wo_diags)
+
+    _ov = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, o_ct)),
+                   dtype=np.float64)
+    fhe_out = _ov[:D_MODEL].copy()
+
+    # ---- Oracle: softmax weights -> dense_score_v -> Wo, on the IDENTICAL
+    # teacher-forced Q/K/V (the trusted Stage-1 spec). ----
+    Q_hd = (np.asarray(xn_query, dtype=np.float64)
+            @ np.asarray(Wq_baked, dtype=np.float64).T).reshape(nH, H)
+    q_slots = _dense_oracle.pack_q_dense(Q_hd, P)
+    q_per_shard = [q_slots for _ in range(n_shards)]
+    k_shards_oracle, v_shards_oracle = _dense_oracle.pack_kv_dense_shards(
+        np.asarray(K_full_h, dtype=np.float64),
+        np.asarray(V_full_h, dtype=np.float64),
+        real_nt, P, nH)
+    oracle_scores = _dense_oracle.dense_qkt(
+        q_per_shard, k_shards_oracle, nH, H, real_nt, P, inv_sqrt_d)
+    _os = oracle_scores - oracle_scores.max(axis=0, keepdims=True)
+    _oe = np.exp(_os)
+    oracle_weights = _oe / _oe.sum(axis=0, keepdims=True)  # (real_nt, nH)
+    score_shards_oracle = [
+        _dense_oracle.pack_scores_shard(
+            oracle_weights, b * P, P, nH, H)
+        for b in range(n_shards)
+    ]
+    oracle_attn_o = _dense_oracle.dense_score_v(
+        score_shards_oracle, v_shards_oracle, nH, H, P)  # (nH, H)
+    # Wo @ flattened attn (attn_flat[h*H+j] == oracle_attn_o[h,j]).
+    oracle_out = (np.asarray(Wo, dtype=np.float64)
+                  @ oracle_attn_o.reshape(-1))[:D_MODEL]
+
+    return {
+        "o_ct": o_ct,
+        "fhe_attn_o": fhe_attn_o,
+        "oracle_attn_o": oracle_attn_o,
+        "fhe_out": fhe_out,
+        "oracle_out": oracle_out,
         "P": P,
         "n_shards": n_shards,
     }
@@ -2306,6 +2824,91 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                       f"(inherent FHE softmax fidelity floor) | "
                       f"dense-FHE adds {max(_sa - _irp_vs_ora, 0.0):.3e} "
                       f"over that floor")
+
+                # ---- Stage 4: dense score·V + BSGS Wo (close the block).
+                # Teacher-forced V (GQA-expanded, NO rope) on the same
+                # numpy inputs encrypt_layer_inputs_multi uses; Wo carries
+                # NO R_P. Wv is in the 5-key hot subset; Wo is an
+                # R_P-independent weight NOT in the per-example subset and
+                # the shared _full_cache may already hold the 5-key subset
+                # (poisoning w["Wo"] -> KeyError), so load Wo directly off
+                # disk via the subset loader (one (4096,4096) fp64 array).
+                _Wv = w["Wv"]
+                _Wo = load_layer_weights_subset(
+                    layer_idx, keys=("Wo",))["Wo"]
+                _V = (_xn @ _Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+                _V_h = np.repeat(_V, N_KV_GROUPS, axis=1)[:_real_nt_g]
+                _fres = fhe_attention_dense_full(
+                    engine, ctx, encoder, sk, relin_key, galois_key,
+                    _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
+                    _real_nt_g, fresh_ci)
+                _f_sv = _fres["fhe_attn_o"]          # (N_HEADS, D_HEAD)
+                _o_sv = _fres["oracle_attn_o"]       # (N_HEADS, D_HEAD)
+                _f_out = _fres["fhe_out"]            # (D_MODEL,)
+                _o_out = _fres["oracle_out"]         # (D_MODEL,)
+                # IRP reference for score·V: the LIVE IRP softmax weights
+                # (captured in the sink) applied to the teacher-forced V —
+                # semantically the IRP path's score·V. attn_irp_o[h,j] =
+                # Σ_tok irpw[tok,h]·V[tok,h,j].
+                _irp_sv = np.einsum(
+                    'th,thj->hj', _irpw, _V_h).astype(np.float64)
+                # IRP reference for post-Wo attn output: decrypt the LIVE
+                # IRP attn_out ciphertext (stride-T_MODEL layout, same as
+                # the residual stream / y_full[::T_MODEL][:D_MODEL]).
+                _irp_o_full = np.array(
+                    encoder.decode_double_vector(
+                        ctx, sk.decrypt(ctx, attn_out)),
+                    dtype=np.float64)
+                _irp_out = _irp_o_full[::T_MODEL][:D_MODEL]
+
+                _va = _relrms(_f_sv, _o_sv)
+                _vb = _relrms(_f_sv, _irp_sv)
+                _oa = _relrms(_f_out, _o_out)
+                _ob = _relrms(_f_out, _irp_out)
+                _LIN_GATE = 1e-3
+                print(f"  [DENSE-GATE L{layer_idx:2d}] score·V (a) vs "
+                      f"oracle  rel-RMS={_va:.3e}  "
+                      f"[{'PASS' if _va <= _LIN_GATE else 'FAIL'}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] score·V (b) vs "
+                      f"IRP-FHE rel-RMS={_vb:.3e}  "
+                      f"[{'PASS' if _vb <= _LIN_GATE else 'FAIL'}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] attn-out(post-Wo) "
+                      f"(a) vs oracle  rel-RMS={_oa:.3e}  "
+                      f"[{'PASS' if _oa <= _LIN_GATE else 'FAIL'}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] attn-out(post-Wo) "
+                      f"(b) vs IRP-FHE rel-RMS={_ob:.3e}  "
+                      f"[{'PASS' if _ob <= _LIN_GATE else 'FAIL'}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] "
+                      f"‖svf‖={np.linalg.norm(_f_sv):.4f} "
+                      f"‖svo‖={np.linalg.norm(_o_sv):.4f} "
+                      f"‖outf‖={np.linalg.norm(_f_out):.4f} "
+                      f"‖outo‖={np.linalg.norm(_o_out):.4f}")
+
+                # ---- WIRE END-TO-END: the dense attention output BECOMES
+                # the layer's attention output that flows into residual1.
+                # The IRP attn_out computed above is DISCARDED at gate
+                # layers. Layout bridge: the dense BSGS Wo output is
+                # replicated-block period-D_TOTAL (o_ct decoded[i]==O[i]
+                # for i<D_MODEL); the residual stream / x_ct is
+                # stride-T_MODEL (slot[i*T_MODEL]==x[i], cf.
+                # encrypt_layer_inputs_multi x_slots). Re-encode O into
+                # stride-T_MODEL and re-encrypt at fresh_ci — the SAME
+                # teacher-forcing layout bridge the per-layer pipeline
+                # already applies to its inputs (encrypt_layer_inputs_multi
+                # re-encrypts from clean numpy each layer). ALL the dense
+                # FHE compute (QK^T + softmax + score·V + BSGS Wo) happens
+                # BEFORE this bridge, so the `Layer {L}` rel-RMS vs
+                # pytorch_ref[L+1] below now reflects the FULL DENSE
+                # pipeline's numerical fidelity, NOT the IRP path.
+                _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+                _attn_slots[::T_MODEL][:D_MODEL] = _f_out
+                attn_out = sk.encrypt_symmetric(
+                    ctx, encoder.encode_double_vector(
+                        ctx, _attn_slots, SCALE, fresh_ci))
+                print(f"  [DENSE-GATE L{layer_idx:2d}] WIRED: dense "
+                      f"attn-out -> residual stream (IRP attn_out "
+                      f"discarded at this gate layer; Layer {layer_idx} "
+                      f"rel-RMS below reflects the DENSE pipeline)")
             except Exception as _de:
                 import traceback
                 print(f"  [DENSE-GATE L{layer_idx:2d}] ERROR: "

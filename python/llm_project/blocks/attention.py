@@ -32,6 +32,25 @@ except ImportError:
     from softmax import softmax_damping_schedule, softmax_required_steps
 
 
+# DIAGNOSTIC ONLY (opt-in via PROBE_DECRYPT_STAGES=1). Dumps a decrypted
+# slot vector to disk so an offline harness can compute rel-RMS vs plain-math
+# for the softmax internals (denominator `a`, broadcast sum). When the flag is
+# unset _probe_dump_stage is a no-op: byte-identical to the original.
+_PROBE_DECRYPT_STAGES = os.environ.get("PROBE_DECRYPT_STAGES") == "1"
+_PROBE_DUMP_DIR = os.environ.get("PROBE_DUMP_DIR", "/tmp/probe_stage_dump")
+_PROBE_DUMP_LAYER = [None]  # set by llama3_mrpc per verbose layer
+
+
+def _probe_dump_stage(tag, v):
+    if not (_PROBE_DECRYPT_STAGES and _PROBE_DUMP_LAYER[0] is not None):
+        return
+    os.makedirs(_PROBE_DUMP_DIR, exist_ok=True)
+    safe = (tag.replace("/", "_").replace(" ", "_")
+            .replace("[", "").replace("]", "").replace("(", "").replace(")", ""))
+    np.save(f"{_PROBE_DUMP_DIR}/L{_PROBE_DUMP_LAYER[0]}__smx_{safe}.npy",
+            np.asarray(v, dtype=np.float64))
+
+
 # ---------------------------------------------------------------------------
 # Shape / step helpers
 # ---------------------------------------------------------------------------
@@ -325,6 +344,213 @@ def compute_qkt_irp(
     return acc
 
 
+def pack_score_blocks_tree(ctx, galois_key, score_blocks, t,
+                            encoder=None, d_head=None, d_total=None,
+                            encode_scale=None):
+    """Tree-rotation pack: n_blocks score ciphertexts -> 1 packed ct in
+    log2(n_blocks) rounds, using only n_blocks distinct rotation steps
+    {-t, -2t, -4t, ..., -(n_blocks/2)*t}.
+
+    Input layout (per block k):
+      slot[h*d_head*t + tok_local] = m[k, h, tok_local] for tok_local<t,
+      other slots zero (assumed masked).
+
+    Output layout (packed):
+      slot[h*d_head*t + (k*t + tok_local)] = m[k, h, tok_local]
+      Equivalently: slot[h*d_head*t + tok_global] = m[h, tok_global]
+      for tok_global<n_blocks*t.
+
+    Required rotation step keys: {-t * 2^s for s in range(log2(n_blocks))}
+    (negative). For n_blocks=64, t=8: {-8, -16, -32, -64, -128, -256}.
+
+    If `encoder`, `d_head`, `d_total`, `encode_scale` are all provided,
+    apply a strict 0/1 mask after each merge round that keeps only the
+    slots populated so far (cumulative populated range expands as
+    `[h*d_head*t + 0..(2*stride*t)-1]` per head) and zeroes everything
+    else. This clips per-round leakage (junk * encoding_noise from
+    unpopulated input slots) before it can accumulate over log2(n_blocks)
+    rounds — needed when the score blocks have non-zero junk at their
+    unpopulated slots, which is the case when this function is called
+    on the QKT output (post stage-A premask only). Each mask consumes
+    1 level; log2(n_blocks) = 6 levels for n_blocks=64.
+
+    If those args are None, the function falls back to the cheap pack
+    with no intermediate masks — correct only when input score_blocks
+    have clean zeros at their unpopulated slots (e.g. post-stage-C).
+    """
+    n_blocks = len(score_blocks)
+    if n_blocks == 0:
+        raise ValueError("pack_score_blocks_tree: empty input")
+    if n_blocks == 1:
+        return score_blocks[0]
+    use_mask = (encoder is not None and d_head is not None
+                and d_total is not None and encode_scale is not None)
+    cts = list(score_blocks)
+    stride = 1
+    while stride < n_blocks:
+        new_cts = []
+        for i in range(0, len(cts), 2):
+            if i + 1 < len(cts):
+                rot = phantom.rotate(ctx, cts[i + 1], -stride * t, galois_key)
+                merged = phantom.add(ctx, cts[i], rot)
+                if use_mask:
+                    populated_len = 2 * stride * t
+                    nominal = merged.scale()
+                    mask_pt = encoder.encode_double_vector(
+                        ctx,
+                        _qkt_irp_head_mask_slots(
+                            encoder.slot_count(), d_head, d_total, t,
+                            populated_len, 1.0),
+                        encode_scale, merged.chain_index())
+                    merged = phantom.multiply_plain(ctx, merged, mask_pt)
+                    merged = phantom.rescale_to_next(ctx, merged)
+                    merged.set_scale(nominal)
+                new_cts.append(merged)
+            else:
+                new_cts.append(cts[i])
+        cts = new_cts
+        stride *= 2
+    return cts[0]
+
+
+def packed_softmax_finalize(
+    ctx, encoder, relin_key, galois_key,
+    packed_e, head_first_slot_mask_pt,
+    n_heads: int, d_head: int, t: int, n_blocks: int, iters: int,
+    user_scale: float,
+    sk=None, verbose=False,
+):
+    """Softmax aggregation on a packed score ciphertext (replaces
+    multi_ct_softmax_finalize for the packed path).
+
+    Packed input layout:
+      slot[h*d_head*t + tok_global] = e[h, tok_global] for h<n_heads,
+        tok_global<n_blocks*t. Slots beyond are zero.
+
+    Algorithm (single-ct version of multi_ct_softmax_finalize):
+      1. (No cross-block sum: already packed in one ct.)
+      2. Within-head sum_reduce stride=1, count=n_blocks*t. Slot
+         [h*d_head*t + 0] ends up holding per-head global sum.
+      3. Mask + broadcast: spread per-head sum to slots
+         [h*d_head*t + 0..n_blocks*t-1] for the per-token goldschmidt.
+      4. Goldschmidt softmax_correct.
+
+    Returns: single packed weights ct with same layout, weights[h, tok] /
+    per_head_sum.
+
+    Required rotation step keys (positive for sum_reduce, negative for
+    broadcast): {±1, ±2, ±4, ..., ±(n_blocks*t/2)}.
+    """
+    total_t = n_blocks * t
+    if not _is_pow2(total_t):
+        raise ValueError(f"packed_softmax_finalize: total_t={total_t} must be pow2")
+
+    def _p(tag, ct):
+        if not (verbose and sk is not None): return
+        v = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct)),
+                     dtype=np.float64)
+        head_block = d_head * t
+        slot0 = v[0]
+        head1_slot0 = v[head_block]
+        print(f"      [packed-smx-probe] {tag:25s} slot0={slot0:.4e} "
+              f"h1_slot0={head1_slot0:.4e} max|.|={np.abs(v).max():.4e}")
+        _probe_dump_stage(f"packed_{tag}", v)
+
+    _p("packed_e (input)", packed_e)
+    a = packed_e
+    step = 1
+    reach = 1
+    while reach < total_t:
+        rot = phantom.rotate(ctx, a, int(step), galois_key)
+        a = phantom.add(ctx, a, rot)
+        step <<= 1
+        reach <<= 1
+    _p("a (post-reduce)", a)
+
+    a_masked = phantom.multiply_plain(ctx, a, head_first_slot_mask_pt)
+    a_masked = phantom.rescale_to_next(ctx, a_masked)
+    a_masked.set_scale(user_scale)
+    _p("a_masked", a_masked)
+    a_bc = a_masked
+    s = 1
+    while s < total_t:
+        rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
+        a_bc = phantom.add(ctx, a_bc, rot)
+        s <<= 1
+    _p("a_bc (broadcast)", a_bc)
+
+    a_chain = a_bc.chain_index()
+    if packed_e.chain_index() != a_chain:
+        packed_e = phantom.mod_switch_to(ctx, packed_e, a_chain)
+    wb = phantom.softmax_correct(ctx, encoder, relin_key, packed_e, a_bc, iters)
+    _p("wb (post-softmax_correct)", wb)
+    return wb
+
+
+def unpack_packed_weights(
+    ctx, encoder, galois_key, packed_weights,
+    n_blocks: int, d_head: int, d_total: int, t: int,
+    chain_index: int, encode_scale: float,
+):
+    """Inverse of pack_score_blocks_tree. Extracts n_blocks per-block
+    weights ciphertexts from a single packed weights ct, so the existing
+    per-block score_v_irp_multi can consume them unchanged.
+
+    For each block k:
+      1. rotate packed by +k*t (slot k*t -> slot 0 within each head)
+      2. multiply by a per-head 'first-t-slots' mask so only slots
+         [h*d_head*t + 0..t-1] remain non-zero.
+      3. rescale + set_scale.
+
+    BSGS decomposition (baby_count=8, giant_count=8 covers k in [0, 64)):
+      Factor k = baby + giant * baby_count, baby in [0, 8), giant in [0, 8).
+      Required positive rotation step keys:
+        baby:  {t * b for b in 1..baby_count-1}  (7 keys)
+        giant: {t * baby_count * g for g in 1..giant_count-1}  (7 keys)
+      Total 14 keys vs. 63 for the naive per-block path.
+
+    Returns: list of n_blocks weights ciphertexts in per-block layout.
+    """
+    n_heads = d_total // d_head
+    num_slots = encoder.slot_count()
+    mask_slots = np.zeros(num_slots, dtype=np.float64)
+    head_block = d_head * t
+    for h in range(n_heads):
+        base = h * head_block
+        for tok_local in range(t):
+            if base + tok_local < num_slots:
+                mask_slots[base + tok_local] = 1.0
+    mask_pt = encoder.encode_double_vector(
+        ctx, mask_slots, encode_scale, chain_index)
+
+    # BSGS factoring k = baby + giant * baby_count covering k in [0, n_blocks).
+    baby_count = 8
+    giant_count = (n_blocks + baby_count - 1) // baby_count
+
+    # Pre-rotate 'packed_weights' by +t*baby for baby in [0, baby_count).
+    # pre_baby[0] is the original ct (no rotation needed).
+    pre_baby = [packed_weights]
+    for b in range(1, baby_count):
+        pre_baby.append(phantom.rotate(ctx, packed_weights, b * t, galois_key))
+
+    blocks = []
+    for k in range(n_blocks):
+        baby = k % baby_count
+        giant = k // baby_count
+        base_ct = pre_baby[baby]
+        if giant == 0:
+            rotated = base_ct
+        else:
+            rotated = phantom.rotate(
+                ctx, base_ct, giant * baby_count * t, galois_key)
+        nominal = rotated.scale()
+        masked = phantom.multiply_plain(ctx, rotated, mask_pt)
+        masked = phantom.rescale_to_next(ctx, masked)
+        masked.set_scale(nominal)
+        blocks.append(masked)
+    return blocks
+
+
 def multi_ct_softmax_finalize(
     ctx, encoder, relin_key, galois_key,
     e_blocks, head_first_slot_mask_pt,
@@ -384,6 +610,7 @@ def multi_ct_softmax_finalize(
         # show value at slot[h*d_head*t + 0] for h=0 (representative per-head sum)
         slot0 = v[0]
         print(f"      [softmax-probe] {tag:25s} slot0={slot0:.4e} max|.|={np.abs(v).max():.4e}")
+        _probe_dump_stage(f"multi_{tag}", v)
 
     e_sum = e_blocks[0]
     for k in range(1, n_blocks):
@@ -417,6 +644,27 @@ def multi_ct_softmax_finalize(
         a_bc = phantom.add(ctx, a_bc, rot)
         s <<= 1
     _p("a_bc (broadcast)", a_bc)
+
+    # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): decrypt the IRP path's per-head
+    # denominator a_bc at the per-head first slots (h*d_head*t + 0) so it can
+    # be compared directly against the dense path's a_total magnitude. This is
+    # the `a` IRP's softmax_correct consumes; its distribution vs the (0,2)/
+    # 1.5 window is the inter-pipeline conditioning reference. Decrypt only;
+    # zero ciphertext effect. Not entered unless the env flag is set and a
+    # decrypt key was threaded in (the dense gate passes sk when verbose; we
+    # also accept it via the env flag for this targeted probe).
+    if os.environ.get("PROBE_DENSE_SMX") == "1" and sk is not None:
+        import numpy as _np
+        _abv = _np.array(
+            encoder.decode_double_vector(ctx, sk.decrypt(ctx, a_bc)),
+            dtype=_np.float64)
+        _hb = d_head * t
+        _ah = _abv[_np.array([_h * _hb + 0 for _h in range(n_heads)])]
+        print(f"      [PROBE-SMX] IRP a_bc (decrypted, per-head first "
+              f"slots, nH={n_heads}): min={_ah.min():.6f} "
+              f"max={_ah.max():.6f} mean={_ah.mean():.6f} "
+              f">1.9:{int((_ah>1.9).sum())} >1.99:{int((_ah>1.99).sum())} "
+              f">=2.0:{int((_ah>=2.0).sum())} <0.05:{int((_ah<0.05).sum())}")
 
     # 4. Per-block Goldschmidt. The e_blocks are still at the pre-mask-rescale
     # chain; mod_switch them down to a_bc's chain so softmax_correct accepts
