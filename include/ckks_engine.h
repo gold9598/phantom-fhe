@@ -93,6 +93,24 @@ namespace phantom {
         // boots a ct on this chain WILL produce wrong values; the Phase 2
         // verification is engine init + scale-array correctness only.
         bool   use_bootstrap_to_17_levels = false;
+
+        // EvalMod K=28 number of double-angle iterations.
+        //   R=3 (default): 9 ER primes,  ~27-bit polynomial precision,
+        //                  good on |input| <= ~0.5–0.7.
+        //   R=4          : 10 ER primes, ~30-bit polynomial precision,
+        //                  extends precision regime up to |input| ~ 1.0.
+        // R=4 adds ONE extra prime to the chain: size_Q grows by 1, so
+        // NSL+16+(R-3) must be divisible by num_special_primes.
+        // Other values are not supported (only K=28 R=3 and K=28 R=4 are
+        // implemented — see evalmod.cu evalmod_k28_r3 / evalmod_k28_r4).
+        int    evalmod_r = 3;
+
+        // PROBE-ONLY (do not commit): when true, build ER segment with 54-bit
+        // primes instead of 58-bit. Used by probe_evalmod_calibration.py to
+        // empirically determine whether evalmod_k28_r3's coefficients are
+        // chain-prime-agnostic or calibrated for 58-bit.
+        // Only honoured on the legacy (use_bootstrap_to_17_levels=false) path.
+        bool   probe_er_54bit = false;
     };
 
     class CKKSEngine {
@@ -105,6 +123,11 @@ namespace phantom {
         // max_user_level() = num_scale_levels - 1.
         // The deepest accessible level before bootstrap is required.
         [[nodiscard]] int    max_user_level() const noexcept { return cfg_.num_scale_levels - 1; }
+        // Chain index of user_level=0 (the freshest user-accessible chain
+        // immediately above the bootstrap output). Invariant to NSL; depends
+        // on bootstrap pipeline (1+NSL+S2C+ER+C2S layout) — currently 16
+        // for evalmod_r=3 (9 ER primes), 17 for evalmod_r=4 (10 ER primes).
+        [[nodiscard]] std::size_t freshest_chain_index() const noexcept { return freshest_chain_index_; }
 
         // user_level: 0 = freshest, increments with each rescale_inplace,
         // max == num_scale_levels - 1 (pre_boot level; two primes remain).
@@ -131,6 +154,12 @@ namespace phantom {
         // The engine internally mod-switches to pre_boot_index (bottom - 1)
         // before calling bootstrap().
         void bootstrap_inplace(PhantomCiphertext &ct);
+
+        // Diagnostic-only: identical to `bootstrap_inplace` but routes through
+        // `phantom::bootstrap_debug` which prints stage-by-stage scale/chain/slot
+        // metadata. Used exclusively by the BootstrapTo17Levels bisect probe.
+        // Mutates `ct` in place; behavior otherwise matches bootstrap_inplace.
+        void bootstrap_inplace_debug(PhantomCiphertext &ct);
 
         // ---- Read-only views (advanced; do NOT use to touch bootstrap primes) ----
         [[nodiscard]] const PhantomContext &context() const noexcept { return *ctx_; }

@@ -705,8 +705,10 @@ namespace phantom {
 
         // Step 1: build the full-RNS NTT-form plaintext (lives only inside
         // this function).
-        PhantomPlaintext full_pt = encode_complex_diagonal(ctx, encoder, vals,
-                                                           chain_index, scale);
+        PhantomPlaintext full_pt =
+            encode_complex_diagonal(ctx, encoder, vals, chain_index, scale);
+
+        const double stored_scale = full_pt.scale();
 
         const auto &cd = ctx.get_context_data(chain_index);
         const auto &mods = cd.parms().coeff_modulus();
@@ -729,7 +731,7 @@ namespace phantom {
         // Step 3: signed-center the q_0 tower's coefficients into int64.
         LightPlaintext light;
         light.target_chain_index = chain_index;
-        light.scale = scale;
+        light.scale = stored_scale;
         light.coeffs_int64 = make_cuda_auto_ptr<std::int64_t>(N, stream);
 
         const std::size_t threads = 256;
@@ -814,12 +816,29 @@ namespace phantom {
                          const LinearTransformDiagonals &host_diags,
                          double last_layer_norm,
                          size_t start_chain_index,
-                         double last_layer_user_scale = 0.0) {
+                         double last_layer_user_scale = 0.0,
+                         const std::vector<double> &per_layer_value_norm = {}) {
         LinearTransformParams out;
         out.stages_per_layer = host_diags.stages_per_layer;
         out.n2 = host_diags.n2;
         const int num_layers = static_cast<int>(host_diags.layers.size());
         out.layers.resize(num_layers);
+
+        // Optional per-layer value-domain normalization. When non-empty, must
+        // have one entry per layer; each layer's diagonals get an extra
+        // multiplicative factor baked in. After multiply+rescale per stage,
+        // ct.scale metadata is preserved (still encodes at the chain prime),
+        // but the accumulated value shrinks by the cumulative product. This
+        // mirrors the_lib's mechanism for absorbing scale gaps between
+        // sections of the chain that use different prime bit sizes (e.g.
+        // C2S→EvalMod 58→54 boundary on the use17 chain consumes
+        // [0.5, 0.5, 0.25] for cumulative 1/16 = 2^-4 value attenuation).
+        if (!per_layer_value_norm.empty() &&
+            static_cast<int>(per_layer_value_norm.size()) != num_layers) {
+            throw std::invalid_argument(
+                "pre_encode_diagonals: per_layer_value_norm size must match "
+                "number of layers (or be empty for default 1.0)");
+        }
 
         double natural_product = 1.0;
         for (int s : host_diags.stages_per_layer) {
@@ -836,13 +855,13 @@ namespace phantom {
             L_out.rotation_unit = L_in.rotation_unit;
 
             const int s = host_diags.stages_per_layer[layer];
-            const double layer_norm = correction_per_layer /
-                                      static_cast<double>(1ULL << s);
+            const double value_norm_factor = per_layer_value_norm.empty()
+                ? 1.0
+                : per_layer_value_norm[layer];
+            const double layer_norm = (correction_per_layer /
+                                      static_cast<double>(1ULL << s)) *
+                                      value_norm_factor;
 
-            // Encode at the matching level: layer 0 uses chain_index =
-            // start_chain_index, layer 1 uses start_chain_index+1, etc.
-            // After multiply_plain and rescale, ct moves to the next chain
-            // index (one prime consumed per layer).
             const size_t target_chain = start_chain_index + static_cast<size_t>(layer);
             const bool is_last = (layer == num_layers - 1);
             const double encode_scale =
@@ -882,7 +901,6 @@ namespace phantom {
 
                 LightPlaintext light = encode_to_light_plaintext(
                     ctx, encoder, scaled, target_chain, encode_scale);
-
                 L_out.diagonals.emplace(diag_idx, std::move(light));
             }
         }
@@ -897,7 +915,8 @@ namespace phantom {
                          std::size_t sparse_hamming_weight,
                          std::size_t eval_mod_levels,
                          double user_scale,
-                         bool split_scale_down) {
+                         bool split_scale_down,
+                         bool use_bootstrap_to_17_levels) {
         BootstrapKey bk;
 
         // 1. Encapsulation key pair (ModRaise).
@@ -928,15 +947,14 @@ namespace phantom {
         LinearTransformDiagonals s2c_host = build_s2c_diagonals(log_n, stages_per_layer);
 
         const size_t first_idx = ctx.get_first_index();
-        const size_t num_c2s_layers = c2s_host.layers.size();
-        // C2S occupies chain indices [first_idx, first_idx + num_c2s_layers).
-        // After C2S the ciphertext lives at chain index
-        //     first_idx + num_c2s_layers.
-        // EvalMod (when present, e.g. K=28 R=3 = 9 levels) consumes
-        // `eval_mod_levels` more, so S2C lives at
-        //     first_idx + num_c2s_layers + eval_mod_levels.
-        // Pass eval_mod_levels=0 to chain C2S directly into S2C (Phase 3).
-        const size_t s2c_start = first_idx + num_c2s_layers + eval_mod_levels;
+        const size_t num_c2s_layers = c2s_host.layers.size(); // always 3 (butterfly layers)
+        // Both use17 and legacy use 3-stage multi-level C2S (1 prime per layer).
+        const size_t num_c2s_chain_primes = num_c2s_layers;
+        // C2S occupies chain indices [first_idx, first_idx + num_c2s_chain_primes).
+        // After C2S the ciphertext lives at first_idx + num_c2s_chain_primes.
+        // EvalMod consumes `eval_mod_levels` more, so S2C lives at
+        //     first_idx + num_c2s_chain_primes + eval_mod_levels.
+        const size_t s2c_start = first_idx + num_c2s_chain_primes + eval_mod_levels;
 
         // When eval_mod_levels > 0 (full bootstrap): use lapis C2S norm = 2*K*num_slots.
         // With K=28, the per-slot value after C2S + conjugation split is ≈ I + m/K,
@@ -949,9 +967,24 @@ namespace phantom {
             ? (2.0 * K_EVALMOD * static_cast<double>(num_slots))
             : static_cast<double>(num_slots);
 
-        bk.c2s = pre_encode_diagonals(ctx, encoder, c2s_host,
-                                      /*last_layer_norm=*/c2s_last_norm,
-                                      /*start_chain_index=*/first_idx);
+        // C2S encoding: multi-stage for both use17 and legacy.
+        // use17: per_layer_value_norm [0.5, 0.5, 0.25] absorbs the 4-bit gap
+        //        between the 29-bit C2S primes and 54-bit ER primes.
+        // legacy: no value-norm (uniform 29-bit C2S and 58-bit ER).
+        {
+            const std::vector<double> c2s_value_norm =
+                use_bootstrap_to_17_levels
+                    ? std::vector<double>{0.5, 0.5, 0.25}
+                    : std::vector<double>{};
+            bk.c2s = pre_encode_diagonals(
+                ctx, encoder, c2s_host,
+                /*last_layer_norm=*/c2s_last_norm,
+                /*start_chain_index=*/first_idx,
+                /*last_layer_user_scale=*/0.0,
+                /*per_layer_value_norm=*/c2s_value_norm);
+        }
+
+        bk.c2s_chain_primes = num_c2s_chain_primes;
 
         // S2C with last_layer_norm = 1.0 (lapis convention). Combined with
         // C2S's last_layer_norm = num_slots, the round-trip
@@ -969,8 +1002,34 @@ namespace phantom {
         // bootstrap() then performs a single multiply+rescale on the small
         // saved-out residual to land at user_scale (1 extra user level,
         // higher precision).
-        const double s2c_last_layer_user_scale =
-            split_scale_down ? 0.0 : user_scale;
+        // Step 3 of heterogeneous-scale fix: on the use17 chain, EvalMod outputs
+        // at scale er_chain_prime (≈2^54) instead of s2c_chain_prime (≈2^58),
+        // because we removed the PRE_S2C snap that previously lied about the scale.
+        // The baked last-layer scale must be adjusted so the output still lands at
+        // user_scale (2^40):
+        //   desired: ct_in × last_pt_scale / s2c_last_prime = user_scale
+        //   with ct_in = er_chain_prime (not s2c_chain_prime):
+        //   last_pt_scale = user_scale × s2c_last_prime / er_chain_prime
+        //                 = user_scale × (s2c_chain_prime / er_chain_prime)
+        //                 = user_scale × 2^4   (for 58-bit S2C, 54-bit ER)
+        // On the legacy uniform chain er_chain_prime == s2c_chain_prime so
+        // the correction factor is 1.0 and behaviour is unchanged.
+        double s2c_last_layer_user_scale;
+        if (split_scale_down) {
+            s2c_last_layer_user_scale = 0.0;
+        } else if (use_bootstrap_to_17_levels && eval_mod_levels > 0) {
+            // use17: ER primes are 54-bit, S2C primes are 58-bit. EvalMod outputs
+            // at er_chain_prime (2^54). The baked last-layer S2C scale must compensate:
+            //   output_scale = ct_in(2^54) × last_pt_scale / s2c_last_prime(2^58) = user_scale
+            //   → last_pt_scale = user_scale × (s2c_chain_prime / er_chain_prime) = user_scale × 2^4
+            const double er_chain_prime =
+                encode_scale_for_layer(ctx, first_idx + num_c2s_chain_primes);
+            const double s2c_chain_prime =
+                encode_scale_for_layer(ctx, s2c_start);
+            s2c_last_layer_user_scale = user_scale * (s2c_chain_prime / er_chain_prime);
+        } else {
+            s2c_last_layer_user_scale = user_scale;
+        }
         bk.s2c = pre_encode_diagonals(ctx, encoder, s2c_host,
                                       /*last_layer_norm=*/1.0,
                                       /*start_chain_index=*/s2c_start,
@@ -1096,8 +1155,13 @@ namespace phantom {
         bk.s2c_galois_keys.resize(per_layer_s2c_steps.size());
 
         auto layer_chain = [&](LayerKind kind, size_t li) -> size_t {
-            return (kind == LayerKind::C2S) ? (first_idx + li)
-                                            : (s2c_start + li);
+            if (kind == LayerKind::C2S) {
+                // Single-stage: all C2S butterfly layers share first_idx (one
+                // 60-bit prime, no per-layer rescale). Multi-stage: each layer
+                // consumes one prime → first_idx + li.
+                return use_bootstrap_to_17_levels ? first_idx : (first_idx + li);
+            }
+            return s2c_start + li;
         };
         auto layer_map_ptr = [&](LayerKind kind, size_t li)
             -> std::map<int, PerLayerKSKSlot>* {
@@ -1187,29 +1251,20 @@ namespace phantom {
     // For our DIF butterfly with stages={5,5,5} and n1=16, observed k's span
     // [0,16) and g's typically lie in {-2,-1,0,1}. The total rotation count
     // per layer is (#nonzero k) + (#nonzero g) instead of (#diagonals).
-    // `single_stage`: when true, skip per-layer rescale_to_next_inplace and
-    // perform ONE rescale_to_next_inplace after the full loop. Mirrors the_lib's
-    // `coeff_to_slot_complex_for_17_levels` (src/ckks/engine/bootstrap.cpp:714)
-    // — all 3 stages of butterflies multiply WITHOUT rescale (OVER_SCALED
-    // accumulation), then a single `rescale_after_multiply` consumes the
-    // single C2S prime (42-bit in the_lib's CKKS_42_54_29_40_60_BOOTSTRAP).
-    //
-    // For single_stage to be correct, all `params.layers[i].diagonals` must
-    // be encoded at the SAME `target_chain_index` (since ct's chain doesn't
-    // advance per layer). The caller (pre_encode_diagonals with
-    // single_stage=true, see below) is responsible for that.
     static void apply_linear_transform_inplace(const PhantomContext &ctx,
                                                PhantomCiphertext &ct,
                                                const LinearTransformParams &params,
                                                const std::vector<std::map<int, PerLayerKSKSlot>> &per_layer_galois,
                                                const char *who,
-                                               bool single_stage = false) {
+                                               int layer_start = 0,
+                                               int layer_end = -1) {
         const int num_layers = static_cast<int>(params.layers.size());
         if (static_cast<int>(per_layer_galois.size()) != num_layers) {
             throw std::logic_error(
                 std::string(who) + ": per-layer galois map count does not match layer count");
         }
-        for (int layer = 0; layer < num_layers; ++layer) {
+        if (layer_end < 0) layer_end = num_layers;
+        for (int layer = layer_start; layer < layer_end; ++layer) {
             const auto &L = params.layers[layer];
             if (L.diagonals.empty()) {
                 throw std::logic_error(std::string(who) + ": layer has no diagonals");
@@ -1335,19 +1390,6 @@ namespace phantom {
                 throw std::logic_error(std::string(who) + ": empty layer accumulator");
             }
             ct = std::move(layer_out);
-            // Multi-stage path: rescale per layer (each layer drops one prime).
-            // Single-stage path: skip per-layer rescale; one final rescale
-            // happens after the loop body below.
-            if (!single_stage) {
-                rescale_to_next_inplace(ctx, ct);
-            }
-        }
-
-        // Single-stage final rescale: drops ONE prime after all layers'
-        // OVER_SCALED multiplications have accumulated. Mirrors the_lib's
-        // `rescale_after_multiply(current)` at bootstrap.cpp:733 inside
-        // coeff_to_slot_complex_for_17_levels.
-        if (single_stage) {
             rescale_to_next_inplace(ctx, ct);
         }
     }
@@ -1356,19 +1398,8 @@ namespace phantom {
                            PhantomCiphertext &ct,
                            const BootstrapKey &bk) {
         apply_linear_transform_inplace(ctx, ct, bk.c2s, bk.c2s_galois_keys,
-                                       "apply_c2s_inplace");
-    }
-
-    void apply_c2s_inplace_single_stage(const PhantomContext &ctx,
-                                        PhantomCiphertext &ct,
-                                        const BootstrapKey &bk) {
-        // BootstrapTo17Levels variant: 3 OVER_SCALED butterflies + 1 final
-        // rescale. Used when the BootstrapKey was built via
-        // `pre_encode_diagonals(... single_stage=true)` so all layer
-        // plaintexts live at the same chain_index.
-        apply_linear_transform_inplace(ctx, ct, bk.c2s, bk.c2s_galois_keys,
-                                       "apply_c2s_inplace_single_stage",
-                                       /*single_stage=*/true);
+                                       "apply_c2s_inplace",
+                                       /*layer_start=*/0, /*layer_end=*/-1);
     }
 
     void apply_s2c_inplace(const PhantomContext &ctx,
@@ -1658,14 +1689,37 @@ namespace phantom {
         // EvalRound = K · ct − EvalMod(ct) for K=28 R=3. Internal (Phase 4 only).
         // Same structure as eval_round_k16_r3 but with K=28 and the degree-49
         // polynomial from the_lib. Same 9-level chain budget.
+        //
+        // Heterogeneous-scale fix (Step 2): On the use17 chain the ER section
+        // uses 54-bit primes, but the CT entering EvalMod carries scale metadata
+        // 2^58 (from C2S + conj_split). evalmod_k28_r3 sets
+        //   target_scale = ct.scale() = 2^58
+        // and snaps after every rescale to 2^58. When the actual rescale prime
+        // is 2^54, each rescale produces scale 2^116/2^54 = 2^62, which snap
+        // rounds down to 2^58 — hiding 4 bits of value amplification. This
+        // compounds exponentially over the 9 EvalMod levels.
+        //
+        // Fix: set ct.scale to the actual chain prime at the evalmod entry
+        // (chain_prime_at(ct.chain_index())) so that target_scale = chain_prime,
+        // and after each rescale: target_scale^2 / chain_prime = chain_prime —
+        // no drift. On the legacy 58-bit chain, chain_prime ≈ 2^58 ≈ ct.scale()
+        // so this is a near-no-op (epsilon difference only).
         PhantomCiphertext eval_round_k28_r3(const PhantomContext &ctx,
                                             PhantomCKKSEncoder &encoder,
                                             const PhantomCiphertext &ct,
                                             const PhantomRelinKey &rk) {
-            PhantomCiphertext kct = ct;
+            // Snap ct.scale to the actual chain prime at the evalmod entry so
+            // evalmod's internal target_scale matches the prime in every rescale.
+            const double er_chain_prime = static_cast<double>(
+                ctx.get_context_data(ct.chain_index())
+                    .parms().coeff_modulus().back().value());
+            PhantomCiphertext ct_snapped = ct;
+            ct_snapped.set_scale(er_chain_prime);
+
+            PhantomCiphertext kct = ct_snapped;
             multiply_int_inplace(ctx, kct, /*k=*/28ULL);
 
-            PhantomCiphertext em = evalmod_k28_r3(ctx, encoder, ct, rk);
+            PhantomCiphertext em = evalmod_k28_r3(ctx, encoder, ct_snapped, rk);
 
             if (kct.chain_index() < em.chain_index()) {
                 mod_switch_to_inplace(ctx, kct, em.chain_index());
@@ -1683,10 +1737,18 @@ namespace phantom {
                                             PhantomCKKSEncoder &encoder,
                                             const PhantomCiphertext &ct,
                                             const PhantomRelinKey &rk) {
-            PhantomCiphertext kct = ct;
+            // Same heterogeneous-scale fix as eval_round_k28_r3: snap ct.scale
+            // to the actual chain prime at the evalmod entry.
+            const double er_chain_prime = static_cast<double>(
+                ctx.get_context_data(ct.chain_index())
+                    .parms().coeff_modulus().back().value());
+            PhantomCiphertext ct_snapped = ct;
+            ct_snapped.set_scale(er_chain_prime);
+
+            PhantomCiphertext kct = ct_snapped;
             multiply_int_inplace(ctx, kct, /*k=*/28ULL);
 
-            PhantomCiphertext em = evalmod_k28_r4(ctx, encoder, ct, rk);
+            PhantomCiphertext em = evalmod_k28_r4(ctx, encoder, ct_snapped, rk);
 
             if (kct.chain_index() < em.chain_index()) {
                 mod_switch_to_inplace(ctx, kct, em.chain_index());
@@ -1705,10 +1767,18 @@ namespace phantom {
               const PhantomCiphertext &ct,
               const BootstrapKey &bk,
               double user_scale,
-              bool split_scale_down) {
+              bool split_scale_down,
+              bool use_bootstrap_to_17_levels,
+              int evalmod_r) {
         PhantomCiphertext out = ct;
 
         // 1. Pre-bootstrap scale-up: ct.scale = user_scale → q_msg.
+        //
+        // BootstrapTo17Levels chain: q_msg == user_scale == 2^40 (bits[0]
+        // IS the user-scale segment's first prime). The_lib's
+        // SCALE_UP_RATIO = q_msg / user_scale = 1, so scale_up is a logical
+        // no-op. scale_up_for_bootstrap's branch (a) handles this: snaps
+        // ct.scale to q_msg without consuming a level.
         scale_up_for_bootstrap(ctx, out, user_scale);
 
         // 2. Encapsulated mod-raise: bottom → top of chain (chain_index = first_idx).
@@ -1729,6 +1799,8 @@ namespace phantom {
         // 5. C2S: maps coefficient form → slot form.
         //    With last_layer_norm = 2*K*num_slots (lapis ER convention), the output
         //    values are scaled by 1/(2*K*num_slots) relative to natural butterfly norm.
+        //    use17: single-stage (3 multiply_plain + 1 rescale of 60-bit prime).
+        //    legacy: multi-stage (3 × multiply_plain + rescale per layer).
         apply_c2s_inplace(ctx, out, bk);
 
         // 6. Conjugation split (lapis "coeff_to_slot_pooled" steps 5–6):
@@ -1754,8 +1826,16 @@ namespace phantom {
 
         // 7. EvalRound = K·ct − EvalMod(ct) on BOTH real and imag tracks.
         //    Matches lapis bootstrap_evalround_plus_with_r steps 8–9.
-        PhantomCiphertext real_round = eval_round_k28_r3(ctx, encoder, out, bk.relin_key);
-        PhantomCiphertext imag_round = eval_round_k28_r3(ctx, encoder, imag_ct, bk.relin_key);
+        //    R=3 (9 ER levels, ~27-bit poly precision, good on |x| <= ~0.7)
+        //    R=4 (10 ER levels, ~30-bit poly precision, good on |x| <= ~1.0)
+        PhantomCiphertext real_round, imag_round;
+        if (evalmod_r == 4) {
+            real_round = eval_round_k28_r4(ctx, encoder, out, bk.relin_key);
+            imag_round = eval_round_k28_r4(ctx, encoder, imag_ct, bk.relin_key);
+        } else {
+            real_round = eval_round_k28_r3(ctx, encoder, out, bk.relin_key);
+            imag_round = eval_round_k28_r3(ctx, encoder, imag_ct, bk.relin_key);
+        }
 
         // 8. Recombine real and imag for S2C input.
         //    lapis slot_to_coeff step 1: imag_rot = (+x^{N/2}) · imag_round = +i·imag
@@ -1784,12 +1864,10 @@ namespace phantom {
             throw std::logic_error(
                 "bootstrap: ct deeper than S2C start — eval_mod_levels mismatch");
         }
-        // Snap ct.scale to the encode_scale of S2C plaintexts.
-        const auto &s2c_in_data = ctx.get_context_data(s2c_in_chain);
-        const double s2c_encode_scale = static_cast<double>(
-            s2c_in_data.parms().coeff_modulus().back().value());
-        out.set_scale(s2c_encode_scale);
-
+        // Do NOT snap ct.scale here. ct carries its honest EvalMod output scale
+        // (≈2^54 on use17, ≈2^58 on legacy) into S2C. multiply_plain_ntt sets
+        // new_scale = ct.scale × pt.scale; rescale_to_next divides by the S2C
+        // chain prime, so metadata is preserved through all S2C layers.
         apply_s2c_inplace(ctx, out, bk);
 
         // `out` = qi = S2C(EvalRound(C2S(ct_raised))) ≈ I_coeff (coeff domain).
@@ -1946,6 +2024,553 @@ namespace phantom {
         }
 
         return saved;
+    }
+
+    // ========================================================================
+    // bootstrap_debug — stage-instrumented clone of `bootstrap`. Used by the
+    // BootstrapTo17Levels bisect probe to identify the first divergence stage
+    // between legacy and use17 chains on the same input.
+    // ========================================================================
+    namespace {
+
+        // Decrypt + decode the first `n` real slots of `ct` using `diag_sk`.
+        // Returns a freshly-allocated std::vector<double>. Does NOT mutate ct.
+        std::vector<double>
+        bdbg_decrypt_slots(const PhantomContext &ctx,
+                           PhantomCKKSEncoder &encoder,
+                           const PhantomSecretKey &diag_sk,
+                           const PhantomCiphertext &ct,
+                           size_t n) {
+            PhantomCiphertext ct_copy = ct;
+            PhantomPlaintext pt;
+            // const-cast: PhantomSecretKey::decrypt is non-const in this build.
+            const_cast<PhantomSecretKey &>(diag_sk).decrypt(ctx, ct_copy, pt);
+            std::vector<cuDoubleComplex> decoded;
+            encoder.decode(ctx, pt, decoded);
+            std::vector<double> out(std::min(n, decoded.size()));
+            for (size_t i = 0; i < out.size(); ++i) out[i] = decoded[i].x;
+            return out;
+        }
+
+        // Decrypt + decode ALL slots of `ct`, returning complex magnitudes |slot_i|.
+        // Does NOT mutate ct.
+        std::vector<double>
+        bdbg_decrypt_magnitudes(const PhantomContext &ctx,
+                                PhantomCKKSEncoder &encoder,
+                                const PhantomSecretKey &diag_sk,
+                                const PhantomCiphertext &ct) {
+            PhantomCiphertext ct_copy = ct;
+            PhantomPlaintext pt;
+            const_cast<PhantomSecretKey &>(diag_sk).decrypt(ctx, ct_copy, pt);
+            std::vector<cuDoubleComplex> decoded;
+            encoder.decode(ctx, pt, decoded);
+            std::vector<double> mags(decoded.size());
+            for (size_t i = 0; i < decoded.size(); ++i) {
+                mags[i] = std::sqrt(decoded[i].x * decoded[i].x +
+                                    decoded[i].y * decoded[i].y);
+            }
+            return mags;
+        }
+
+        // Print complex magnitude stats for a POST_C2S ciphertext.
+        // Prints first 16 |slot| values and max/mean/median/L2-norm statistics.
+        void bdbg_c2s_magnitude_stats(const char *label,
+                                      const PhantomContext &ctx,
+                                      PhantomCKKSEncoder &encoder,
+                                      const PhantomSecretKey &diag_sk,
+                                      const PhantomCiphertext &ct) {
+            auto mags = bdbg_decrypt_magnitudes(ctx, encoder, diag_sk, ct);
+            const size_t n = mags.size();
+
+            std::printf("[C2S_STATS %s] num_slots=%zu\n", label, n);
+
+            // First 16 magnitudes.
+            std::printf("  |slot[0..15]| = [");
+            for (size_t i = 0; i < std::min(n, size_t(16)); ++i) {
+                std::printf("%s%.4e", i == 0 ? "" : ", ", mags[i]);
+            }
+            std::printf("]\n");
+
+            // Statistics.
+            double sum = 0.0, sum_sq = 0.0, mx = 0.0;
+            for (double v : mags) {
+                sum += v;
+                sum_sq += v * v;
+                if (v > mx) mx = v;
+            }
+            const double mean = (n > 0) ? sum / static_cast<double>(n) : 0.0;
+            const double l2 = std::sqrt(sum_sq);
+
+            // Median via partial sort on a copy.
+            std::vector<double> sorted_mags = mags;
+            std::nth_element(sorted_mags.begin(),
+                             sorted_mags.begin() + static_cast<std::ptrdiff_t>(n / 2),
+                             sorted_mags.end());
+            const double median = sorted_mags[n / 2];
+
+            std::printf("  max=%.4e  mean=%.4e  median=%.4e  L2=%.4e\n",
+                        mx, mean, median, l2);
+            std::fflush(stdout);
+        }
+
+        // Per-stage print. `expected_scale` is the algebraic prediction for
+        // ct.scale at this stage; pass 0.0 to skip the mismatch check.
+        void bdbg_stage(const char *tag,
+                        const PhantomContext &ctx,
+                        PhantomCKKSEncoder &encoder,
+                        const PhantomSecretKey &diag_sk,
+                        const PhantomCiphertext &ct,
+                        double expected_scale,
+                        const char *note = nullptr) {
+            const size_t ci = ct.chain_index();
+            const auto &cd = ctx.get_context_data(ci);
+            const auto &mods = cd.parms().coeff_modulus();
+            const size_t remaining = mods.size();
+            // The "next prime to drop" on rescale_to_next is mods.back().
+            const uint64_t back_prime = mods.back().value();
+            const int back_bits =
+                static_cast<int>(std::round(std::log2(static_cast<double>(back_prime))));
+            const double scale = ct.scale();
+            const double log2_scale = (scale > 0.0) ? std::log2(scale) : 0.0;
+            std::printf("[BDBG %-30s] chain=%zu (%zup) scale=2^%.4f (=%.6e) back=%db",
+                        tag, ci, remaining, log2_scale, scale, back_bits);
+            if (expected_scale > 0.0) {
+                const double log2_exp = std::log2(expected_scale);
+                const double diff_bits = std::abs(log2_scale - log2_exp);
+                std::printf(" exp=2^%.4f", log2_exp);
+                if (diff_bits > 0.5) {
+                    std::printf("  [MISMATCH diff=%.4f bits]", diff_bits);
+                }
+            }
+            if (note) std::printf("  note='%s'", note);
+            std::printf("\n");
+
+            // Decrypt slot[0..3].
+            auto slots = bdbg_decrypt_slots(ctx, encoder, diag_sk, ct, 4);
+            std::printf("    slot[0..3] = [");
+            for (size_t i = 0; i < slots.size(); ++i) {
+                std::printf("%s%+.6e", i == 0 ? "" : ", ", slots[i]);
+            }
+            std::printf("]\n");
+            std::fflush(stdout);
+        }
+
+    } // namespace
+
+    PhantomCiphertext
+    bootstrap_debug(const PhantomContext &ctx,
+                    PhantomCKKSEncoder &encoder,
+                    const PhantomCiphertext &ct,
+                    const BootstrapKey &bk,
+                    const PhantomSecretKey &diag_sk,
+                    double user_scale,
+                    bool split_scale_down,
+                    bool use_bootstrap_to_17_levels,
+                    int evalmod_r) {
+        PhantomCiphertext out = ct;
+
+        // Read q_msg (bottom prime).
+        const size_t bottom_index = ctx.total_parm_size() - 1;
+        const double q_msg_d = static_cast<double>(
+            ctx.get_context_data(bottom_index).parms().coeff_modulus()[0].value());
+
+        // ---- ENTRY ----
+        std::printf("\n========== BOOTSTRAP_DEBUG (use17=%d split=%d R=%d) ==========\n",
+                    use_bootstrap_to_17_levels ? 1 : 0,
+                    split_scale_down ? 1 : 0,
+                    evalmod_r);
+        std::printf("    user_scale=2^%.4f q_msg=2^%.4f\n",
+                    std::log2(user_scale), std::log2(q_msg_d));
+        bdbg_stage("ENTRY", ctx, encoder, diag_sk, out, user_scale,
+                   "input ciphertext as received");
+
+        // 1. scale_up_for_bootstrap (lifts ct.scale → q_msg if needed).
+        scale_up_for_bootstrap(ctx, out, user_scale);
+        bdbg_stage("POST_SCALE_UP_FOR_BOOTSTRAP", ctx, encoder, diag_sk, out, q_msg_d,
+                   "scale should now be q_msg");
+
+        // 2. Encapsulated mod-raise: bottom → top of chain.
+        mod_raise_inplace(ctx, out, bk.small);
+        // mod_raise doesn't change ct.scale (still q_msg).
+        bdbg_stage("POST_MOD_RAISE", ctx, encoder, diag_sk, out, q_msg_d,
+                   "ct at top-of-chain, encodes m + K·I");
+
+        // Save for final subtraction.
+        PhantomCiphertext saved = out;
+
+        // Align to C2S input level.
+        const size_t c2s_in_chain =
+            bk.c2s.layers[0].diagonals.begin()->second.target_chain_index;
+        if (out.chain_index() != c2s_in_chain) {
+            mod_switch_to_inplace(ctx, out, c2s_in_chain);
+            bdbg_stage("POST_C2S_INPUT_ALIGN", ctx, encoder, diag_sk, out,
+                       q_msg_d, "after mod_switch_to c2s_in_chain");
+        }
+
+        // 3. C2S: predict the post-C2S scale.
+        //   Multi-stage 3-layer: each layer multiplies by chain prime at
+        //   its index then rescales by the back prime. Net scale change
+        //   per layer ≈ 1 (when prime sizes are uniform). For non-uniform
+        //   primes (legacy: 29-bit C2S primes vs 58-bit q_msg), each layer
+        //   multiplies by 2^29 then rescales by 2^29 (since both are the
+        //   chain prime at that level — for layer 0 the back prime IS the
+        //   29-bit C2S prime). Net per-layer: scale unchanged.
+        double pre_c2s_scale = out.scale();
+        double expected_post_c2s_scale = pre_c2s_scale;
+
+        apply_c2s_inplace(ctx, out, bk);
+        bdbg_stage("POST_C2S", ctx, encoder, diag_sk, out, expected_post_c2s_scale,
+                   "after coeff-to-slot");
+        bdbg_c2s_magnitude_stats(use_bootstrap_to_17_levels ? "USE17" : "LEGACY",
+                                 ctx, encoder, diag_sk, out);
+
+        // 4. Conjugation split.
+        const size_t N = ctx.get_context_data(0).parms().poly_modulus_degree();
+        const size_t conj_galois_elt = 2 * N - 1;
+        PhantomCiphertext conj_ct =
+            apply_galois(ctx, out, conj_galois_elt, bk.user_galois_keys);
+        PhantomCiphertext imag_ct = out;
+        sub_inplace(ctx, imag_ct, conj_ct);
+        multiply_x_pow_N2_inplace(ctx, imag_ct, /*neg=*/true, cudaStreamPerThread);
+        add_inplace(ctx, out, conj_ct);
+
+        bdbg_stage("POST_CONJ_SPLIT_REAL", ctx, encoder, diag_sk, out,
+                   expected_post_c2s_scale, "real = ct + conj(ct), 2*Re(slots)");
+        bdbg_stage("POST_CONJ_SPLIT_IMAG", ctx, encoder, diag_sk, imag_ct,
+                   expected_post_c2s_scale, "imag = -i*(ct - conj(ct)), 2*Im(slots)");
+
+        // 5. EvalRound on both tracks. K=28.
+        PhantomCiphertext real_round, imag_round;
+        if (evalmod_r == 4) {
+            real_round = eval_round_k28_r4(ctx, encoder, out, bk.relin_key);
+            imag_round = eval_round_k28_r4(ctx, encoder, imag_ct, bk.relin_key);
+        } else {
+            real_round = eval_round_k28_r3(ctx, encoder, out, bk.relin_key);
+            imag_round = eval_round_k28_r3(ctx, encoder, imag_ct, bk.relin_key);
+        }
+        bdbg_stage("POST_EVALMOD_REAL", ctx, encoder, diag_sk, real_round, 0.0,
+                   "real EvalRound = K*Re - EvalMod(Re), encodes K*I_re");
+        bdbg_stage("POST_EVALMOD_IMAG", ctx, encoder, diag_sk, imag_round, 0.0,
+                   "imag EvalRound, encodes K*I_im");
+
+        // 6. Recombine.
+        multiply_x_pow_N2_inplace(ctx, imag_round, /*neg=*/false, cudaStreamPerThread);
+        if (real_round.chain_index() != imag_round.chain_index()) {
+            if (real_round.chain_index() < imag_round.chain_index()) {
+                mod_switch_to_inplace(ctx, real_round, imag_round.chain_index());
+            } else {
+                mod_switch_to_inplace(ctx, imag_round, real_round.chain_index());
+            }
+        }
+        imag_round.set_scale(real_round.scale());
+        add_inplace(ctx, real_round, imag_round);
+        out = std::move(real_round);
+
+        bdbg_stage("POST_RECOMBINE", ctx, encoder, diag_sk, out, 0.0,
+                   "real + i*imag, ready for S2C");
+
+        // 7. S2C: align, snap, apply.
+        const size_t s2c_in_chain =
+            bk.s2c.layers[0].diagonals.begin()->second.target_chain_index;
+        if (out.chain_index() < s2c_in_chain) {
+            mod_switch_to_inplace(ctx, out, s2c_in_chain);
+        } else if (out.chain_index() > s2c_in_chain) {
+            throw std::logic_error(
+                "bootstrap_debug: ct deeper than S2C start — eval_mod_levels mismatch");
+        }
+        // No snap: let ct carry its honest EvalMod output scale into S2C.
+        // See production path comment for rationale.
+        const double s2c_encode_scale = out.scale();  // actual scale, no snap
+
+        bdbg_stage("PRE_S2C", ctx, encoder, diag_sk, out, s2c_encode_scale,
+                   "entering S2C at actual EvalMod output scale (no snap)");
+
+        // ---- Per-layer S2C instrumentation ----
+        // Decrypt POST_EVALMOD/RECOMBINE state as host-reference starting point.
+        {
+            const int log_n = static_cast<int>(
+                arith::get_power_of_two(
+                    ctx.get_context_data(0).parms().poly_modulus_degree()));
+            const int num_slots = 1 << (log_n - 1);
+
+            // Host reference: decrypt current ct → complex slots.
+            std::vector<C64> host_ref(static_cast<size_t>(num_slots));
+            {
+                auto real_slots = bdbg_decrypt_slots(
+                    ctx, encoder, diag_sk, out,
+                    static_cast<size_t>(num_slots));
+                for (int i = 0; i < num_slots; ++i) {
+                    host_ref[static_cast<size_t>(i)] =
+                        C64(real_slots[static_cast<size_t>(i)], 0.0);
+                }
+            }
+
+            // Build S2C host diagonals (pure-math, no GPU).
+            const std::vector<int> spl = bk.s2c.stages_per_layer;
+            LinearTransformDiagonals s2c_host_diags =
+                build_s2c_diagonals(log_n, spl);
+
+            // Print header for per-layer table.
+            std::printf("\n  [S2C per-layer table]\n");
+            std::printf("  %-20s | %14s | %14s | %10s\n",
+                        "Stage", "scale_before", "scale_after", "bits(avg)");
+            std::printf("  %s\n", std::string(65, '-').c_str());
+
+            // Print PRE_S2C row (no transform applied yet).
+            std::printf("  %-20s | %14s | %14s | %10s\n",
+                        "PRE_S2C (POST_ER)", "---", "---", "---");
+
+            const int num_s2c_layers = static_cast<int>(bk.s2c.layers.size());
+
+            // Compute natural product for per-layer normalization in host ref.
+            // apply_linear_transform_host distributes correction_per_layer
+            // uniformly — we replicate that by calling it one layer at a time,
+            // passing last_layer_norm=natural_product so correction=1 and
+            // correction_per_layer=1, then applying the per-layer factor
+            // manually via our own single-layer s2c host struct.
+            double s2c_natural_product = 1.0;
+            for (int s : spl) {
+                s2c_natural_product *= static_cast<double>(1ULL << s);
+            }
+            const double s2c_correction_per_layer =
+                std::pow(s2c_natural_product,
+                         1.0 / static_cast<double>(num_s2c_layers));
+
+            for (int li = 0; li < num_s2c_layers; ++li) {
+                const double scale_before = out.scale();
+
+                // Apply only layer li of S2C using the range-limited overload.
+                apply_linear_transform_inplace(
+                    ctx, out, bk.s2c, bk.s2c_galois_keys,
+                    "bdbg_s2c_layer", li, li + 1);
+
+                const double scale_after = out.scale();
+
+                // Advance host reference one layer.
+                // Build a single-layer LinearTransformDiagonals for layer li.
+                LinearTransformDiagonals single_host_diags;
+                single_host_diags.n2 = s2c_host_diags.n2;
+                single_host_diags.stages_per_layer =
+                    {spl[static_cast<size_t>(li)]};
+                single_host_diags.layers =
+                    {s2c_host_diags.layers[static_cast<size_t>(li)]};
+
+                // The layer_norm used by apply_linear_transform_host for a
+                // single-layer call:
+                //   correction_per_layer / (1 << stages_per_layer[0])
+                // matches the per-layer factor baked into the encoded plaintexts
+                // (before value_norm), so the host reference should track ct.
+                const double layer_correction =
+                    s2c_correction_per_layer /
+                    static_cast<double>(1ULL << spl[static_cast<size_t>(li)]);
+                // Pass last_layer_norm = natural_product^(1/L) / layer_correction
+                // so that correction_per_layer inside = layer_correction and
+                // the single-layer host matches. Simplest: pass
+                // last_layer_norm = 1.0 / layer_correction (so correction=1/lc,
+                // correction_per_layer=1/lc for 1 layer, and
+                // layer_norm = (1/lc) / 2^s = correction_per_layer / 2^s = layer_correction / 2^s ... )
+                // Actually just pass last_layer_norm so that host matches:
+                // layer_norm_host = (prod / last_layer_norm)^(1/L) / 2^s
+                // We want layer_norm_host = layer_correction
+                // => (2^s / last_layer_norm)^1 / 2^s = layer_correction
+                // => 1/last_layer_norm = layer_correction
+                // => last_layer_norm = 1.0 / layer_correction
+                host_ref = apply_linear_transform_host(
+                    single_host_diags, host_ref,
+                    /*last_layer_norm=*/1.0 / layer_correction);
+
+                // Decrypt ct and compare to host_ref.
+                auto ct_slots = bdbg_decrypt_slots(
+                    ctx, encoder, diag_sk, out,
+                    static_cast<size_t>(num_slots));
+
+                double sum_err = 0.0;
+                int count = 0;
+                for (int i = 0; i < num_slots; ++i) {
+                    const double diff =
+                        std::abs(ct_slots[static_cast<size_t>(i)] -
+                                 host_ref[static_cast<size_t>(i)].real());
+                    sum_err += diff * diff;
+                    ++count;
+                }
+                const double rms_err =
+                    (count > 0) ? std::sqrt(sum_err / count) : 0.0;
+                const double bits_avg =
+                    (rms_err > 0.0) ? -std::log2(rms_err) : 999.0;
+
+                char tag[32];
+                std::snprintf(tag, sizeof(tag), "S2C_layer_%d", li);
+                std::printf("  %-20s | %14.4f | %14.4f | %10.2f\n",
+                            tag,
+                            std::log2(scale_before),
+                            std::log2(scale_after),
+                            bits_avg);
+                std::fflush(stdout);
+            }
+            std::printf("  %s\n\n", std::string(65, '-').c_str());
+        }
+        bdbg_stage("POST_S2C", ctx, encoder, diag_sk, out, 0.0,
+                   "ct = qi = S2C(EvalRound(C2S(raised))) ≈ K·I_coeff");
+
+        const size_t qi_chain = out.chain_index();
+
+        // 8. Align saved to qi's level and scale, then subtract.
+        bdbg_stage("PRE_SUB_SAVED", ctx, encoder, diag_sk, saved, 0.0,
+                   "saved before alignment");
+
+        if (std::abs(out.scale() - saved.scale()) > 0.5) {
+            const size_t one_above_qi = qi_chain - 1;
+            mod_switch_to_inplace(ctx, saved, one_above_qi);
+
+            const auto &one_above_cd = ctx.get_context_data(one_above_qi);
+            const uint64_t q_back_saved =
+                one_above_cd.parms().coeff_modulus().back().value();
+
+            const uint64_t q_msg =
+                ctx.get_context_data(bottom_index).parms().coeff_modulus()[0].value();
+
+            const size_t num_s2c_layers = bk.s2c.layers.size();
+            const size_t s2c_last_chain = s2c_in_chain + num_s2c_layers - 1;
+            const uint64_t first_back =
+                ctx.get_context_data(s2c_in_chain).parms().coeff_modulus().back().value();
+            const uint64_t last_back =
+                ctx.get_context_data(s2c_last_chain).parms().coeff_modulus().back().value();
+
+            const uint64_t user_scale_u64 = static_cast<uint64_t>(user_scale);
+            if (static_cast<double>(user_scale_u64) != user_scale) {
+                throw std::invalid_argument(
+                    "bootstrap_debug: user_scale must be representable as u64");
+            }
+
+            __uint128_t D_int128;
+            if (split_scale_down) {
+                D_int128 = ((__uint128_t)first_back * (__uint128_t)q_back_saved
+                            + (__uint128_t)q_msg / 2) /
+                           (__uint128_t)q_msg;
+            } else {
+                const __uint128_t step1_num =
+                    (__uint128_t)first_back * (__uint128_t)user_scale_u64;
+                const __uint128_t step1_den = (__uint128_t)q_msg;
+                const __uint128_t step1 = (step1_num + step1_den / 2) / step1_den;
+                D_int128 =
+                    (step1 * (__uint128_t)q_back_saved + (__uint128_t)last_back / 2) /
+                    (__uint128_t)last_back;
+            }
+            const uint64_t D_exact = static_cast<uint64_t>(D_int128);
+
+            std::printf("    [BDBG saved-align] D_exact=%llu (~2^%.2f) "
+                        "q_msg=%llu first_back=%llu last_back=%llu q_back_saved=%llu\n",
+                        (unsigned long long)D_exact,
+                        std::log2(static_cast<double>(D_exact)),
+                        (unsigned long long)q_msg,
+                        (unsigned long long)first_back,
+                        (unsigned long long)last_back,
+                        (unsigned long long)q_back_saved);
+
+            const auto &saved_cd = ctx.get_context_data(saved.chain_index());
+            const size_t saved_num_towers =
+                saved_cd.parms().coeff_modulus().size();
+            std::vector<uint64_t> tower_scalars(saved_num_towers, D_exact);
+            multiply_uint_scalars_per_tower(ctx, saved, tower_scalars);
+            saved.set_scale(saved.scale() * static_cast<double>(D_exact));
+            rescale_to_next_inplace(ctx, saved);
+            saved.set_scale(out.scale());
+        }
+
+        if (saved.chain_index() != qi_chain) {
+            mod_switch_to_inplace(ctx, saved, qi_chain);
+        }
+        saved.set_scale(out.scale());
+
+        bdbg_stage("PRE_SUB_ALIGNED", ctx, encoder, diag_sk, saved, out.scale(),
+                   "saved aligned to qi's scale; encodes (m+K*I)·out.scale");
+
+        sub_inplace(ctx, saved, out);
+
+        bdbg_stage("POST_SUB", ctx, encoder, diag_sk, saved, out.scale(),
+                   "saved - out = m (small residual)");
+
+        // 9. Optional post-bootstrap scale-down (split path only).
+        if (split_scale_down) {
+            const uint64_t saved_scale_u64 = static_cast<uint64_t>(saved.scale());
+            const auto &qi_cd = ctx.get_context_data(qi_chain);
+            const uint64_t q_drop_post =
+                qi_cd.parms().coeff_modulus().back().value();
+
+            const uint64_t user_scale_u64 = static_cast<uint64_t>(user_scale);
+            if (static_cast<double>(user_scale_u64) != user_scale) {
+                throw std::invalid_argument(
+                    "bootstrap_debug: user_scale must be representable as u64");
+            }
+
+            const __uint128_t D2_int128 =
+                ((__uint128_t)q_drop_post * (__uint128_t)user_scale_u64
+                 + (__uint128_t)saved_scale_u64 / 2) /
+                (__uint128_t)saved_scale_u64;
+            const uint64_t D2 = static_cast<uint64_t>(D2_int128);
+
+            std::printf("    [BDBG split-scaledown] D2=%llu (~2^%.2f) q_drop_post=%llu\n",
+                        (unsigned long long)D2,
+                        std::log2(static_cast<double>(D2)),
+                        (unsigned long long)q_drop_post);
+
+            const auto &saved_cd = ctx.get_context_data(saved.chain_index());
+            const size_t saved_num_towers =
+                saved_cd.parms().coeff_modulus().size();
+            std::vector<uint64_t> tower_scalars(saved_num_towers, D2);
+            multiply_uint_scalars_per_tower(ctx, saved, tower_scalars);
+            saved.set_scale(saved.scale() * static_cast<double>(D2));
+            rescale_to_next_inplace(ctx, saved);
+            saved.set_scale(user_scale);
+
+            bdbg_stage("POST_SPLIT_SCALEDOWN", ctx, encoder, diag_sk, saved,
+                       user_scale, "after D2 multiply + rescale to user_scale");
+        }
+
+        bdbg_stage("RETURN", ctx, encoder, diag_sk, saved, user_scale,
+                   "final bootstrapped ciphertext");
+        std::printf("========== END BOOTSTRAP_DEBUG ==========\n\n");
+        std::fflush(stdout);
+
+        return saved;
+    }
+
+    // PROBE-ONLY: see declaration in include/bootstrap.h.
+    PhantomCiphertext
+    probe_plaintext_storage_mul_rescale(
+            const PhantomContext &ctx,
+            PhantomCKKSEncoder &encoder,
+            const PhantomCiphertext &ct_in,
+            const std::vector<std::complex<double>> &vals,
+            std::size_t chain_index,
+            double scale,
+            int mode) {
+        PhantomCiphertext ct = ct_in;  // deep copy
+        if (ct.chain_index() != chain_index) {
+            mod_switch_to_inplace(ctx, ct, chain_index);
+        }
+
+        std::vector<C64> vals_c64(vals.size());
+        for (size_t i = 0; i < vals.size(); ++i) {
+            vals_c64[i] = C64(vals[i].real(), vals[i].imag());
+        }
+
+        if (mode == 0) {
+            // light path: tower-0 int64 storage, expand-on-demand.
+            LightPlaintext light = encode_to_light_plaintext(
+                    ctx, encoder, vals_c64, chain_index, scale);
+            PhantomPlaintext expanded = expand_light_plaintext(ctx, light);
+            multiply_plain_inplace(ctx, ct, expanded);
+            rescale_to_next_inplace(ctx, ct);
+            return ct;
+        } else {
+            // full path: full-RNS NTT-form plaintext encoded directly by CKKS encoder.
+            PhantomPlaintext full = encode_complex_diagonal(
+                    ctx, encoder, vals_c64, chain_index, scale);
+            multiply_plain_inplace(ctx, ct, full);
+            rescale_to_next_inplace(ctx, ct);
+            return ct;
+        }
     }
 
 } // namespace phantom

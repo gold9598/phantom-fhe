@@ -123,8 +123,16 @@ Returns (f, e1, e2) such that
         if (!are_same_scale(encrypted1, encrypted2)) {
             throw std::invalid_argument("scale mismatch");
         }
-        if (encrypted1.size() != encrypted2.size()) {
-            throw std::invalid_argument("poly number mismatch");
+        // Allow size mismatch for CKKS to support TRIO (3-component) carry through
+        // deferred-relinearization Paterson-Stockmeyer evaluation. The kernel
+        // path below already handles max/min sizes correctly via component-wise
+        // add over the overlap and tail copy of the larger operand.
+        {
+            auto &context_data_check = context.get_context_data(encrypted1.chain_index());
+            auto scheme_check = context_data_check.parms().scheme();
+            if (scheme_check != scheme_type::ckks && encrypted1.size() != encrypted2.size()) {
+                throw std::invalid_argument("poly number mismatch");
+            }
         }
 
         const auto &s = cudaStreamPerThread;
@@ -268,8 +276,16 @@ Returns (f, e1, e2) such that
             throw std::invalid_argument("NTT form mismatch");
         if (!are_same_scale(encrypted1, encrypted2))
             throw std::invalid_argument("scale mismatch");
-        if (encrypted1.size() != encrypted2.size())
-            throw std::invalid_argument("poly number mismatch");
+        // Allow size mismatch for CKKS to support TRIO carry through
+        // deferred-relinearization Paterson-Stockmeyer evaluation. The kernel
+        // path below is updated to overlap-then-tail (component-wise sub over
+        // min_count, then resize+copy/negate the larger operand's tail).
+        {
+            auto &context_data_check = context.get_context_data(encrypted1.chain_index());
+            auto scheme_check = context_data_check.parms().scheme();
+            if (scheme_check != scheme_type::ckks && encrypted1.size() != encrypted2.size())
+                throw std::invalid_argument("poly number mismatch");
+        }
 
         const auto &s = cudaStreamPerThread;
 
@@ -286,6 +302,19 @@ Returns (f, e1, e2) such that
         size_t encrypted2_size = encrypted2.size();
         size_t max_count = max(encrypted1_size, encrypted2_size);
         size_t min_count = min(encrypted1_size, encrypted2_size);
+
+        // For CKKS with size mismatch, grow encrypted1 to max_count (any new
+        // components are zero-initialised by the resize copy logic preserving
+        // existing data, and we will overwrite the tail after the loop).
+        if (parms.scheme() == scheme_type::ckks && encrypted1_size < encrypted2_size) {
+            encrypted1.resize(context, context_data.chain_index(), max_count, s);
+            // Zero the new tail components so the subsequent copy/negate sees
+            // a clean slate.
+            cudaMemsetAsync(encrypted1.data() + encrypted1_size * rns_coeff_count,
+                            0,
+                            (max_count - encrypted1_size) * rns_coeff_count * sizeof(uint64_t),
+                            s);
+        }
 
         uint64_t gridDimGlb = rns_coeff_count / blockDimGlb.x;
 
@@ -326,18 +355,50 @@ Returns (f, e1, e2) such that
                 }
             }
         } else {
+            // Component-wise subtract over the overlap (min_count). For the
+            // tail (when sizes differ): if encrypted2 has the extra components,
+            // either zero-then-sub them in (handled by negate=false path via
+            // the new resize+memset above) or copy them when negate=true.
             if (negate) {
-                for (size_t i = 0; i < encrypted1.size(); i++) {
+                for (size_t i = 0; i < min_count; i++) {
                     sub_rns_poly<<<gridDimGlb, blockDimGlb, 0, s>>>(
                             encrypted2.data() + i * rns_coeff_count, encrypted1.data() + i * rns_coeff_count, base_rns,
                             encrypted1.data() + i * rns_coeff_count, poly_degree, coeff_modulus_size);
                 }
+                // Tail: encrypted1 was zero-extended above (if it was smaller),
+                // so result_tail = encrypted2_tail - 0 = encrypted2_tail.
+                if (encrypted1_size < encrypted2_size) {
+                    cudaMemcpyAsync(encrypted1.data() + min_count * rns_coeff_count,
+                                    encrypted2.data() + min_count * rns_coeff_count,
+                                    (max_count - min_count) * rns_coeff_count * sizeof(uint64_t),
+                                    cudaMemcpyDeviceToDevice, s);
+                }
+                // If encrypted1_size > encrypted2_size: result_tail = 0 - encrypted1_tail = -encrypted1_tail.
+                if (encrypted1_size > encrypted2_size) {
+                    for (size_t i = min_count; i < max_count; i++) {
+                        negate_rns_poly<<<gridDimGlb, blockDimGlb, 0, s>>>(
+                                encrypted1.data() + i * rns_coeff_count, base_rns,
+                                encrypted1.data() + i * rns_coeff_count, poly_degree, coeff_modulus_size);
+                    }
+                }
             } else {
-                for (size_t i = 0; i < encrypted1.size(); i++) {
+                for (size_t i = 0; i < min_count; i++) {
                     sub_rns_poly<<<gridDimGlb, blockDimGlb, 0, s>>>(
                             encrypted1.data() + i * rns_coeff_count, encrypted2.data() + i * rns_coeff_count, base_rns,
                             encrypted1.data() + i * rns_coeff_count, poly_degree, coeff_modulus_size);
                 }
+                // Tail: if encrypted2 has the extras, result_tail = 0 - encrypted2_tail = -encrypted2_tail.
+                if (encrypted1_size < encrypted2_size) {
+                    // encrypted1 was zero-extended above.
+                    for (size_t i = min_count; i < max_count; i++) {
+                        // dst = -encrypted2[i]; encrypted1[i] is already zero.
+                        sub_rns_poly<<<gridDimGlb, blockDimGlb, 0, s>>>(
+                                encrypted1.data() + i * rns_coeff_count,
+                                encrypted2.data() + i * rns_coeff_count, base_rns,
+                                encrypted1.data() + i * rns_coeff_count, poly_degree, coeff_modulus_size);
+                    }
+                }
+                // If encrypted1_size > encrypted2_size: result_tail = encrypted1_tail - 0 = encrypted1_tail (no-op).
             }
         }
     }
@@ -1036,8 +1097,14 @@ Returns (f, e1, e2) such that
             throw std::invalid_argument("NTT form mismatch");
         if (!are_same_scale(encrypted1, encrypted2))
             throw std::invalid_argument("scale mismatch");
-        if (encrypted1.size() != encrypted2.size())
-            throw std::invalid_argument("poly number mismatch");
+        // Allow size mismatch for CKKS (e.g. TRIO×DUO via the MxN tensor path
+        // in bgv_ckks_multiply) to support deferred-relinearization PS eval.
+        {
+            auto &context_data_check = context.get_context_data(encrypted1.chain_index());
+            auto scheme_check = context_data_check.parms().scheme();
+            if (scheme_check != scheme_type::ckks && encrypted1.size() != encrypted2.size())
+                throw std::invalid_argument("poly number mismatch");
+        }
 
         const auto &s = cudaStreamPerThread;
         auto &context_data = context.get_context_data(encrypted1.chain_index());

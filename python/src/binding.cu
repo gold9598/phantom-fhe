@@ -11,6 +11,7 @@
 #include "bootstrap.h"
 #include "bsgs.h"
 #include "ckks_engine.h"
+#include "evalmod.h"
 #include "linear.h"
 #include "mlp.h"
 #include "ps.h"
@@ -324,7 +325,21 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("sparse_hamming_weight") = 128,
           py::arg("eval_mod_levels") = 0,
           py::arg("user_scale") = 0.0,
-          py::arg("split_scale_down") = false);
+          py::arg("split_scale_down") = false,
+          py::arg("use_bootstrap_to_17_levels") = false);
+
+    // PROBE-ONLY binding for plaintext-storage precision experiment.
+    // mode=0 -> tower-0 LightPlaintext; mode=1 -> full-RNS PhantomPlaintext.
+    m.def("probe_plaintext_storage_mul_rescale",
+          &phantom::probe_plaintext_storage_mul_rescale,
+          py::arg("context"),
+          py::arg("encoder"),
+          py::arg("ct"),
+          py::arg("vals"),
+          py::arg("chain_index"),
+          py::arg("scale"),
+          py::arg("mode"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("bootstrap", &phantom::bootstrap,
           py::arg("context"),
@@ -333,7 +348,28 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("bk"),
           py::arg("user_scale"),
           py::arg("split_scale_down") = false,
+          py::arg("use_bootstrap_to_17_levels") = false,
+          py::arg("evalmod_r") = 3,
           py::call_guard<py::gil_scoped_release>());
+
+    // ===== EvalMod (K=28 R=3 / R=4) — direct binding for probes =====
+    m.def("evalmod_k28_r3", &phantom::evalmod_k28_r3,
+          py::arg("context"), py::arg("encoder"), py::arg("ct"), py::arg("relin_keys"),
+          py::call_guard<py::gil_scoped_release>(),
+          "EvalMod K=28 R=3: returns sin(2π·28·x)/(2π) under encryption.");
+    m.def("evalmod_k28_r4", &phantom::evalmod_k28_r4,
+          py::arg("context"), py::arg("encoder"), py::arg("ct"), py::arg("relin_keys"),
+          py::call_guard<py::gil_scoped_release>(),
+          "EvalMod K=28 R=4: returns sin(2π·28·x)/(2π) under encryption.");
+
+#ifdef EVALMOD_STAGE_DEBUG
+    m.def("evalmod_set_stage_probe", &phantom::evalmod_set_stage_probe,
+          py::arg("sk"), py::arg("vals"),
+          "DEBUG: set secret key + input values for per-stage decrypt-and-measure "
+          "inside the next evalmod_k28_r3 call.");
+    m.def("evalmod_clear_stage_probe", &phantom::evalmod_clear_stage_probe,
+          "DEBUG: clear the stage-probe state.");
+#endif
 
     // ===== CKKSEngine: user-facing facade with bootstrap =====
     py::class_<phantom::CKKSEngineConfig>(m, "ckks_engine_config")
@@ -352,13 +388,19 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def_readwrite("build_two_scale_arrays",
                            &phantom::CKKSEngineConfig::build_two_scale_arrays)
             .def_readwrite("use_bootstrap_to_17_levels",
-                           &phantom::CKKSEngineConfig::use_bootstrap_to_17_levels);
+                           &phantom::CKKSEngineConfig::use_bootstrap_to_17_levels)
+            .def_readwrite("evalmod_r",
+                           &phantom::CKKSEngineConfig::evalmod_r)
+            // PROBE-ONLY: 54-bit ER override for probe_evalmod_calibration.py.
+            .def_readwrite("probe_er_54bit",
+                           &phantom::CKKSEngineConfig::probe_er_54bit);
 
     py::class_<phantom::CKKSEngine>(m, "ckks_engine")
             .def(py::init<const phantom::CKKSEngineConfig &>(), py::arg("config"))
             .def("slot_count", &phantom::CKKSEngine::slot_count)
             .def("user_scale", &phantom::CKKSEngine::user_scale)
             .def("max_user_level", &phantom::CKKSEngine::max_user_level)
+            .def("freshest_chain_index", &phantom::CKKSEngine::freshest_chain_index)
             .def("user_level", &phantom::CKKSEngine::user_level)
             .def("user_level_chain_index", &phantom::CKKSEngine::user_level_chain_index)
             .def("encrypt", &phantom::CKKSEngine::encrypt,
@@ -366,6 +408,9 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("decrypt_decode", &phantom::CKKSEngine::decrypt_decode,
                  py::call_guard<py::gil_scoped_release>())
             .def("bootstrap_inplace", &phantom::CKKSEngine::bootstrap_inplace,
+                 py::call_guard<py::gil_scoped_release>())
+            .def("bootstrap_inplace_debug",
+                 &phantom::CKKSEngine::bootstrap_inplace_debug,
                  py::call_guard<py::gil_scoped_release>())
             .def("context", &phantom::CKKSEngine::context, py::return_value_policy::reference_internal)
             .def("encoder", &phantom::CKKSEngine::mutable_encoder, py::return_value_policy::reference_internal)

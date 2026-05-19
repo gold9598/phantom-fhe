@@ -29,6 +29,8 @@
 
 #include "phantom.h"
 
+#include <vector>
+
 namespace phantom {
 
     PhantomCiphertext evalmod_k7_r3(const PhantomContext &ctx,
@@ -59,5 +61,17 @@ namespace phantom {
                                      PhantomCKKSEncoder &encoder,
                                      const PhantomCiphertext &ct,
                                      const PhantomRelinKey &relin_keys);
+
+#ifdef EVALMOD_STAGE_DEBUG
+    // DEBUG-ONLY: when phantom is built with -DEVALMOD_STAGE_DEBUG=1, the
+    // K=28 R=3 sine kernel decrypts and measures bits-of-precision at each
+    // stage (basis, T_14, T_28, T_21, T_49, aux_ct, quotient, remainder,
+    // aux*quotient, sine_final). Call set_stage_probe with the secret key
+    // and the analytical input vector (one value per slot in [0..N-1]) BEFORE
+    // calling evalmod_k28_r3, then clear with clear_stage_probe.
+    void evalmod_set_stage_probe(const PhantomSecretKey *sk,
+                                 const std::vector<double> &vals);
+    void evalmod_clear_stage_probe();
+#endif
 
 }  // namespace phantom

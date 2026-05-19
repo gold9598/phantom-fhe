@@ -148,6 +148,9 @@ namespace phantom {
         PhantomRelinKey   relin_key;          // for EvalMod (Phase 4)
         LinearTransformParams c2s;
         LinearTransformParams s2c;            // empty in Phase 2
+        // Number of chain primes consumed by C2S. Equals c2s.layers.size() for
+        // multi-stage (legacy), or 1 for single-stage (use17 with 1×60-bit prime).
+        size_t c2s_chain_primes = 0;
     };
 
     // ===== Host-side diagonal computation (no encoding, no GPU) =====
@@ -221,6 +224,10 @@ namespace phantom {
     // residual `m` (rather than the large mod-raised `m + K·I`). Costs 1
     // extra user level but recovers ~5 bits of bootstrap precision (the
     // scale-down rounding no longer compounds with K·I noise).
+    // `use_bootstrap_to_17_levels`: when true, use the prime bit sizes for
+    // the_lib's BootstrapTo17Levels chain (different prime widths vs lapis,
+    // but same 3-stage multi-level C2S layout). C2S consumes 3 chain primes
+    // the same as the lapis path; S2C lives at first_idx + 3 + eval_mod_levels.
     [[nodiscard]] BootstrapKey
     create_bootstrap_key(const PhantomContext &ctx,
                          PhantomCKKSEncoder &encoder,
@@ -228,7 +235,8 @@ namespace phantom {
                          std::size_t sparse_hamming_weight = 128,
                          std::size_t eval_mod_levels = 0,
                          double user_scale = 0.0,
-                         bool split_scale_down = false);
+                         bool split_scale_down = false,
+                         bool use_bootstrap_to_17_levels = false);
 
     // Apply the pre-encoded C2S linear transform in place.
     //
@@ -239,19 +247,6 @@ namespace phantom {
     void apply_c2s_inplace(const PhantomContext &ctx,
                            PhantomCiphertext &ct,
                            const BootstrapKey &bk);
-
-    // Single-stage C2S variant matching the_lib's `coeff_to_slot_complex_for_
-    // 17_levels` (src/ckks/engine/bootstrap.cpp:714): applies all layer
-    // butterflies WITHOUT per-layer rescale (OVER_SCALED accumulation), then
-    // a single `rescale_after_multiply` consumes one chain prime — the 42-bit
-    // C2S prime in the BootstrapTo17Levels chain.
-    //
-    // The bootstrap key's C2S diagonals must be pre-encoded with all layers
-    // sharing the same `target_chain_index` (see Phase-3 build path in
-    // create_bootstrap_key when use_bootstrap_to_17_levels is set).
-    void apply_c2s_inplace_single_stage(const PhantomContext &ctx,
-                                        PhantomCiphertext &ct,
-                                        const BootstrapKey &bk);
 
     // Apply the pre-encoded S2C linear transform in place.
     //
@@ -304,6 +299,52 @@ namespace phantom {
               const PhantomCiphertext &ct,
               const BootstrapKey &bk,
               double user_scale,
-              bool split_scale_down = false);
+              bool split_scale_down = false,
+              bool use_bootstrap_to_17_levels = false,
+              int evalmod_r = 3);
+
+    // Diagnostic clone of `bootstrap` that prints scale/chain metadata and
+    // decrypted slot[0..3] values at every meaningful pipeline stage. Used
+    // exclusively by the BootstrapTo17Levels bisect probe to identify the
+    // first stage where the new chain diverges from the legacy chain on the
+    // same input. Behavior is identical to `bootstrap` modulo stdout prints;
+    // do not call from production code.
+    //
+    // `diag_sk` is the symmetric secret key associated with the same
+    // PhantomContext that produced `bk` (i.e. the engine's `sk_`). It is
+    // used only for stage-by-stage decryption and is otherwise untouched.
+    [[nodiscard]] PhantomCiphertext
+    bootstrap_debug(const PhantomContext &ctx,
+                    PhantomCKKSEncoder &encoder,
+                    const PhantomCiphertext &ct,
+                    const BootstrapKey &bk,
+                    const PhantomSecretKey &diag_sk,
+                    double user_scale,
+                    bool split_scale_down = false,
+                    bool use_bootstrap_to_17_levels = false,
+                    int evalmod_r = 3);
+
+    // PROBE-ONLY: plaintext-storage precision experiment. Encodes the given
+    // complex diagonal `vals` at `chain_index` and `scale` in one of two
+    // forms, multiplies `ct` by it, rescales, and returns the result.
+    //
+    //   mode == 0 ("light"): encode via encode_to_light_plaintext (tower-0
+    //     int64 storage) → expand_light_plaintext → multiply_plain_inplace →
+    //     rescale_to_next_inplace. This mirrors what C2S/S2C do internally.
+    //
+    //   mode == 1 ("full"): encode via encode_complex_diagonal (full-RNS
+    //     NTT-form PhantomPlaintext, every tower encoded directly by the CKKS
+    //     encoder) → multiply_plain_inplace → rescale_to_next_inplace.
+    //
+    // Used only by python/llm_project/probe_plaintext_storage.py.
+    [[nodiscard]] PhantomCiphertext
+    probe_plaintext_storage_mul_rescale(
+            const PhantomContext &ctx,
+            PhantomCKKSEncoder &encoder,
+            const PhantomCiphertext &ct,
+            const std::vector<std::complex<double>> &vals,
+            std::size_t chain_index,
+            double scale,
+            int mode);
 
 } // namespace phantom
