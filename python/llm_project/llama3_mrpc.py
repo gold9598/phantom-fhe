@@ -2934,15 +2934,194 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             x_mid_norm = bootstrap_safe(engine, ctx, encoder, x_mid_norm,
                                            max_abs=max_abs_calib.get("rms2_out", 1.0),
                                            slot_count=NUM_SLOTS)
-        mlp_out = fhe_mlp_irp_bootstrap(
-            engine, ctx, encoder, relin_key, galois_key,
-            x_mid_norm,
-            diag_gate_irp, diag_up_irp, diag_down_irp,
-            sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
-            max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
-            silu_norm_factor=silu_norm_factor,
-            silu_t_coeffs=silu_t_coeffs, silu_D=silu_D,
-            sk=sk if verbose else None, verbose_mag=verbose)
+        if _dense_gate_here:
+            # ---- Stage 5: dense BSGS MLP (replaces IRP MLP at gate layers).
+            # Input: x_mid_norm in stride-T_MODEL layout (rmsnorm output).
+            # Contract: dense BSGS needs replicated-block period D_PAD_MLP.
+            # Layout bridge: decrypt x_mid_norm, build period-D_PAD_MLP
+            # replicated-block slots, re-encrypt at fresh_ci — mirrors the
+            # Stage 4 attn-out bridge exactly.
+            # All galois steps (baby_steps=128, d_pad=D_PAD_MLP=16384) are
+            # already provisioned by irp_required_steps_rect — ZERO new keys.
+            _DENSE_MLP_BABY_STEPS = 128  # divides 16384; steps={1,2,4,...,64,128} ⊆ provisioned
+            # Wgate/Wup/Wdown are R_P-independent and may not be in w's hot
+            # subset (same situation as Wo at Stage 4) — load via subset loader.
+            _mlp_ws = load_layer_weights_subset(
+                layer_idx, keys=("Wgate", "Wup", "Wdown"))
+            _Wgate = np.asarray(_mlp_ws["Wgate"], dtype=np.float64)  # (D_HIDDEN, D_MODEL)
+            _Wup   = np.asarray(_mlp_ws["Wup"],   dtype=np.float64)  # (D_HIDDEN, D_MODEL)
+            _Wdown = np.asarray(_mlp_ws["Wdown"], dtype=np.float64)  # (D_MODEL,  D_HIDDEN)
+
+            try:
+                # -- numpy oracle for DENSE-GATE diagnostics --
+                _xn2_raw = np.array(
+                    encoder.decode_double_vector(ctx, sk.decrypt(ctx, x_mid_norm)),
+                    dtype=np.float64)
+                _xn2_p = _xn2_raw[::T_MODEL][:D_MODEL]   # stride-T_MODEL decode
+                _gate_np   = _xn2_p @ _Wgate.T            # (D_HIDDEN,)
+                _up_np     = _xn2_p @ _Wup.T              # (D_HIDDEN,)
+                _silu_np   = _gate_np / (1.0 + np.exp(-_gate_np))  # silu element-wise
+                _h_np      = _silu_np * _up_np             # (D_HIDDEN,)
+                _down_np   = _h_np @ _Wdown.T              # (D_MODEL,)
+
+                # -- input bridge: stride-T_MODEL -> replicated-block period D_PAD_MLP --
+                _mlp_in_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+                _periods_in = NUM_SLOTS // D_PAD_MLP   # = 2
+                for _k in range(_periods_in):
+                    _mlp_in_slots[_k * D_PAD_MLP : _k * D_PAD_MLP + D_MODEL] = _xn2_p
+                _mlp_in_ct = sk.encrypt_symmetric(
+                    ctx, encoder.encode_double_vector(
+                        ctx, _mlp_in_slots, SCALE, fresh_ci))
+
+                # -- BSGS Wgate: (D_HIDDEN×D_MODEL) zero-padded to d_pad=D_PAD_MLP --
+                _wgate_flat = _Wgate.ravel().tolist()
+                _gate_diags = phantom.pre_encode_bsgs_diagonals(
+                    ctx, encoder, _wgate_flat,
+                    D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+                _gate_ct = phantom.bsgs_matmul_preencoded(
+                    ctx, galois_key, _mlp_in_ct, _gate_diags)
+
+                # -- BSGS Wup: reuse same baby rotations of _mlp_in_ct --
+                _wup_flat = _Wup.ravel().tolist()
+                _up_diags = phantom.pre_encode_bsgs_diagonals(
+                    ctx, encoder, _wup_flat,
+                    D_HIDDEN, D_MODEL, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+                _up_ct = phantom.bsgs_matmul_preencoded(
+                    ctx, galois_key, _mlp_in_ct, _up_diags)
+
+                # -- DIAGNOSTIC (DENSE_MLP_PROBE=1; default byte-identical):
+                #    decrypt each dense MLP sub-stage period-0 -> numpy oracle.
+                #    Localizes WHERE an L31 explosion first appears. --
+                _DMP = os.environ.get("DENSE_MLP_PROBE") == "1"
+                def _dmp(_tag, _ct, _ref):
+                    if not _DMP:
+                        return
+                    _v = np.array(
+                        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _ct)),
+                        dtype=np.float64)[:len(_ref)]
+                    _rr = float(np.linalg.norm(_v - _ref)
+                                / (np.linalg.norm(_ref) + 1e-30))
+                    print(f"  [DENSE-MLP-PROBE L{layer_idx:2d}] {_tag:<14s} "
+                          f"rel-RMS={_rr:.3e}  max|fhe|={np.abs(_v).max():.3e}  "
+                          f"max|ref|={np.abs(_ref).max():.3e}")
+                _dmp("gate", _gate_ct, _gate_np)
+                _dmp("up",   _up_ct,   _up_np)
+
+                # -- silu(gate): slot-wise, layout-invariant.
+                #    IRP-PARITY dispatch (mirrors fhe_mlp_irp_bootstrap in
+                #    llama3.py): at high-magnitude layers (L30/31, silu_max>6)
+                #    the harness sets silu_t_coeffs/silu_D and the IRP MLP
+                #    takes the BOUNDED Chebyshev-basis Clenshaw path. The
+                #    deg<=20 monomial silu_coeffs catastrophically extrapolates
+                #    past the ±1.2·silu_max fit domain (silu(9.5)≈-60 vs ≈9.5),
+                #    so the dense path MUST honor silu_t_coeffs/silu_D too. --
+                if silu_t_coeffs is not None and silu_D is not None:
+                    from blocks.silu import silu_clenshaw
+                    _silu_ct = silu_clenshaw(
+                        engine, ctx, encoder, relin_key, _gate_ct,
+                        silu_D, silu_t_coeffs, NUM_SLOTS,
+                        galois_key=galois_key)
+                else:
+                    _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
+                                    coeffs=silu_coeffs,
+                                    norm_factor=silu_norm_factor,
+                                    slot_count=NUM_SLOTS if silu_norm_factor is not None else None)
+                _dmp("silu(gate)", _silu_ct, _silu_np)
+
+                # -- h = silu(gate) * up --
+                _s_ci = _silu_ct.chain_index()
+                _u_ci = _up_ct.chain_index()
+                if _u_ci < _s_ci:
+                    _up_ct = phantom.mod_switch_to(ctx, _up_ct, _s_ci)
+                elif _u_ci > _s_ci:
+                    _silu_ct = phantom.mod_switch_to(ctx, _silu_ct, _u_ci)
+                _silu_ct.set_scale(_up_ct.scale())
+                _h_ct = phantom.multiply_and_relin(ctx, _silu_ct, _up_ct, relin_key)
+                _h_ct = phantom.rescale_to_next(ctx, _h_ct)
+                _h_ct.set_scale(SCALE)
+                _dmp("h=silu*up", _h_ct, _h_np)
+
+                # -- bootstrap h (mirrors IRP MLP bootstrap before down-proj) --
+                _h_calib = max_abs_calib.get("h", 1.26) if max_abs_calib else 1.26
+                _h_ct = bootstrap_safe(engine, ctx, encoder, _h_ct,
+                                       max_abs=_h_calib, slot_count=NUM_SLOTS)
+                _dmp("h_post_boot", _h_ct, _h_np)
+
+                # -- BSGS Wdown: (D_MODEL×D_HIDDEN) zero-padded to d_pad=D_PAD_MLP --
+                _wdown_flat = _Wdown.ravel().tolist()
+                _down_diags = phantom.pre_encode_bsgs_diagonals(
+                    ctx, encoder, _wdown_flat,
+                    D_MODEL, D_HIDDEN, D_PAD_MLP, _DENSE_MLP_BABY_STEPS, SCALE)
+                _down_ct = phantom.bsgs_matmul_preencoded(
+                    ctx, galois_key, _h_ct, _down_diags)
+
+                # -- FHE diagnostics: decode down_ct period-0 -> dense MLP out --
+                _down_raw = np.array(
+                    encoder.decode_double_vector(ctx, sk.decrypt(ctx, _down_ct)),
+                    dtype=np.float64)
+                _fhe_down = _down_raw[:D_MODEL]
+
+                _mlp_vs_oracle = float(
+                    np.linalg.norm(_fhe_down - _down_np)
+                    / (np.linalg.norm(_down_np) + 1e-30))
+
+                # IRP MLP decode for vs-IRP comparison
+                _irp_mlp_dummy = fhe_mlp_irp_bootstrap(
+                    engine, ctx, encoder, relin_key, galois_key,
+                    x_mid_norm,
+                    diag_gate_irp, diag_up_irp, diag_down_irp,
+                    sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+                    max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
+                    silu_norm_factor=silu_norm_factor,
+                    silu_t_coeffs=silu_t_coeffs, silu_D=silu_D)
+                _irp_out_raw = np.array(
+                    encoder.decode_double_vector(ctx, sk.decrypt(ctx, _irp_mlp_dummy)),
+                    dtype=np.float64)
+                _irp_down = _irp_out_raw[::T_MODEL][:D_MODEL]
+                _mlp_vs_irp = float(
+                    np.linalg.norm(_fhe_down - _irp_down)
+                    / (np.linalg.norm(_irp_down) + 1e-30))
+
+                _DENSE_MLP_GATE = 1e-2  # MLP linear+SiLU: expect ~1e-3; report honestly
+                print(f"  [DENSE-GATE L{layer_idx:2d}] dense-MLP vs oracle  "
+                      f"rel-RMS={_mlp_vs_oracle:.3e}  "
+                      f"[{'PASS' if _mlp_vs_oracle <= _DENSE_MLP_GATE else 'FAIL'}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] dense-MLP vs IRP-FHE "
+                      f"rel-RMS={_mlp_vs_irp:.3e}  "
+                      f"[{'PASS' if _mlp_vs_irp <= _DENSE_MLP_GATE else 'FAIL'}]")
+
+                # -- output bridge: replicated-block period D_PAD_MLP -> stride-T_MODEL --
+                # pack _fhe_down into stride-T_MODEL layout, re-encrypt at fresh_ci
+                _mlp_out_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+                _mlp_out_slots[::T_MODEL][:D_MODEL] = _fhe_down
+                mlp_out = sk.encrypt_symmetric(
+                    ctx, encoder.encode_double_vector(
+                        ctx, _mlp_out_slots, SCALE, fresh_ci))
+                print(f"  [DENSE-GATE L{layer_idx:2d}] WIRED: dense MLP-out "
+                      f"-> residual2 (IRP MLP discarded; FULL dense layer)")
+            except Exception as _me:
+                import traceback
+                print(f"  [DENSE-GATE L{layer_idx:2d}] dense-MLP ERROR: "
+                      f"{type(_me).__name__}: {_me}")
+                traceback.print_exc()
+                # fall back to IRP MLP on error
+                mlp_out = fhe_mlp_irp_bootstrap(
+                    engine, ctx, encoder, relin_key, galois_key,
+                    x_mid_norm,
+                    diag_gate_irp, diag_up_irp, diag_down_irp,
+                    sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+                    max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
+                    silu_norm_factor=silu_norm_factor,
+                    silu_t_coeffs=silu_t_coeffs, silu_D=silu_D)
+        else:
+            mlp_out = fhe_mlp_irp_bootstrap(
+                engine, ctx, encoder, relin_key, galois_key,
+                x_mid_norm,
+                diag_gate_irp, diag_up_irp, diag_down_irp,
+                sub_mask_mlp_wide_pt, sub_mask_mlp_tall_pt, input_mask_mlp_pt,
+                max_abs_calib=max_abs_calib, silu_coeffs=silu_coeffs,
+                silu_norm_factor=silu_norm_factor,
+                silu_t_coeffs=silu_t_coeffs, silu_D=silu_D)
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
         # residual2
         y_ct = residual(ctx, x_mid_ct, mlp_out)
