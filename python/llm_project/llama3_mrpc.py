@@ -59,6 +59,8 @@ from blocks.irp import (
     encode_irp_mask_rect, irp_required_steps_rect,
 )
 from blocks.kv_layout import pack_kv_blocks
+from blocks import kv_layout_dense as _dense_oracle
+from blocks import kv_layout_dense_fhe as _dense_fhe
 from blocks.lm_head import yes_no_logits_np
 from blocks.residual import residual
 from blocks.rmsnorm import (
@@ -590,6 +592,145 @@ def encrypt_layer_inputs_multi(ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
     return x_ct, k_cts, v_cts, c_per_head, Wq_baked
 
 
+# ===========================================================================
+# Stage 2 (dense-layout rewrite) — FHE dense QK^T.  ADDITIVE / opt-in.
+#
+# Selected by env DENSE_ATTN=1 (or --dense). When unset, NONE of this runs
+# and the IRP path / residual stream is byte-identical.
+#
+# Reuses the SAME kernel contract attention_forward_llama uses for Stage A:
+#   phantom.bsgs_matmul_preencoded (Wq, d_pad == D_TOTAL, replicated-block I/O)
+#   -> phantom.compute_qkt(q, k_shard_list, d_head)  (the multi-shard loop)
+#   -> fused multiply_plain (1/sqrt(d_head) * per-head mask * pad-token-zero)
+#   -> per-head sub_plain (c_per_head centering).
+#
+# baby_steps=64 for the d_pad=4096 Wq BSGS: bsgs_required_steps(64) ==
+# {1,2,4,8,16,32,64} == inner_sum(D_HEAD=128) steps, ALL already provisioned
+# by build_user_steps_mrpc -> ZERO new galois keys, engine untouched.
+#
+# Slot geometry is byte-identical to the verified Stage-1 numpy oracle
+# blocks.kv_layout_dense (commit 744e61f). Validated by the caller against
+# (a) kv_layout_dense.dense_qkt on the same Q/K and (b) the IRP path scores.
+# ===========================================================================
+
+_DENSE_ATTN = os.environ.get("DENSE_ATTN") == "1"
+_DENSE_WQ_BABY_STEPS = 64  # bsgs_required_steps(64) ⊆ already-provisioned steps
+
+# Read-only sink for the LIVE IRP path's post-stage-A scores (gate (b):
+# measured-FHE dense vs measured-FHE IRP at the SAME layer/input). Armed
+# ONLY under DENSE_ATTN at the probe layer; when disarmed _stage_a_premask
+# is byte-identical (the capture block is not entered). One extra decrypt
+# per block, ZERO change to the IRP ciphertext computation.
+_DENSE_IRP_SCORE_SINK = {"armed": False, "blocks": [], "sk": None}
+
+
+def fhe_attention_dense_scores(ctx, encoder, sk, relin_key, galois_key,
+                                xn_query, Wq_baked, K_full_h, c_per_head,
+                                real_nt, chain_index):
+    """Run the FHE dense token-major QK^T -> scaled/masked/centered scores.
+
+    Stops at the scores ciphertext list (one per shard), post scale*mask
+    and post per-head sub(C). Self-contained: encrypts its own dense inputs
+    from the teacher-forced numpy Q/K (same as encrypt_layer_inputs_multi /
+    the calibration), runs the real kernel, returns the decrypted scores
+    plus the oracle scores on the identical Q/K for the validation gate.
+
+    Args:
+      xn_query: (D_MODEL,) rmsnormed hidden at the query position.
+      Wq_baked: (D_TOTAL, D_MODEL) Wq with R_P (rope@query) pre-applied.
+      K_full_h: (real_nt, N_HEADS, D_HEAD) rope-applied + GQA-expanded K.
+      c_per_head: (N_HEADS,) per-head softmax shift (real-key max + 0.5).
+      real_nt: real token count (== num_tokens for variable-nt).
+      chain_index: fresh chain to encode/encrypt the dense inputs at.
+
+    Returns dict:
+      'fhe_scores'   : (real_nt, N_HEADS) decrypted, post scale*mask*sub(C)
+      'oracle_scores': (real_nt, N_HEADS) kv_layout_dense.dense_qkt - C
+      'P', 'n_shards'
+    """
+    D = D_TOTAL
+    H = D_HEAD
+    nH = N_HEADS
+    P = _dense_fhe.positions_per_ct(real_nt, NUM_SLOTS, D)
+    n_shards = _dense_fhe.n_shards_for(real_nt, P)
+
+    # ---- BSGS Wq (d_pad == D_TOTAL); replicated-block x -> dense Q.
+    wq_diags = _dense_fhe.bsgs_wq_diags_dense(
+        ctx, encoder, Wq_baked, D, _DENSE_WQ_BABY_STEPS, SCALE)
+    x_ct = _dense_fhe.encrypt_x_replicated_block(
+        ctx, encoder, sk, xn_query, D, NUM_SLOTS, SCALE, chain_index)
+    q_ct = phantom.bsgs_matmul_preencoded(ctx, galois_key, x_ct, wq_diags)
+    # NO rescale here — mirror attention_forward_llama's canonical BSGS
+    # pattern exactly: compute_qkt reads nominal = q.scale() and snaps its
+    # product back to it. Rescaling/re-snapping q_ct (the IRP-Wq contract)
+    # would mis-set that nominal and corrupt the score magnitude.
+    # BSGS output is replicated-block period D_TOTAL == dense pre-broadcast Q
+    # (q_slot[tok*D + h*H + j] = Q[h,j] for every token frame). == pack_q_dense.
+
+    # ---- Dense token-major K shards (oracle-exact slot geometry).
+    k_cts = _dense_fhe.encrypt_k_dense_shards(
+        ctx, encoder, sk, K_full_h, real_nt, P, nH, H,
+        NUM_SLOTS, SCALE, chain_index)
+    for kc in k_cts:
+        phantom.mod_switch_to_inplace(ctx, kc, q_ct.chain_index())
+
+    # ---- The real kernel: elementwise q*k + inner_sum(d_head), per shard.
+    raw_score_cts = phantom.compute_qkt(
+        ctx, relin_key, galois_key, q_ct, k_cts, H)
+
+    inv_sqrt_d = 1.0 / math.sqrt(float(H))
+    fhe_scores = np.zeros((real_nt, nH), dtype=np.float64)
+    for b, sc in enumerate(raw_score_cts):
+        tok_start = b * P
+        # Fused scale * per-head mask * pad-token-zero (one multiply_plain).
+        nominal = sc.scale()
+        ms_slots = _dense_fhe.dense_scale_mask_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, inv_sqrt_d)
+        ms_pt = encoder.encode_double_vector(
+            ctx, ms_slots, SCALE, sc.chain_index())
+        sc = phantom.multiply_plain(ctx, sc, ms_pt)
+        sc = phantom.rescale_to_next(ctx, sc)
+        sc.set_scale(nominal)
+        # Per-head centering sub(C) (mirror IRP stage-A).
+        sub_slots = _dense_fhe.dense_per_head_sub_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, c_per_head)
+        sub_pt = encoder.encode_double_vector(
+            ctx, sub_slots, sc.scale(), sc.chain_index())
+        sc = phantom.sub_plain(ctx, sc, sub_pt)
+        # Decrypt & read base slots tok_local*D + h*H.
+        sv = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, sc)),
+                      dtype=np.float64)
+        for tok_local in range(P):
+            tok_abs = tok_start + tok_local
+            if tok_abs >= real_nt:
+                break
+            for h in range(nH):
+                fhe_scores[tok_abs, h] = sv[tok_local * D + h * H]
+
+    # ---- Oracle on the IDENTICAL Q/K (the trusted Stage-1 spec).
+    # Q[h,j] is exactly xn_query @ Wq_baked.T reshaped (== BSGS output target).
+    Q_hd = (np.asarray(xn_query, dtype=np.float64)
+            @ np.asarray(Wq_baked, dtype=np.float64).T).reshape(nH, H)
+    q_slots = _dense_oracle.pack_q_dense(Q_hd, P)
+    q_per_shard = [q_slots for _ in range(n_shards)]
+    # K shards: oracle packer with n_kv_heads == nH (K already GQA-expanded).
+    k_shards_oracle, _ = _dense_oracle.pack_kv_dense_shards(
+        np.asarray(K_full_h, dtype=np.float64),
+        np.asarray(K_full_h, dtype=np.float64),  # V unused for QK^T gate
+        real_nt, P, nH)
+    oracle_scores = _dense_oracle.dense_qkt(
+        q_per_shard, k_shards_oracle, nH, H, real_nt, P, inv_sqrt_d)
+    oracle_scores = oracle_scores - np.asarray(c_per_head,
+                                               dtype=np.float64)[None, :]
+
+    return {
+        "fhe_scores": fhe_scores,
+        "oracle_scores": oracle_scores,
+        "P": P,
+        "n_shards": n_shards,
+    }
+
+
 def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
                              x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
                              k_cts, v_cts, c_per_head,
@@ -730,7 +871,16 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         sub_pt = qkt_irp_per_head_sub_plaintext(
             ctx, encoder, D_HEAD, D_TOTAL, blk_size, T_MODEL,
             c_per_head, sb.chain_index(), sb.scale())
-        return phantom.sub_plain(ctx, sb, sub_pt)
+        sb = phantom.sub_plain(ctx, sb, sub_pt)
+        # gate (b) read-only capture: decrypt the LIVE IRP post-stage-A
+        # block. No-op (not entered) unless armed by run_classifier_fhe.
+        if _DENSE_IRP_SCORE_SINK["armed"] and _DENSE_IRP_SCORE_SINK["sk"] is not None:
+            _sk = _DENSE_IRP_SCORE_SINK["sk"]
+            _v = np.array(
+                encoder.decode_double_vector(ctx, _sk.decrypt(ctx, sb)),
+                dtype=np.float64)
+            _DENSE_IRP_SCORE_SINK["blocks"].append((blk_size, _v))
+        return sb
 
     def _stage_b_ps_exp(sb):
         """ps_exp_init + damped squarings + mean-sub."""
@@ -1482,6 +1632,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             print(f"  early exit after layer {max_layer}")
             break
         t_layer_start = time.perf_counter()
+        _t_wait = 0.0  # PERF_BREAKDOWN: default 0 when queue.get is not hit
         verbose = (debug_layer is not None and layer_idx == debug_layer)
         # DIAGNOSTIC ONLY: tag stage dumps with the current layer so the
         # offline rel-RMS harness can pick the right file. No-op when
@@ -1633,6 +1784,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # Encrypt inputs (multi-ct K, V). K/V/c_per_head always derive
         # from the clean numpy x_btd (= pytorch_ref[layer_idx]); only the
         # encrypted query residual x_ct is carried in autonomous mode.
+        _t_prep_end = time.perf_counter()  # PERF_BREAKDOWN: end of host-prep phase
         t_encrypt0 = time.perf_counter()
         x_ct, k_cts, v_cts, c_per_head, _ = encrypt_layer_inputs_multi(
             ctx, encoder, sk, fresh_ci, x_btd, w, R_P,
@@ -1689,6 +1841,23 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
                                       max_abs=max_abs_calib.get("rms1_out", 1.0),
                                       slot_count=NUM_SLOTS)
+        # Stage 2 dense-rewrite validation gate (ADDITIVE, opt-in via
+        # DENSE_ATTN=1). Layers 0 & 31 are the historically worst
+        # (calibration/magnitude); both must pass rel-RMS <= 1e-3 vs the
+        # verified oracle AND vs the live IRP-FHE scores at the same input.
+        # The IRP path below runs UNCHANGED and still feeds the residual
+        # stream — only an extra read-only decrypt is added when armed.
+        _dense_gate_here = False
+        if _DENSE_ATTN or os.environ.get("DENSE_ATTN") == "1":
+            _dg_env = os.environ.get("DENSE_GATE_LAYERS")
+            _dg_layers = ([int(s) for s in _dg_env.split(",")] if _dg_env
+                          else [0, NUM_DECODERS - 1])
+            _dense_gate_here = layer_idx in _dg_layers
+        if _dense_gate_here:
+            _DENSE_IRP_SCORE_SINK["armed"] = True
+            _DENSE_IRP_SCORE_SINK["sk"] = sk
+            _DENSE_IRP_SCORE_SINK["blocks"] = []
+
         attn_out = fhe_attention_multi_ct(
             engine, ctx, encoder, relin_key, galois_key, sk,
             x_norm, diag_wq_irp, diag_wo_irp, mask_attn_pt,
@@ -1696,6 +1865,73 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             num_tokens, max_abs_calib, hf_mask_slots, verbose=verbose,
             query_position=P_local)
         if verbose: _probe("post-attention", ctx, encoder, sk, attn_out)
+
+        if _dense_gate_here:
+            _DENSE_IRP_SCORE_SINK["armed"] = False
+            try:
+                _real_nt_g = _real_nt(num_tokens, P_local)
+                # Derive the SAME teacher-forced Q/K the IRP path used
+                # (mirror encrypt_layer_inputs_multi exactly).
+                _g1 = w["g1"]; _Wq = w["Wq"]; _Wk = w["Wk"]
+                _Wq_baked = _Wq.copy()
+                for _h in range(N_HEADS):
+                    _s, _e = _h * D_HEAD, (_h + 1) * D_HEAD
+                    _Wq_baked[_s:_e, :] = R_P @ _Wq[_s:_e, :]
+                _xn = rmsnorm_np(x_btd, _g1)
+                _K = (_xn @ _Wk.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
+                _K = apply_rope_np(_K, cos_all, sin_all)
+                _K_h = np.repeat(_K, N_KV_GROUPS, axis=1)[:_real_nt_g]
+                _xn_q = _xn[P_local]
+                _dres = fhe_attention_dense_scores(
+                    ctx, encoder, sk, relin_key, galois_key,
+                    _xn_q, _Wq_baked, _K_h, c_per_head,
+                    _real_nt_g, fresh_ci)
+                _fs = _dres["fhe_scores"]
+                _os = _dres["oracle_scores"]
+                # Reassemble live IRP-FHE post-stage-A scores from the
+                # sink. IRP block layout: slot[h*D_HEAD*T_MODEL + tok],
+                # block k -> tokens [k*T_MODEL, k*T_MODEL+blk_size).
+                _irp = np.zeros((_real_nt_g, N_HEADS), dtype=np.float64)
+                _hb = D_HEAD * T_MODEL
+                _tok0 = 0
+                for _blk_size, _vec in _DENSE_IRP_SCORE_SINK["blocks"]:
+                    for _tl in range(_blk_size):
+                        _ta = _tok0 + _tl
+                        if _ta >= _real_nt_g:
+                            break
+                        for _h in range(N_HEADS):
+                            _irp[_ta, _h] = _vec[_h * _hb + _tl]
+                    _tok0 += _blk_size
+
+                def _relrms(a, b):
+                    a = np.asarray(a, np.float64); b = np.asarray(b, np.float64)
+                    d = np.linalg.norm(a - b)
+                    n = np.linalg.norm(b)
+                    return float(d / n) if n > 0 else float(d)
+
+                _ra = _relrms(_fs, _os)
+                _rb = _relrms(_fs, _irp)
+                _GATE = 1e-3
+                _pa = "PASS" if _ra <= _GATE else "FAIL"
+                _pb = "PASS" if _rb <= _GATE else "FAIL"
+                print(f"  [DENSE-GATE L{layer_idx:2d}] P={_dres['P']} "
+                      f"n_shards={_dres['n_shards']} real_nt={_real_nt_g}")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] (a) dense-FHE vs "
+                      f"oracle  rel-RMS={_ra:.3e}  [{_pa}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] (b) dense-FHE vs "
+                      f"IRP-FHE rel-RMS={_rb:.3e}  [{_pb}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] "
+                      f"‖fhe‖={np.linalg.norm(_fs):.4f} "
+                      f"‖oracle‖={np.linalg.norm(_os):.4f} "
+                      f"‖irp‖={np.linalg.norm(_irp):.4f}")
+            except Exception as _de:
+                import traceback
+                print(f"  [DENSE-GATE L{layer_idx:2d}] ERROR: "
+                      f"{type(_de).__name__}: {_de}")
+                traceback.print_exc()
+            finally:
+                _DENSE_IRP_SCORE_SINK["sk"] = None
+                _DENSE_IRP_SCORE_SINK["blocks"] = []
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
@@ -1746,6 +1982,13 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
               f"rel-RMS={rel_rms:.3e}  t={layer_ms:.0f}ms  "
               f"[encrypt={t_encrypt*1000:.0f}ms decrypt={t_decrypt*1000:.0f}ms "
               f"fhe={t_fhe_ms:.0f}ms]")
+        if os.environ.get("PERF_BREAKDOWN") == "1":
+            _qwait_ms    = _t_wait * 1000.0
+            _prep_ms     = (_t_prep_end - t_layer_start) * 1000.0 - _qwait_ms
+            _fhec_ms     = t_fhe_ms - _qwait_ms - _prep_ms
+            print(f"    [pb L{layer_idx:02d}] qwait={_qwait_ms:.0f}ms "
+                  f"prep={_prep_ms:.0f}ms fhecompute={_fhec_ms:.0f}ms "
+                  f"(fhe_field={t_fhe_ms:.0f}ms total={layer_ms:.0f}ms)")
         y_p_fhe = y_p
         if _autonomous_fhe:
             # Carry the post-residual2 output ciphertext into the next
@@ -1945,7 +2188,13 @@ if __name__ == "__main__":
                     help="Skip layers before this index (uses PT ref as input)")
     ap.add_argument("--truncate-to", type=int, default=None,
                     help="Truncate the MRPC prompt to first N tokens (for num_tokens sweep)")
+    ap.add_argument("--dense", action="store_true",
+                    help="Stage 2 dense-rewrite gate: run + validate the FHE "
+                         "dense QK^T at layers 0 & 31 (sets DENSE_ATTN=1). "
+                         "ADDITIVE — IRP path/output unchanged.")
     args = ap.parse_args()
+    if args.dense:
+        os.environ["DENSE_ATTN"] = "1"  # gate reads env at runtime
     DEBUG_LAYER = args.debug_layer
     MAX_LAYER = args.max_layer
     MIN_LAYER = args.min_layer
