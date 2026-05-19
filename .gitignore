@@ -99,5 +99,13 @@ CTestTestfile.cmake
 _deps
 
 
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Large local FHE plaintext/IRP/Wq disk cache (multi-GB; never tracked)
+cache/
+
 # oh-my-claudecode local agent state
 .omc/

@@ -23,9 +23,20 @@ import math
 import numpy as np
 
 
-def pack_kv_blocks(K_full, V_full, num_tokens, t_model, num_slots, n_heads, d_head):
+def pack_kv_blocks(K_full, V_full, num_tokens, t_model, num_slots, n_heads, d_head,
+                     k_scale=1.0):
     """Pack K_full[num_tokens, n_heads, d_head] and V_full into a list of
     n_blocks slot vectors each (numpy float64 arrays of length num_slots).
+
+    Args:
+        k_scale: scalar applied to K values during packing. Used to reduce
+            ||K_h||_2 entering the ct·ct multiply in compute_qkt — post-QKT
+            err is Cauchy-Schwarz-bounded by err_Q · ||K_h||_2, so scaling K
+            down by 4× at encoding time drops cascade post-QKT err 4×
+            (1.16 → 0.29). The caller MUST compensate by dividing
+            inv_sqrt_d by k_scale so post-stage-A scores are bit-identical.
+            V is NOT scaled — only K participates in the noise-amplifying
+            QKT dot product.
 
     Returns:
         k_blocks: list of n_blocks numpy arrays of shape (num_slots,)
@@ -45,7 +56,7 @@ def pack_kv_blocks(K_full, V_full, num_tokens, t_model, num_slots, n_heads, d_he
                 base = (h * d_head + j) * t_model
                 for tok_local in range(block_size):
                     abs_tok = block_start + tok_local
-                    k_slots[base + tok_local] = K_full[abs_tok, h, j]
+                    k_slots[base + tok_local] = K_full[abs_tok, h, j] * k_scale
                     v_slots[base + tok_local] = V_full[abs_tok, h, j]
         k_blocks.append(k_slots)
         v_blocks.append(v_slots)
