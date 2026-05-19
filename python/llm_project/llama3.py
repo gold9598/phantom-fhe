@@ -76,7 +76,12 @@ P = 3                          # query position (last token attends to all 4)
 # ps_exp_init=4 levels + 4 damped squarings×2 levels = 12 levels ≤ max_user_level=13.
 # Softmax approximation quality: NUM_SQUARINGS=4 covers scores in [-8,0] well;
 # our per-head scores after C_per_head subtraction are near zero, so this suffices.
-NUM_SQUARINGS = 4
+NUM_SQUARINGS = 6 if __import__("os").environ.get("NSQ6") == "1" else 4
+# USE_BOOTSTRAP_17=1 opts the engine into the use17 chain layout (port of
+# the_lib's BootstrapTo17Levels). Currently sized identical to legacy but
+# kept as a separate code path while we tune prime sizes. Pairs naturally
+# with NSL=16 + NSP=8 (size_Q=32 / NSP=8 = dnum=4).
+USE_BOOTSTRAP_17 = __import__("os").environ.get("USE_BOOTSTRAP_17") == "1"
 EXTRA_SCALE = 0.5
 ITERS = 6
 TARGET_MAG = 0.45
@@ -100,8 +105,10 @@ RMS_Z_MARGIN = 0.30  # ±30% multiplicative window for per-layer z calibration
 #   swiglu:      1 level    (ct*ct)       → bootstrap_safe refresh before Wdown
 #   Wdown IRP:   1 level
 # Total per sub-stage ≤ 10; NSL=14 (13 usable) gives comfortable headroom.
-NUM_SCALE_LEVELS = 14
-NUM_SPECIAL_PRIMES = 6
+NUM_SCALE_LEVELS = int(__import__("os").environ.get("NSL",
+                                                       "16" if USE_BOOTSTRAP_17 else "14"))
+NUM_SPECIAL_PRIMES = int(__import__("os").environ.get("NSP",
+                                                       "8" if USE_BOOTSTRAP_17 else "6"))
 
 # User-level shorthand. freshest_chain_index = 16 (fixed by bootstrap pipeline).
 # Key size scales as (size_Q - user_level) primes.
