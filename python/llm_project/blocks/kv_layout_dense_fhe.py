@@ -204,6 +204,57 @@ def dense_per_head_sub_slots(num_slots: int, d_head: int, d_total: int,
 
 
 # ---------------------------------------------------------------------------
+# Stage 3: strict 0/1 base-slot mask (the poly(0) trap fix)
+# ---------------------------------------------------------------------------
+
+def dense_real_base_mask_slots(num_slots: int, d_head: int, d_total: int,
+                               shard_tok_start: int, P: int,
+                               real_nt: int,
+                               keep_value: float = 1.0) -> np.ndarray:
+    """Strict mask: `keep_value` (default 1.0) ONLY at base slots
+    tok_local*D + h*H of REAL tokens (shard_tok_start + tok_local < real_nt),
+    0.0 everywhere else.
+
+    `keep_value` defaults to 1.0 (a pure 0/1 strict mask). Pass the IRP
+    path's `softmax_safety_scale` to additionally fold the post-exp safety
+    rescale into this same multiply_plain (exactly like the IRP path's
+    stage-C qkt_irp_mask_scale_plaintext, which masks AND scales by
+    safety_scale in one fused op). Softmax weights are scale-invariant
+    ((s·e)/Σ(s·e) == e/Σe), so this leaves the final weights unchanged while
+    keeping the Goldschmidt denominator a = s·Σe inside the convergence
+    window (0,2) for peaky heads whose un-scaled per-head Σexp exceeds 2.
+
+    THE poly(0) trap fix. After compute_qkt + scale*mask, padded-token base
+    slots (tok >= real_nt) and ALL mid-block (j>0) slots are exact-0. But
+    ps_exp_init evaluates a polynomial whose value at 0 is poly(0) != 0
+    (~0.449). So after ps_exp_init + damped squarings EVERY zero slot holds a
+    nonzero junk value. If the per-head finalize sum-reduce
+    (sum_reduce_stride over the P token frames at stride d_total) runs over
+    those slots it adds (nt_pad - real_nt) bogus poly(0) terms per head and
+    pollutes every per-head denominator (the recurring softmax-layout trap,
+    the single biggest historical bug in this codebase).
+
+    Applying this strict-0/1 mask (multiply_plain) AFTER ps_exp_init + the
+    damped squarings — exactly mirroring the IRP path's stage-C
+    qkt_irp_mask_scale_plaintext re-mask — hard-zeros every padded / junk
+    slot so ONLY the real_nt legitimate exp values enter the per-head sum.
+    Geometry is byte-identical to dense_scale_mask_slots with scale_value=1.0
+    (same base-slot, same real-token guard).
+    """
+    n_heads = d_total // d_head
+    slots = np.zeros(num_slots, dtype=np.float64)
+    for tok_local in range(P):
+        if shard_tok_start + tok_local >= real_nt:
+            break
+        frame = tok_local * d_total
+        for h in range(n_heads):
+            idx = frame + h * d_head
+            if idx < num_slots:
+                slots[idx] = keep_value
+    return slots
+
+
+# ---------------------------------------------------------------------------
 # Readout: dense scores ct list -> scores[real_nt, n_heads]
 # ---------------------------------------------------------------------------
 

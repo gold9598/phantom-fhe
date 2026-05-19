@@ -68,7 +68,7 @@ from blocks.rmsnorm import (
     setup_rmsnorm_weights,
 )
 from blocks.silu import silu, fit_silu_coeffs, fit_silu_chebyshev_basis
-from blocks.softmax import softmax_damping_schedule
+from blocks.softmax import softmax_damping_schedule, sum_reduce_stride
 from llama3 import (
     LOG_N, N, NUM_SLOTS, SCALE, SPARSE_HW,
     D_MODEL, D_HEAD, N_HEADS, N_KV_HEADS, N_KV_GROUPS, D_TOTAL,
@@ -621,7 +621,8 @@ _DENSE_WQ_BABY_STEPS = 64  # bsgs_required_steps(64) ⊆ already-provisioned ste
 # ONLY under DENSE_ATTN at the probe layer; when disarmed _stage_a_premask
 # is byte-identical (the capture block is not entered). One extra decrypt
 # per block, ZERO change to the IRP ciphertext computation.
-_DENSE_IRP_SCORE_SINK = {"armed": False, "blocks": [], "sk": None}
+_DENSE_IRP_SCORE_SINK = {"armed": False, "armed_w": False,
+                         "blocks": [], "weights": [], "sk": None}
 
 
 def fhe_attention_dense_scores(ctx, encoder, sk, relin_key, galois_key,
@@ -726,6 +727,322 @@ def fhe_attention_dense_scores(ctx, encoder, sk, relin_key, galois_key,
     return {
         "fhe_scores": fhe_scores,
         "oracle_scores": oracle_scores,
+        "P": P,
+        "n_shards": n_shards,
+    }
+
+
+def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
+                                 xn_query, Wq_baked, K_full_h, c_per_head,
+                                 real_nt, chain_index):
+    """Stage 3 (dense-layout rewrite): FHE dense token-major softmax.
+
+    Extends fhe_attention_dense_scores' QK^T -> scaled/masked/centered scores
+    ciphertexts (kept encrypted, NOT decrypted) with the softmax compute:
+
+      ps_exp_init -> damped squarings -> STRICT 0/1 base-slot re-mask
+        -> per-shard sum_reduce (stride=D, count=P) -> cross-shard ADD
+        -> Goldschmidt softmax_correct  (== exp / per-head Σexp).
+
+    The strict 0/1 re-mask after ps_exp_init is THE poly(0) trap fix
+    (kv_layout_dense_fhe.dense_real_base_mask_slots): ps_exp(0)=poly(0)!=0
+    (~0.449), so without it the per-head sum-reduce over the P token frames
+    would add (nt_pad-real_nt) bogus poly(0) terms and pollute every per-head
+    denominator. Mirrors the IRP path's stage-C re-mask exactly.
+
+    Per-shard partial-sum then cross-shard ADD then reciprocal exactly
+    mirrors the verified oracle (test_kv_layout_dense.
+    test_softmax_denom_cross_shard_sum) AND the IRP multi_ct_softmax_finalize
+    (cross-block add -> sum_reduce -> per-block softmax_correct).
+
+    Reuses the SAME softmax primitive chain / constants the IRP path uses:
+      damps = softmax_damping_schedule(NUM_SQUARINGS, real_nt, EXTRA_SCALE,
+                                       TARGET_MAG)
+      e = phantom.ps_exp_init(.., real_nt, NUM_SQUARINGS, EXTRA_SCALE)
+      phantom.square_iterations_damped_inplace(.., e, damps)
+      w = phantom.softmax_correct(.., e_shard, a_total, ITERS)
+
+    Args / signature identical to fhe_attention_dense_scores.
+
+    Returns dict:
+      'fhe_weights'   : (real_nt, N_HEADS) decrypted softmax weights
+      'oracle_weights': (real_nt, N_HEADS) numpy oracle softmax (kv_layout_
+                        dense.dense_qkt on the SAME Q/K, then stable softmax
+                        over the token axis)
+      'head_sums'     : (N_HEADS,) per-head Σ_tok fhe_weights (must be ~1.0)
+      'P', 'n_shards'
+    """
+    D = D_TOTAL
+    H = D_HEAD
+    nH = N_HEADS
+    P = _dense_fhe.positions_per_ct(real_nt, NUM_SLOTS, D)
+    n_shards = _dense_fhe.n_shards_for(real_nt, P)
+
+    # ---- QK^T (identical to fhe_attention_dense_scores up to raw scores). ----
+    wq_diags = _dense_fhe.bsgs_wq_diags_dense(
+        ctx, encoder, Wq_baked, D, _DENSE_WQ_BABY_STEPS, SCALE)
+    x_ct = _dense_fhe.encrypt_x_replicated_block(
+        ctx, encoder, sk, xn_query, D, NUM_SLOTS, SCALE, chain_index)
+    q_ct = phantom.bsgs_matmul_preencoded(ctx, galois_key, x_ct, wq_diags)
+    k_cts = _dense_fhe.encrypt_k_dense_shards(
+        ctx, encoder, sk, K_full_h, real_nt, P, nH, H,
+        NUM_SLOTS, SCALE, chain_index)
+    for kc in k_cts:
+        phantom.mod_switch_to_inplace(ctx, kc, q_ct.chain_index())
+    raw_score_cts = phantom.compute_qkt(
+        ctx, relin_key, galois_key, q_ct, k_cts, H)
+
+    inv_sqrt_d = 1.0 / math.sqrt(float(H))
+
+    # ---- Stage A: fused scale*mask + per-head sub(C), per shard. ----
+    score_cts = []
+    for b, sc in enumerate(raw_score_cts):
+        tok_start = b * P
+        nominal = sc.scale()
+        ms_slots = _dense_fhe.dense_scale_mask_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, inv_sqrt_d)
+        ms_pt = encoder.encode_double_vector(
+            ctx, ms_slots, SCALE, sc.chain_index())
+        sc = phantom.multiply_plain(ctx, sc, ms_pt)
+        sc = phantom.rescale_to_next(ctx, sc)
+        sc.set_scale(nominal)
+        sub_slots = _dense_fhe.dense_per_head_sub_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, c_per_head)
+        sub_pt = encoder.encode_double_vector(
+            ctx, sub_slots, sc.scale(), sc.chain_index())
+        sc = phantom.sub_plain(ctx, sc, sub_pt)
+        score_cts.append(sc)
+
+    # ---- Bootstrap after stage A (before ps_exp), mirroring the IRP path's
+    # post-stage-A bootstrap (fhe_attention_multi_ct: bootstrap_safe at
+    # max_abs=_calib["scores"]). Without it the ps_exp(3) + squarings(NSQ) +
+    # mask(1) + softmax_correct(2*ITERS) depth overruns a single fresh chain
+    # ("end of modulus switching chain reached"). The dense gate is a
+    # self-contained validation harness with `engine` in scope at the call
+    # site, so it bootstraps exactly like the live IRP softmax. ----
+    _SCORES_CALIB = 45.10  # same static post-stage-A bound the IRP path uses
+    score_cts = [
+        bootstrap_safe(engine, ctx, encoder, sc,
+                       max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS)
+        for sc in score_cts
+    ]
+
+    # ---- Safety scale (mirrors the IRP path's softmax_safety_scale). ----
+    # Goldschmidt softmax_correct's denominator update a ← a(2-a) converges
+    # ONLY for a ∈ (0,2). A peaky head's true per-head Σ_tok pipeline(score)
+    # can legitimately exceed 2 (observed L0: max per-head denom ≈ 2.06 > 2),
+    # which makes softmax_correct DIVERGE for that one head (a₁ = 2.06·(2-2.06)
+    # < 0, oscillates) -> garbage weights, per-head-sum |1-Σ| ≈ 55. The IRP
+    # path's _stage_c_post folds a `safety_scale` into its stage-C mask so the
+    # LARGEST per-head sum lands at SOFTMAX_TARGET (< 2). Softmax weights are
+    # scale-invariant ((s·e)/Σ(s·e) == e/Σe) so this is exact. Computed here
+    # from the SAME teacher-forced numpy oracle compute_layer_calib_n uses
+    # (NOT from any decrypted FHE value) — self-contained for the gate.
+    _SOFTMAX_TARGET = 1.5  # == compute_layer_calib_n's SOFTMAX_TARGET
+    _Qd_s = (np.asarray(xn_query, np.float64)
+             @ np.asarray(Wq_baked, np.float64).T).reshape(nH, H)
+    _qs_s = _dense_oracle.pack_q_dense(_Qd_s, P)
+    _ks_s, _ = _dense_oracle.pack_kv_dense_shards(
+        np.asarray(K_full_h, np.float64),
+        np.asarray(K_full_h, np.float64), real_nt, P, nH)
+    _osc_s = _dense_oracle.dense_qkt(
+        [_qs_s] * n_shards, _ks_s, nH, H, real_nt, P, inv_sqrt_d)
+    _scc_s = _osc_s - np.asarray(c_per_head, np.float64)[None, :]
+    _EC_S = [1.0000000000000002, 0.9999999011179665, 0.49999999014536933,
+             0.16666798420023443, 0.04166679798739991, 0.008328598903862764,
+             0.001388416857145537, 0.00020469833492755798,
+             2.542872206845459e-05]
+    _se_s = 2.0 ** NUM_SQUARINGS
+    _lead_s = EXTRA_SCALE * (float(real_nt) ** (-1.0 / _se_s))
+    _cf_s = [_lead_s * _EC_S[i] * ((1.0 / _se_s) ** i)
+             for i in range(len(_EC_S))]
+    _pe_s = np.zeros_like(_scc_s)
+    for i, c in enumerate(_cf_s):
+        _pe_s = _pe_s + c * np.power(_scc_s, i)
+    _dmp_s = softmax_damping_schedule(
+        NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    for d in _dmp_s:
+        _pe_s = _pe_s * _pe_s
+        if abs(d - 1.0) > 1e-12:
+            _pe_s = _pe_s * d
+    _max_head_denom = float(_pe_s.sum(axis=0).max())
+    safety_scale = (_SOFTMAX_TARGET / _max_head_denom
+                    if _max_head_denom > _SOFTMAX_TARGET else 1.0)
+
+    # ---- Stage B: ps_exp_init + damped squarings, per shard. ----
+    # real_nt (NOT nt_pad): paired with the damps; matches IRP _stage_b_ps_exp
+    # + softmax_damping_schedule (the t^(-1) baked in must be the real summed
+    # key count). A per-shard constant -> identical across shards.
+    damps = softmax_damping_schedule(
+        NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    e_cts = []
+    for b, sc in enumerate(score_cts):
+        e_ct = phantom.ps_exp_init(
+            ctx, encoder, relin_key, sc,
+            real_nt, NUM_SQUARINGS, EXTRA_SCALE)
+        phantom.square_iterations_damped_inplace(
+            ctx, encoder, relin_key, e_ct, damps)
+        # Mean-subtract BEFORE the bootstrap, mean-add AFTER — EXACTLY the IRP
+        # path's _stage_b_ps_exp (sub) / _stage_c_post (add). bootstrap_safe
+        # assumes an approximately mean-zero input (its docstring); but after
+        # ps_exp + damped squarings the off-support slots all sit at
+        # pipeline(0) ≈ TARGET_MAG ≈ 0.45, so the ciphertext mean is ≈ 0.45.
+        # Bootstrapping that ~0.45-mean signal directly corrupts it (the
+        # bootstrap mod-reduction polynomial is centred at 0) — observed:
+        # post-bootstrap exp values came out ≈ -0.39 (negative! exp must be
+        # > 0), a_total ≈ -22.7, Goldschmidt blow-up to ~1e88. Subtracting
+        # _PRE_FINSMX_MEAN first centres the signal for the bootstrap, then
+        # adding it back restores the true pipeline values. _PRE_FINSMX_MEAN
+        # is the SAME functional-baseline constant the IRP path uses.
+        _PRE_FINSMX_MEAN = 0.4487
+        _mean_pt = encoder.encode_double_vector(
+            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+            e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
+        e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
+                              max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+        _mean_pt2 = encoder.encode_double_vector(
+            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
+            e_ct.scale(), e_ct.chain_index())
+        e_ct = phantom.add_plain(ctx, e_ct, _mean_pt2)
+        # THE poly(0) trap fix: strict 0/1 base-slot mask applied AFTER the
+        # bootstrap (== the IRP path's stage-C re-mask order). ps_exp(0) =
+        # poly(0) ≈ 0.45 != 0, so EVERY padded / mid-block (j>0) slot holds
+        # ~0.45 after exp+squarings; the bootstrap then ALSO injects ~1e-4
+        # noise at those slots. Masking AFTER the bootstrap with a clean
+        # encoded-zero plaintext drives those slots to EXACT 0 (a
+        # mask-before-bootstrap leaves ~6.7e-5 bootstrap residue, which makes
+        # Goldschmidt x ← x(2-a) explode where a≈0 — observed: CUDA error /
+        # 4.2x weight inflation). With e EXACTLY 0 off-support, softmax_correct
+        # keeps x = 0 there (no explosion) and the per-head sum-reduce sees
+        # ONLY the real_nt legitimate exp values. `safety_scale` is folded
+        # into this same multiply_plain (mirrors IRP stage-C's mask*safety),
+        # keeping the peaky-head Goldschmidt denominator inside (0,2).
+        tok_start = b * P
+        mask_slots = _dense_fhe.dense_real_base_mask_slots(
+            NUM_SLOTS, H, D, tok_start, P, real_nt, keep_value=safety_scale)
+        e_nominal = e_ct.scale()
+        mask_pt = encoder.encode_double_vector(
+            ctx, mask_slots, SCALE, e_ct.chain_index())
+        e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
+        e_ct = phantom.rescale_to_next(ctx, e_ct)
+        e_ct.set_scale(e_nominal)
+        e_cts.append(e_ct)
+
+    # ---- Stage C: per-shard partial sum -> cross-shard ADD -> reciprocal. ----
+    # Per shard: sum_reduce_stride(stride=D, count=P) folds the P token frames
+    # within that shard cyclically (slot len == P*D), landing the per-shard
+    # per-head partial Σ_{tok in shard} e at EVERY base slot tok*D+h*H.
+    # Cross-shard ADD the partials -> the true per-head total Σ_all_tok e at
+    # every base slot. THEN Goldschmidt softmax_correct (== oracle
+    # test_softmax_denom_cross_shard_sum + IRP multi_ct_softmax_finalize).
+    a_total = None
+    for e_ct in e_cts:
+        partial = sum_reduce_stride(ctx, galois_key, e_ct, D, P)
+        if a_total is None:
+            a_total = partial
+        else:
+            a_total = phantom.add(ctx, a_total, partial)
+
+    # Mask + rescale + set_scale(user_scale) on the accumulated denominator,
+    # EXACTLY the IRP path's multi_ct_softmax_finalize step 3 (a_masked =
+    # multiply_plain(a, head_first_slot_mask); rescale; set_scale(user_scale)).
+    # a_total has accumulated noise from log2(P) sum_reduce rotate-adds +
+    # (n_shards-1) cross-shard adds — fed straight into Goldschmidt (which
+    # squares `a` 2*ITERS times) that noise is amplified. The IRP path resets
+    # it with a mask*rescale before the broadcast; omitting that reset is the
+    # ~2.7e-3 extra error the dense path showed over the IRP fidelity floor.
+    # The mask (keep_value=1.0 at base slots) also re-zeros any sum_reduce
+    # residue at j>0 so the broadcast stays clean. 1 level (chain budget OK:
+    # post-bootstrap fresh chain has ~16 levels; e-mask 1 + a-mask 1 +
+    # softmax_correct 2*ITERS=12 = 14 <= 16).
+    _a_reset_slots = _dense_fhe.dense_real_base_mask_slots(
+        NUM_SLOTS, H, D, 0, P, P * n_shards, keep_value=1.0)
+    _a_nominal = a_total.scale()
+    _a_mask_pt = encoder.encode_double_vector(
+        ctx, _a_reset_slots, SCALE, a_total.chain_index())
+    a_total = phantom.multiply_plain(ctx, a_total, _a_mask_pt)
+    a_total = phantom.rescale_to_next(ctx, a_total)
+    a_total.set_scale(engine.user_scale())
+
+    # Intra-head broadcast of the per-head sum across the d_head block
+    # (mirrors the verified oracle kv_layout_dense._broadcast_within_heads
+    # and the IRP path's a_bc broadcast). After sum_reduce_stride the per-head
+    # denominator sits ONLY at the j=0 base slot tok*D+h*H; j>0 slots hold the
+    # sum of ~0 (strict-masked) residues ≈ 0. Goldschmidt softmax_correct
+    # updates `a` GLOBALLY: a slot with a≈0 makes x ← x(2-a) ≈ 2x DOUBLE every
+    # iteration, and 2*ITERS doublings across ~30k near-zero slots blow up the
+    # ciphertext's global scale/noise (CKKS rescale/relin is shared) — that
+    # is why softmax_correct returned 4.2x-inflated weights even though
+    # a_total at the base slots was numerically correct (FHE/numpy ratio
+    # 1.007). Broadcasting the per-head sum to ALL d_head slots keeps
+    # a ∈ (0,2) near the per-head sum everywhere -> Goldschmidt converges
+    # globally; j>0 slots have e≈0 so their weight≈0 (harmless), base slots
+    # get the correct e/Σe. Right-rotation broadcast == oracle's
+    # rotate_right(bstride) for bstride=d_head//2..1. Steps {-64..-1} are all
+    # pre-provisioned (sdpa/irp) -> ZERO new galois keys.
+    # Doubling broadcast, EXACTLY the IRP path's proven a_bc pattern
+    # (multi_ct_softmax_finalize step 3): s = 1,2,4,...,H/2 with
+    # rotate(-s) then add. Each step doubles the filled span so the j=0
+    # per-head value spreads to all H slots of the head block.
+    #
+    # NOTE: the per-token weight readout reads ONLY the j=0 base slot
+    # tok*D+h*H, where sum_reduce already placed the correct per-head sum.
+    # Now that the post-bootstrap strict mask makes e EXACTLY 0 at j>0
+    # (≈2e-7), Goldschmidt x=0 stays 0 there regardless of a — so the
+    # broadcast is no longer required for correctness and its log2(H)=7
+    # rotate-adds only inject extra noise into a_total. Default: SKIP it.
+    # DENSE_SMX_BCAST=1 restores the broadcast (kept for the original
+    # explosion-avoidance rationale / debugging).
+    if os.environ.get("DENSE_SMX_BCAST") == "1":
+        a_bc = a_total
+        s = 1
+        while s < H:
+            rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
+            a_bc = phantom.add(ctx, a_bc, rot)
+            s <<= 1
+        a_total = a_bc
+
+    a_chain = a_total.chain_index()
+    fhe_weights = np.zeros((real_nt, nH), dtype=np.float64)
+    for b, e_ct in enumerate(e_cts):
+        if e_ct.chain_index() != a_chain:
+            e_ct = phantom.mod_switch_to(ctx, e_ct, a_chain)
+        wb = phantom.softmax_correct(
+            ctx, encoder, relin_key, e_ct, a_total, ITERS)
+        wv = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, wb)),
+                      dtype=np.float64)
+        tok_start = b * P
+        for tok_local in range(P):
+            tok_abs = tok_start + tok_local
+            if tok_abs >= real_nt:
+                break
+            for h in range(nH):
+                fhe_weights[tok_abs, h] = wv[tok_local * D + h * H]
+
+    head_sums = fhe_weights.sum(axis=0)  # (nH,) — must be ~1.0
+
+    # ---- Oracle softmax on the IDENTICAL Q/K (the trusted Stage-1 spec). ----
+    Q_hd = (np.asarray(xn_query, dtype=np.float64)
+            @ np.asarray(Wq_baked, dtype=np.float64).T).reshape(nH, H)
+    q_slots = _dense_oracle.pack_q_dense(Q_hd, P)
+    q_per_shard = [q_slots for _ in range(n_shards)]
+    k_shards_oracle, _ = _dense_oracle.pack_kv_dense_shards(
+        np.asarray(K_full_h, dtype=np.float64),
+        np.asarray(K_full_h, dtype=np.float64),
+        real_nt, P, nH)
+    oracle_scores = _dense_oracle.dense_qkt(
+        q_per_shard, k_shards_oracle, nH, H, real_nt, P, inv_sqrt_d)
+    # Stable softmax over the token axis (axis=0) — shift-invariant, so the
+    # c_per_head centering the FHE path applies is irrelevant to the weights.
+    _os = oracle_scores - oracle_scores.max(axis=0, keepdims=True)
+    _oe = np.exp(_os)
+    oracle_weights = _oe / _oe.sum(axis=0, keepdims=True)
+
+    return {
+        "fhe_weights": fhe_weights,
+        "oracle_weights": oracle_weights,
+        "head_sums": head_sums,
         "P": P,
         "n_shards": n_shards,
     }
@@ -1146,6 +1463,21 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     if verbose:
         for kk, wb in enumerate(weights_blocks[:2]):
             _probe(f"attn post-weights[{kk}]", ctx, encoder, sk, wb)
+
+    # gate (b) read-only capture: decrypt the LIVE IRP softmax weights
+    # blocks. No-op (not entered) unless armed by run_classifier_fhe. IRP
+    # weights-block layout: slot[h*D_HEAD*T_MODEL + tok_local], block k ->
+    # tokens [k*T_MODEL, k*T_MODEL+block_sizes[k]). Zero change to the IRP
+    # ciphertext math (decrypt only).
+    if (_DENSE_IRP_SCORE_SINK["armed_w"]
+            and _DENSE_IRP_SCORE_SINK["sk"] is not None):
+        _skw = _DENSE_IRP_SCORE_SINK["sk"]
+        for _bk, _wb in enumerate(weights_blocks):
+            _wv = np.array(
+                encoder.decode_double_vector(ctx, _skw.decrypt(ctx, _wb)),
+                dtype=np.float64)
+            _bsz = block_sizes[_bk] if _bk < len(block_sizes) else T_MODEL
+            _DENSE_IRP_SCORE_SINK["weights"].append((_bsz, _wv))
 
     # score_times_v_irp_multi
     t0 = _t()
@@ -1855,8 +2187,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             _dense_gate_here = layer_idx in _dg_layers
         if _dense_gate_here:
             _DENSE_IRP_SCORE_SINK["armed"] = True
+            _DENSE_IRP_SCORE_SINK["armed_w"] = True
             _DENSE_IRP_SCORE_SINK["sk"] = sk
             _DENSE_IRP_SCORE_SINK["blocks"] = []
+            _DENSE_IRP_SCORE_SINK["weights"] = []
 
         attn_out = fhe_attention_multi_ct(
             engine, ctx, encoder, relin_key, galois_key, sk,
@@ -1868,6 +2202,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
         if _dense_gate_here:
             _DENSE_IRP_SCORE_SINK["armed"] = False
+            _DENSE_IRP_SCORE_SINK["armed_w"] = False
             try:
                 _real_nt_g = _real_nt(num_tokens, P_local)
                 # Derive the SAME teacher-forced Q/K the IRP path used
@@ -1924,6 +2259,53 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                       f"‖fhe‖={np.linalg.norm(_fs):.4f} "
                       f"‖oracle‖={np.linalg.norm(_os):.4f} "
                       f"‖irp‖={np.linalg.norm(_irp):.4f}")
+
+                # ---- Stage 3: dense softmax gate. ----
+                _sres = fhe_attention_dense_softmax(
+                    engine, ctx, encoder, sk, relin_key, galois_key,
+                    _xn_q, _Wq_baked, _K_h, c_per_head,
+                    _real_nt_g, fresh_ci)
+                _fw = _sres["fhe_weights"]
+                _ow = _sres["oracle_weights"]
+                _hsum = _sres["head_sums"]
+                # Reassemble live IRP-FHE softmax weights from the sink.
+                # IRP weights-block layout: slot[h*D_HEAD*T_MODEL + tok],
+                # block k -> tokens [k*T_MODEL, k*T_MODEL+blk_size).
+                _irpw = np.zeros((_real_nt_g, N_HEADS), dtype=np.float64)
+                _tok0 = 0
+                for _blk_size, _vec in _DENSE_IRP_SCORE_SINK["weights"]:
+                    for _tl in range(_blk_size):
+                        _ta = _tok0 + _tl
+                        if _ta >= _real_nt_g:
+                            break
+                        for _h in range(N_HEADS):
+                            _irpw[_ta, _h] = _vec[_h * _hb + _tl]
+                    _tok0 += _blk_size
+
+                _sa = _relrms(_fw, _ow)
+                _sb = _relrms(_fw, _irpw)
+                # diagnostic: is dense-vs-oracle error just the inherent
+                # FHE-vs-oracle softmax fidelity the IRP path ALSO has?
+                _irp_vs_ora = _relrms(_irpw, _ow)
+                _hmax = float(np.max(np.abs(1.0 - _hsum)))
+                _psa = "PASS" if _sa <= _GATE else "FAIL"
+                _psb = "PASS" if _sb <= _GATE else "FAIL"
+                _psh = "PASS" if _hmax <= _GATE else "FAIL"
+                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax (a) vs "
+                      f"oracle  rel-RMS={_sa:.3e}  [{_psa}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax (b) vs "
+                      f"IRP-FHE rel-RMS={_sb:.3e}  [{_psb}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax "
+                      f"per-head-sum max|1-Σ|={_hmax:.3e}  [{_psh}]")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax "
+                      f"‖fhe_w‖={np.linalg.norm(_fw):.4f} "
+                      f"‖oracle_w‖={np.linalg.norm(_ow):.4f} "
+                      f"‖irp_w‖={np.linalg.norm(_irpw):.4f}")
+                print(f"  [DENSE-GATE L{layer_idx:2d}] softmax DIAG: "
+                      f"IRP-FHE vs oracle rel-RMS={_irp_vs_ora:.3e} "
+                      f"(inherent FHE softmax fidelity floor) | "
+                      f"dense-FHE adds {max(_sa - _irp_vs_ora, 0.0):.3e} "
+                      f"over that floor")
             except Exception as _de:
                 import traceback
                 print(f"  [DENSE-GATE L{layer_idx:2d}] ERROR: "
@@ -1932,6 +2314,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             finally:
                 _DENSE_IRP_SCORE_SINK["sk"] = None
                 _DENSE_IRP_SCORE_SINK["blocks"] = []
+                _DENSE_IRP_SCORE_SINK["weights"] = []
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
