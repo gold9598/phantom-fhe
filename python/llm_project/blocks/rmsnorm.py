@@ -226,8 +226,16 @@ def rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
     xw.set_scale(nominal)
 
     # Stage 5: pt*ct rescale by stride-t g.
-    g_pt = encoder.encode_double_vector(
-        ctx, weights_stride_t.g_tiled_real, nominal, xw.chain_index())
+    # Model-weight γ encoded as SingleChainPlaintext (chain-agnostic, single
+    # polynomial = N*8 bytes) + JIT-expanded to full-RNS PhantomPlaintext at
+    # xw's chain via expand_single_chain_to_full. Mathematically identical to
+    # the prior encode_double_vector path; opens the door to hoisting the SCP
+    # encoding to setup-time so it's not re-encoded on every rmsnorm call.
+    g_scp = phantom.encode_single_chain_plaintext(
+        ctx, encoder,
+        np.asarray(weights_stride_t.g_tiled_real, dtype=np.float64),
+        nominal)
+    g_pt = phantom.expand_single_chain_to_full(ctx, g_scp, xw.chain_index())
     xw = phantom.multiply_plain(ctx, xw, g_pt)
     xw = phantom.rescale_to_next(ctx, xw)
     xw.set_scale(nominal)
