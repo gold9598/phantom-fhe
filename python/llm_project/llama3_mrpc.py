@@ -51,7 +51,7 @@ sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
 from blocks.attention import (
     qkt_required_steps, score_v_required_steps, broadcast_required_steps,
 )
-from blocks.bootstrap import bootstrap_safe
+from blocks.bootstrap import bootstrap_safe, merge_bootstrap
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
 )
@@ -1419,11 +1419,21 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # ---- Bootstrap after stage A (before ps_exp). Same static bound the
     # IRP path / fhe_attention_dense_softmax uses. ----
     _SCORES_CALIB = 45.10
-    score_cts = [
-        bootstrap_safe(engine, ctx, encoder, sc,
-                       max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS)
-        for sc in score_cts
-    ]
+    _new_score_cts = []
+    _i = 0
+    while _i + 1 < len(score_cts):
+        _a, _b = merge_bootstrap(
+            engine, ctx, encoder, score_cts[_i], score_cts[_i + 1],
+            max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS,
+            galois_key=galois_key)
+        _new_score_cts.append(_a)
+        _new_score_cts.append(_b)
+        _i += 2
+    if _i < len(score_cts):
+        _new_score_cts.append(bootstrap_safe(
+            engine, ctx, encoder, score_cts[_i],
+            max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS))
+    score_cts = _new_score_cts
 
     # ---- Safety scale (identical derivation to fhe_attention_dense_
     # softmax: from the SAME teacher-forced numpy oracle, NOT decrypted
@@ -1488,7 +1498,10 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # shard. Byte-identical to fhe_attention_dense_softmax. ----
     damps = softmax_damping_schedule(
         NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
-    e_cts = []
+
+    # Phase 1: pre-bootstrap work (ps_exp + squarings + mean-sub), per shard.
+    _pre_boot_cts = []
+    _post_state = []  # per-shard _PRE_FINSMX_MEAN
     for b, sc in enumerate(score_cts):
         e_ct = phantom.ps_exp_init(
             ctx, encoder, relin_key, sc,
@@ -1502,8 +1515,29 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
             ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
             e_ct.scale(), e_ct.chain_index())
         e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
-        e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
-                              max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+        _pre_boot_cts.append(e_ct)
+        _post_state.append(_PRE_FINSMX_MEAN)
+
+    # Phase 2: pairwise merge_bootstrap across shards.
+    _post_boot_cts = []
+    _i = 0
+    while _i + 1 < len(_pre_boot_cts):
+        _a, _b = merge_bootstrap(
+            engine, ctx, encoder, _pre_boot_cts[_i], _pre_boot_cts[_i + 1],
+            max_abs=TARGET_MAG, slot_count=NUM_SLOTS,
+            galois_key=galois_key)
+        _post_boot_cts.append(_a)
+        _post_boot_cts.append(_b)
+        _i += 2
+    if _i < len(_pre_boot_cts):
+        _post_boot_cts.append(bootstrap_safe(
+            engine, ctx, encoder, _pre_boot_cts[_i],
+            max_abs=TARGET_MAG, slot_count=NUM_SLOTS))
+
+    # Phase 3: post-bootstrap work (mean-add + mask), per shard.
+    e_cts = []
+    for b, e_ct in enumerate(_post_boot_cts):
+        _PRE_FINSMX_MEAN = _post_state[b]
         _mean_pt2 = encoder.encode_double_vector(
             ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
             e_ct.scale(), e_ct.chain_index())
@@ -2189,23 +2223,14 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
         # Encode IRP-rect SCPs. Wgate/Wup are WIDE (d_in=D_MODEL < d_out=D_PAD_OUT).
         # Wdown is TALL (d_in=D_PAD_OUT > d_out=D_MODEL).
-        # SEQUENTIAL encoding: ThreadPoolExecutor(3) over a shared
-        # PhantomCKKSEncoder/PhantomContext races on internal scratch state
-        # (binding releases the GIL inside encode_single_chain_plaintext) and
-        # corrupts the resulting SCPs (rel-RMS=5.5e+11 vs sequential ~8.6e-3).
-        # Match the recovered.py V1 wiring; the disk cache is still V2.
-        _gate_irp = _irp_cache.gate_plaintexts_cached(
-            ctx, encoder, _Wgate_padded, N=NUM_SLOTS,
-            d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
-            baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
-        _up_irp = _irp_cache.up_plaintexts_cached(
-            ctx, encoder, _Wup_padded, N=NUM_SLOTS,
-            d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
-            baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
-        _down_irp = _irp_cache.down_plaintexts_cached(
-            ctx, encoder, _Wdown_padded, N=NUM_SLOTS,
-            d_in=_D_PAD_OUT_MLP, d_out=D_MODEL, scale=SCALE,
-            baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
+        # Warm path: all 3 blobs present -> parallel load via ThreadPoolExecutor(3)
+        # (encoder-free, thread-safe). Cold/partial path: sequential encode.
+        _gate_irp, _up_irp, _down_irp = _irp_cache.mlp_plaintexts_batch_cached(
+            ctx, encoder, _Wgate_padded, _Wup_padded, _Wdown_padded,
+            N=NUM_SLOTS, d_in_wide=D_MODEL, d_out_wide=_D_PAD_OUT_MLP,
+            d_in_tall=_D_PAD_OUT_MLP, d_out_tall=D_MODEL,
+            scale=SCALE, baby_steps=_BABY_STEPS_IRP_MLP_RECT,
+            layer_idx=layer_idx)
 
         # Per K-2 test (blocks/kv_cache_test.py:115-127): wide path needs
         # only sub_mask_pt; tall path needs BOTH sub_mask_pt (at chain+1)
