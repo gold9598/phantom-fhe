@@ -2269,10 +2269,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         #    silu_t_coeffs/silu_D too. --
         if silu_t_coeffs is not None and silu_D is not None:
             from blocks.silu import silu_clenshaw
+            # ul_max=14 drops one internal bootstrap (3→2) by fitting more Clenshaw iters
+            # per bootstrap session; safe since pre-scale takes 1 level → max user_level=15 < NSL=16
             _silu_ct = silu_clenshaw(
                 engine, ctx, encoder, relin_key, _gate_ct,
                 silu_D, silu_t_coeffs, NUM_SLOTS,
-                galois_key=galois_key)
+                galois_key=galois_key, ul_max=14)
         else:
             _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
                             coeffs=silu_coeffs,
