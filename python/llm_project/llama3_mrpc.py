@@ -1366,78 +1366,93 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         k_pt = encoder.encode_double_vector(
             ctx, k_slots, SCALE, q_ct.chain_index())
         k_cache_cts.append(sk.encrypt_symmetric(ctx, k_pt))
-    # Per-chunk compute_qkt_irp + SK bridge to dense raw_score_cts.
-    dense_shard_slots = [np.zeros(NUM_SLOTS, dtype=np.float64)
-                         for _ in range(n_shards)]
+    # ---- Path B: IRP-native attention chain. Eliminates dense Stage A/B/C +
+    # C++ score_times_v + IRP-Wo input SK bridge. Single-ct IRP layout across
+    # the chain: slot[h*d_head*t + tok] = m[tok, h].
+    inv_sqrt_d = 1.0 / math.sqrt(float(H))
+    # Pad real_nt to next pow2 for finalize_softmax_irp_t (which asserts pow2>=2).
+    # For real_nt=60 -> 64; for real_nt=512 -> 512.
+    nt_pad = 1
+    while nt_pad < max(2, real_nt):
+        nt_pad <<= 1
+
+    # ---- Per-chunk compute_qkt_irp + per-chunk Stage A mask*scale (Section 1
+    # partial-junk fix: mask each chunk BEFORE tree-agg so the partial-junk
+    # in slots [h*1024+t..h*1024+1023] doesn't pollute valid token slots in
+    # the global ct).
+    score_cts_irp = []
+    # Per-chunk mask*scale plaintext shared across chunks (every chunk has
+    # t=8 valid slots per head at offsets [0,t)). Encoded LAZILY at the
+    # post-compute_qkt_irp chain (q.chain + 1 after the rescale inside
+    # compute_qkt_irp).
+    _ms_pt = None
     for c, k_ct in enumerate(k_cache_cts):
         if k_ct.chain_index() != q_ct.chain_index():
             phantom.mod_switch_to_inplace(ctx, k_ct, q_ct.chain_index())
-        scores_ct = _attn.compute_qkt_irp(
+        sc = _attn.compute_qkt_irp(
             ctx, encoder, relin_key, galois_key,
             q_ct, k_ct, d_head=H, d_total=D, t=t_k)
-        scores_dec = np.asarray(
-            encoder.decode_double_vector(ctx, sk.decrypt(ctx, scores_ct)),
-            dtype=np.float64)
-        for h in range(nH):
-            src_base = h * H * t_k
-            for p in range(t_k):
-                tok_abs = c * t_k + p
-                if tok_abs >= real_nt:
-                    break
-                shard_idx = tok_abs // P
-                tok_local = tok_abs - shard_idx * P
-                if shard_idx < n_shards:
-                    dense_shard_slots[shard_idx][tok_local * D + h * H] = \
-                        scores_dec[src_base + p]
-    raw_score_cts = [
-        sk.encrypt_symmetric(ctx, encoder.encode_double_vector(
-            ctx, ds, SCALE, q_ct.chain_index()))
-        for ds in dense_shard_slots
-    ]
-
-    inv_sqrt_d = 1.0 / math.sqrt(float(H))
-
-    # ---- Stage A: fused scale*mask + per-head sub(C), per shard. ----
-    score_cts = []
-    for b, sc in enumerate(raw_score_cts):
-        tok_start = b * P
+        if _ms_pt is None:
+            _ms_pt = _attn.qkt_irp_mask_scale_plaintext(
+                ctx, encoder, d_head=H, d_total=D, num_tokens=t_k, t=t_k,
+                scale_value=inv_sqrt_d, chain_index=sc.chain_index(),
+                encode_scale=SCALE)
+        # Per-chunk mask*scale: keep slot[h*1024+p] = inv_sqrt_d * m[c*t+p, h]
+        # for p in [0, t); zero junk slots so tree-agg is collision-safe.
         nominal = sc.scale()
-        ms_slots = _dense_fhe.dense_scale_mask_slots(
-            NUM_SLOTS, H, D, tok_start, P, real_nt, inv_sqrt_d)
-        ms_pt = encoder.encode_double_vector(
-            ctx, ms_slots, SCALE, sc.chain_index())
-        sc = phantom.multiply_plain(ctx, sc, ms_pt)
+        sc = phantom.multiply_plain(ctx, sc, _ms_pt)
         sc = phantom.rescale_to_next(ctx, sc)
         sc.set_scale(nominal)
-        sub_slots = _dense_fhe.dense_per_head_sub_slots(
-            NUM_SLOTS, H, D, tok_start, P, real_nt, c_per_head)
-        sub_pt = encoder.encode_double_vector(
-            ctx, sub_slots, sc.scale(), sc.chain_index())
-        sc = phantom.sub_plain(ctx, sc, sub_pt)
-        score_cts.append(sc)
+        score_cts_irp.append(sc)
 
-    # ---- Bootstrap after stage A (before ps_exp). Same static bound the
-    # IRP path / fhe_attention_dense_softmax uses. ----
+    # ---- Tree-aggregate the n_chunks_k per-chunk score cts into one global
+    # ct with slot[h*1024 + tok] = (m[tok, h] - 0) / sqrt(d_head) for h<nH,
+    # tok<real_nt; zero elsewhere within each head's first-nt_pad slots.
+    # Pre-condition: n_chunks_k must be a power of 2 (= nt_pad / t_k).
+    # nt_pad/t_k = 64/8 = 8 chunks (3 levels of tree).
+    n_chunks_pow2 = nt_pad // t_k
+    # Pad score_cts_irp to n_chunks_pow2 with zero ciphertexts (mask*0 trick:
+    # encode a zero ct at the chunk-mask chain so the tree-add is a no-op).
+    if len(score_cts_irp) < n_chunks_pow2:
+        # Create a zero ct at the same chain/scale as the masked score cts.
+        _zero_pt = encoder.encode_double_vector(
+            ctx, np.zeros(NUM_SLOTS, dtype=np.float64),
+            score_cts_irp[0].scale(), score_cts_irp[0].chain_index())
+        _zero_ct = sk.encrypt_symmetric(ctx, _zero_pt)
+        while len(score_cts_irp) < n_chunks_pow2:
+            score_cts_irp.append(_zero_ct)
+    cur = score_cts_irp
+    _level = 0
+    while len(cur) > 1:
+        rot_step = -(t_k << _level)   # -8, -16, -32, ... (-t * 2^l)
+        nxt = []
+        for k in range(len(cur) // 2):
+            left = cur[2 * k]
+            right = phantom.rotate(ctx, cur[2 * k + 1], int(rot_step), galois_key)
+            nxt.append(phantom.add(ctx, left, right))
+        cur = nxt
+        _level += 1
+    S_global = cur[0]
+
+    # ---- Global per-head sub(c_per_head). Keeps slot[h*1024 + tok] valid
+    # for tok in [0, real_nt) — the helper only writes the first real_nt
+    # slots per head, so slots [real_nt, nt_pad) (the pad-to-pow2 buffer)
+    # are untouched and remain zero from the per-chunk mask above.
+    _sub_pt = _attn.qkt_irp_per_head_sub_plaintext(
+        ctx, encoder, d_head=H, d_total=D, num_tokens=real_nt, t=t_k,
+        c_per_head=c_per_head, chain_index=S_global.chain_index(),
+        encode_scale=S_global.scale())
+    S_global = phantom.sub_plain(ctx, S_global, _sub_pt)
+
+    # ---- Bootstrap-1 (post-Stage-A). Single ct vs dense's per-shard 4×.
     _SCORES_CALIB = 45.10
-    _new_score_cts = []
-    _i = 0
-    while _i + 1 < len(score_cts):
-        _a, _b = merge_bootstrap(
-            engine, ctx, encoder, score_cts[_i], score_cts[_i + 1],
-            max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS,
-            galois_key=galois_key)
-        _new_score_cts.append(_a)
-        _new_score_cts.append(_b)
-        _i += 2
-    if _i < len(score_cts):
-        _new_score_cts.append(bootstrap_safe(
-            engine, ctx, encoder, score_cts[_i],
-            max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS))
-    score_cts = _new_score_cts
+    S_global = bootstrap_safe(
+        engine, ctx, encoder, S_global,
+        max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS)
 
-    # ---- Safety scale (identical derivation to fhe_attention_dense_
-    # softmax: from the SAME teacher-forced numpy oracle, NOT decrypted
-    # FHE). Keeps the peaky-head Goldschmidt denominator inside (0,2). ----
+    # ---- Safety scale + global pre-bootstrap mean (numpy oracle; layout-
+    # agnostic). Identical derivation to the dense path; only the mean
+    # reduction shape changes (global, not per-shard).
     _SOFTMAX_TARGET = 1.5
     _Qd_s = (np.asarray(xn_query, np.float64)
              @ np.asarray(Wq_baked, np.float64).T).reshape(nH, H)
@@ -1469,11 +1484,10 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     safety_scale = (_SOFTMAX_TARGET / _max_head_denom
                     if _max_head_denom > _SOFTMAX_TARGET else 1.0)
 
-    # ---- Dense-layout-correct per-shard pre-bootstrap mean (H2 fix). ----
-    # See fhe_attention_dense_softmax for the full rationale. The end-to-end
-    # path flows through THIS function, so the same correction must apply
-    # here. ADDITIVE; DENSE_PRE_MEAN_FIX=0 restores the 0.4487 baseline.
-    _pre_mean_fix = os.environ.get("DENSE_PRE_MEAN_FIX", "1") == "1"
+    # Global pre-bootstrap mean: numpy poly applied to padded (real_nt, nH)
+    # = (60, 32) scores; the rest of the slots are zero (mask*0 → poly(0)
+    # = _v0). The IRP layout populates real_nt*nH slots; the rest are
+    # _v0-valued junk after ps_exp+squarings (poly evaluated at 0 elementwise).
     _v0 = 0.0
     for _c in reversed(_cf_s):
         _v0 = _v0 * 0.0 + _c
@@ -1482,168 +1496,159 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         if abs(_d - 1.0) > 1e-12:
             _v0 = _v0 * _d
     _v0 = float(_v0)
-    _dense_pre_mean = np.full(n_shards, 0.4487, dtype=np.float64)
-    if _pre_mean_fix:
-        for _b in range(n_shards):
-            _t0 = _b * P
-            _t1 = min(_t0 + P, real_nt)
-            _n_real_frames = max(_t1 - _t0, 0)
-            _pop_sum = float(_pe_s[_t0:_t1, :].sum())
-            _n_pop = _n_real_frames * nH
-            _n_junk = NUM_SLOTS - _n_pop
-            _dense_pre_mean[_b] = (_pop_sum + _n_junk * _v0) / NUM_SLOTS
+    _pop_sum_global = float(_pe_s[0:real_nt, :].sum())
+    _n_pop_global = real_nt * nH
+    _n_junk_global = NUM_SLOTS - _n_pop_global
+    _global_pre_mean = (_pop_sum_global + _n_junk_global * _v0) / NUM_SLOTS
 
-    # ---- Stage B: ps_exp_init + damped squarings + mean-centered
-    # bootstrap + STRICT 0/1 base-slot re-mask (poly(0) trap fix), per
-    # shard. Byte-identical to fhe_attention_dense_softmax. ----
+    # ---- Stage B IRP (single ct): ps_exp_init + damped squarings +
+    # mean-centered bootstrap. Layout-agnostic (elementwise polynomial).
     damps = softmax_damping_schedule(
         NUM_SQUARINGS, real_nt, EXTRA_SCALE, TARGET_MAG)
+    e_ct = phantom.ps_exp_init(
+        ctx, encoder, relin_key, S_global,
+        real_nt, NUM_SQUARINGS, EXTRA_SCALE)
+    phantom.square_iterations_damped_inplace(
+        ctx, encoder, relin_key, e_ct, damps)
+    _mean_pt = encoder.encode_double_vector(
+        ctx, np.full(NUM_SLOTS, _global_pre_mean, dtype=np.float64),
+        e_ct.scale(), e_ct.chain_index())
+    e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
+    # Bootstrap-2 (mean-centered).
+    e_ct = bootstrap_safe(
+        engine, ctx, encoder, e_ct,
+        max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
+    _mean_pt2 = encoder.encode_double_vector(
+        ctx, np.full(NUM_SLOTS, _global_pre_mean, dtype=np.float64),
+        e_ct.scale(), e_ct.chain_index())
+    e_ct = phantom.add_plain(ctx, e_ct, _mean_pt2)
 
-    # Phase 1: pre-bootstrap work (ps_exp + squarings + mean-sub), per shard.
-    _pre_boot_cts = []
-    _post_state = []  # per-shard _PRE_FINSMX_MEAN
-    for b, sc in enumerate(score_cts):
-        e_ct = phantom.ps_exp_init(
-            ctx, encoder, relin_key, sc,
-            real_nt, NUM_SQUARINGS, EXTRA_SCALE)
-        phantom.square_iterations_damped_inplace(
-            ctx, encoder, relin_key, e_ct, damps)
-        # H2 FIX: dense-layout-correct per-shard mean (see
-        # fhe_attention_dense_softmax). Restores mean-zero bootstrap input.
-        _PRE_FINSMX_MEAN = float(_dense_pre_mean[b])
-        _mean_pt = encoder.encode_double_vector(
-            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
-            e_ct.scale(), e_ct.chain_index())
-        e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
-        _pre_boot_cts.append(e_ct)
-        _post_state.append(_PRE_FINSMX_MEAN)
+    # ---- Stage B mask: keep slot[h*1024 + tok] for h<nH, tok<real_nt with
+    # value safety_scale; zero elsewhere (especially slots [real_nt, nt_pad)
+    # within each head's first-nt_pad block — required for finalize_softmax_
+    # irp_t's cyclic-replica precondition at num_tokens=nt_pad).
+    mask_slots = _attn._qkt_irp_head_mask_slots(
+        NUM_SLOTS, H, D, t_k, real_nt, value=safety_scale)
+    e_nominal = e_ct.scale()
+    mask_pt = encoder.encode_double_vector(
+        ctx, mask_slots, SCALE, e_ct.chain_index())
+    e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
+    e_ct = phantom.rescale_to_next(ctx, e_ct)
+    e_ct.set_scale(e_nominal)
 
-    # Phase 2: pairwise merge_bootstrap across shards.
-    _post_boot_cts = []
-    _i = 0
-    while _i + 1 < len(_pre_boot_cts):
-        _a, _b = merge_bootstrap(
-            engine, ctx, encoder, _pre_boot_cts[_i], _pre_boot_cts[_i + 1],
-            max_abs=TARGET_MAG, slot_count=NUM_SLOTS,
-            galois_key=galois_key)
-        _post_boot_cts.append(_a)
-        _post_boot_cts.append(_b)
-        _i += 2
-    if _i < len(_pre_boot_cts):
-        _post_boot_cts.append(bootstrap_safe(
-            engine, ctx, encoder, _pre_boot_cts[_i],
-            max_abs=TARGET_MAG, slot_count=NUM_SLOTS))
+    # ---- Stage C IRP: single finalize_softmax_irp_t call. Cyclic-replica
+    # at -nt_pad (= -64 for real_nt=60). All rotations in provisioned set.
+    weights_ct = _attn.finalize_softmax_irp_t(
+        ctx, encoder, relin_key, galois_key,
+        e_ct, num_tokens=nt_pad, iters=ITERS)
 
-    # Phase 3: post-bootstrap work (mean-add + mask), per shard.
-    e_cts = []
-    for b, e_ct in enumerate(_post_boot_cts):
-        _PRE_FINSMX_MEAN = _post_state[b]
-        _mean_pt2 = encoder.encode_double_vector(
-            ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
-            e_ct.scale(), e_ct.chain_index())
-        e_ct = phantom.add_plain(ctx, e_ct, _mean_pt2)
-        tok_start = b * P
-        mask_slots = _dense_fhe.dense_real_base_mask_slots(
-            NUM_SLOTS, H, D, tok_start, P, real_nt, keep_value=safety_scale)
-        e_nominal = e_ct.scale()
-        mask_pt = encoder.encode_double_vector(
-            ctx, mask_slots, SCALE, e_ct.chain_index())
-        e_ct = phantom.multiply_plain(ctx, e_ct, mask_pt)
-        e_ct = phantom.rescale_to_next(ctx, e_ct)
-        e_ct.set_scale(e_nominal)
-        e_cts.append(e_ct)
+    # ---- Bootstrap-3 (post-softmax, before distribute + score_v). Needed
+    # because softmax_correct consumes 2*ITERS levels and score_v_irp_multi
+    # adds ~3 more (distribute mask + ct·ct + output mask).
+    weights_ct = bootstrap_safe(
+        engine, ctx, encoder, weights_ct,
+        max_abs=1.0, slot_count=NUM_SLOTS)
 
-    # ---- Stage C: per-shard partial sum -> cross-shard ADD -> a-reset
-    # mask -> Goldschmidt softmax_correct. Byte-identical to
-    # fhe_attention_dense_softmax EXCEPT weights stay ENCRYPTED. ----
-    a_total = None
-    for e_ct in e_cts:
-        partial = sum_reduce_stride(ctx, galois_key, e_ct, D, P)
-        if a_total is None:
-            a_total = partial
-        else:
-            a_total = phantom.add(ctx, a_total, partial)
+    # ---- Tree-distribute global weights → n_chunks_pow2 per-chunk cts.
+    # Inverse of tree-agg: at each level, split one ct into "lower" and
+    # "upper" via mask+rotate. Only positive power-of-2 rotations needed
+    # (all in provisioned set). For 8 chunks: 3 levels (8 -> 4 -> 2 -> 1
+    # reversed = 1 -> 2 -> 4 -> 8). Each level uses one shared mask plaintext
+    # at this level's "lower-half" pattern.
+    weights_blocks = [weights_ct]
+    # Process levels from coarse to fine: at level L (W = nt_pad >> L), we
+    # have 2^L blocks each holding W consecutive tokens. To split one block
+    # of W tokens into two blocks of W/2 tokens:
+    #   lower = mask_low(block)              # keeps slots [h*1024+0 .. +W/2-1]
+    #   upper = mask_high(block) rotate +W/2 # shifts slots [h*1024+W/2 ..] -> [h*1024+0 ..]
+    # Equivalently: lower = block * lo_mask; upper = (rotate(block, +W/2)) * lo_mask.
+    # Use a single shared lo_mask per level.
+    _W = nt_pad
+    while len(weights_blocks) < n_chunks_pow2:
+        _half = _W // 2
+        # lo_mask: 1.0 at slot[h*1024+0..half-1] for h<nH; zero elsewhere.
+        _lo_mask_slots = _attn._qkt_irp_head_mask_slots(
+            NUM_SLOTS, H, D, t_k, _half, value=1.0)
+        _lo_mask_pt = encoder.encode_double_vector(
+            ctx, _lo_mask_slots, SCALE, weights_blocks[0].chain_index())
+        _new_blocks = []
+        for _wb in weights_blocks:
+            _nom = _wb.scale()
+            # Lower half:
+            _lo = phantom.multiply_plain(ctx, _wb, _lo_mask_pt)
+            _lo = phantom.rescale_to_next(ctx, _lo)
+            _lo.set_scale(_nom)
+            # Upper half: rotate left by +_half (source slot h*1024+half lands
+            # at h*1024+0), then mask.
+            _up_rot = phantom.rotate(ctx, _wb, int(_half), galois_key)
+            _up = phantom.multiply_plain(ctx, _up_rot, _lo_mask_pt)
+            _up = phantom.rescale_to_next(ctx, _up)
+            _up.set_scale(_nom)
+            _new_blocks.append(_lo)
+            _new_blocks.append(_up)
+        weights_blocks = _new_blocks
+        _W = _half
 
-    _a_reset_slots = _dense_fhe.dense_real_base_mask_slots(
-        NUM_SLOTS, H, D, 0, P, P * n_shards, keep_value=1.0)
-    _a_mask_pt = encoder.encode_double_vector(
-        ctx, _a_reset_slots, SCALE, a_total.chain_index())
-    a_total = phantom.multiply_plain(ctx, a_total, _a_mask_pt)
-    a_total = phantom.rescale_to_next(ctx, a_total)
-    a_total.set_scale(engine.user_scale())
+    # Truncate weights_blocks to actual n_chunks_k (drop the pad-to-pow2
+    # trailing blocks; they'll be ignored in the sum_v anyway since V cache
+    # only has n_chunks_k chunks).
+    weights_blocks = weights_blocks[:n_chunks_k]
 
-    if os.environ.get("DENSE_SMX_BCAST") == "1":
-        a_bc = a_total
-        s = 1
-        while s < H:
-            rot = phantom.rotate(ctx, a_bc, -int(s), galois_key)
-            a_bc = phantom.add(ctx, a_bc, rot)
-            s <<= 1
-        a_total = a_bc
+    # ---- V cache: build n_chunks_k IRP-layout V cts (same layout as K cache).
+    v_cache_cts = []
+    for c in range(n_chunks_k):
+        v_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+        for h in range(nH):
+            base_h = h * H * t_k
+            for r in range(H):
+                base_hr = base_h + r * t_k
+                for p in range(t_k):
+                    tok_abs = c * t_k + p
+                    if tok_abs >= real_nt:
+                        break
+                    v_slots[base_hr + p] = V_full_h[tok_abs, h, r]
+        v_pt = encoder.encode_double_vector(
+            ctx, v_slots, SCALE, weights_blocks[0].chain_index())
+        v_cache_cts.append(sk.encrypt_symmetric(ctx, v_pt))
 
-    a_chain = a_total.chain_index()
-    weight_cts = []
-    for e_ct in e_cts:
-        if e_ct.chain_index() != a_chain:
-            e_ct = phantom.mod_switch_to(ctx, e_ct, a_chain)
-        wb = phantom.softmax_correct(
-            ctx, encoder, relin_key, e_ct, a_total, ITERS)
-        weight_cts.append(wb)
+    # ---- IRP-native score_times_v_irp_multi (per-chunk; sums across chunks).
+    # output_mask is applied AFTER the ct·ct multiply+rescale in
+    # score_times_v_irp, so encode at weights_chain + 1.
+    _output_mask_pt = _attn.score_v_irp_output_mask_plaintext(
+        ctx, encoder, d_head=H, d_total=D, t=t_k,
+        chain_index=weights_blocks[0].chain_index() + 1,
+        encode_scale=SCALE)
+    # Align v_cache_cts chain to weights chain.
+    _w_chain = weights_blocks[0].chain_index()
+    for _i, _v in enumerate(v_cache_cts):
+        if _v.chain_index() != _w_chain:
+            phantom.mod_switch_to_inplace(ctx, _v, _w_chain)
+    attn_h = _attn.score_times_v_irp_multi(
+        ctx, encoder, relin_key, galois_key,
+        weights_blocks, v_cache_cts,
+        d_head=H, d_total=D, t=t_k,
+        output_mask_pt=_output_mask_pt,
+        num_tokens_per_block=t_k)
 
-    # ---- score·V via the C++ kernel AS-IS (src/attention.cu:30-98). ----
-    # mask_pt: strict 0/1 at base slots tok*D+h*H of REAL tokens — the
-    # kernel masks, then negative-stride d_head//2..1 broadcasts w[tok,h]
-    # across the head block, ×V, then +d_total accumulates over the P
-    # positions (cyclic over P*D == NUM_SLOTS -> replicates to all
-    # periods), then cross-shard adds. Identical geometry to the trusted
-    # numpy oracle kv_layout_dense.dense_score_v. Per-shard mask: the
-    # kernel applies ONE mask_pt to every shard, so the mask must keep
-    # base slots for ALL P frames (real_nt guard handled by per-shard
-    # token packing — pad tokens were already zeroed upstream). Use
-    # shard_tok_start=0 + real_nt=P*n_shards so every base slot in every
-    # frame is kept (matches the oracle's per-shard mask, which keeps
-    # base[tok_local*D + h*H] for all tok_local in [0,P)).
-    sv_mask_slots = _dense_fhe.dense_real_base_mask_slots(
-        NUM_SLOTS, H, D, 0, P, P * n_shards, keep_value=1.0)
-    w_chain = weight_cts[0].chain_index()
-    sv_mask_pt = encoder.encode_double_vector(
-        ctx, sv_mask_slots, SCALE, w_chain)
-    v_cts = _dense_fhe.encrypt_k_dense_shards(
-        ctx, encoder, sk, V_full_h, real_nt, P, nH, H,
-        NUM_SLOTS, SCALE, chain_index)
-    attn_h = phantom.score_times_v(
-        ctx, relin_key, galois_key, weight_cts, v_cts,
-        sv_mask_pt, H, D, P)
-
-    # Decrypt the pre-Wo score·V output for the per-stage diagnostic.
-    _av = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, attn_h)),
-                   dtype=np.float64)
+    # Decrypt the pre-Wo score·V output for the per-stage diagnostic. The
+    # IRP layout is slot[(h*d_head + j)*t] = attn[h, j] (stride-t).
+    _av_irp = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, attn_h)),
+                       dtype=np.float64)
     fhe_attn_o = np.zeros((nH, H), dtype=np.float64)
     for h in range(nH):
-        fhe_attn_o[h, :] = _av[h * H:h * H + H]
+        for j in range(H):
+            fhe_attn_o[h, j] = _av_irp[(h * H + j) * t_k]
 
-    # ---- BSGS Wo: bsgs_matmul_preencoded, d_pad == D_TOTAL, baby_steps
-    # == _DENSE_WQ_BABY_STEPS == 64 (bsgs_required_steps(64) ⊆ provisioned
-    # -> ZERO new galois keys). score·V output is replicated-block period
-    # D_TOTAL (P*D == NUM_SLOTS makes the kernel's accumulate a full
-    # cyclic broadcast) == exactly the input layout BSGS consumes
-    # (verified: contiguous-only input -> 0.69 relrms garbage; replicated
-    # -> ~1.5e-6). Output: replicated-block period D_TOTAL. ----
-    # IRP-Wo (Cachemir §4.1). K=d²/N=512 SCPs × 512 KB = 256 MB per Wo (8×
-    # fewer SCPs than dense BSGS's 4096). SK bridges on both sides: input
-    # attn_h is already decrypted above (`_av` at the diagnostic decrypt),
-    # so the input bridge is free; the output bridge re-encrypts the IRP
-    # output back to replicated-block period D_TOTAL for downstream residual
-    # + rms2. Eliminating the bridges requires IRP'ing residual/rms2 too.
+    # ---- IRP-Wo (Cachemir §4.1). K=d²/N=512 SCPs × 512 KB = 256 MB per Wo
+    # (8× fewer SCPs than dense BSGS's 4096). Path B: input SK bridge
+    # ELIMINATED — score_times_v_irp_multi output (attn_h) is already in IRP
+    # stride-t layout (slot[i*t] = attn[i] for i = h*d_head + j), the same
+    # layout irp_matvec_host consumes. Only the output bridge remains
+    # (re-encrypt to replicated-block period D_TOTAL for downstream residual
+    # + rms2); eliminating that requires IRP'ing residual/rms2 (out of scope).
     from blocks import irp as _irp
     _BABY_STEPS_IRP_WO = 16  # M=16, G=32 for d=4096 K=512 (~sqrt(K))
-    # IRP-interleaved input: slot[i*t] = attn[i] for i in [0, D).
     t_wo = NUM_SLOTS // D                          # = 8 for D=4096
-    _attn_slots_irp = np.zeros(NUM_SLOTS, dtype=np.float64)
-    _attn_slots_irp[::t_wo][:D] = _av[:D]
-    _attn_ct_irp = sk.encrypt_symmetric(
-        ctx, encoder.encode_double_vector(
-            ctx, _attn_slots_irp, SCALE, attn_h.chain_index()))
     # Encode Wo as IRP SCPs (pass Wo.T to match irp_matvec's y = x @ M
     # convention; gives o = Wo @ attn).
     _wo_irp = _irp_cache.wo_plaintexts_cached(
@@ -1652,9 +1657,9 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         N=NUM_SLOTS, d=D, scale=SCALE, baby_steps=_BABY_STEPS_IRP_WO,
         layer_idx=layer_idx)
     _mask_pt_wo = _irp.encode_irp_mask(
-        ctx, encoder, NUM_SLOTS, D, SCALE, _attn_ct_irp.chain_index())
+        ctx, encoder, NUM_SLOTS, D, SCALE, attn_h.chain_index())
     _o_ct_irp = _irp.irp_matvec_host(
-        ctx, encoder, galois_key, _attn_ct_irp, _wo_irp,
+        ctx, encoder, galois_key, attn_h, _wo_irp,
         N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_WO,
         mask_pt=_mask_pt_wo)
     # SK bridge: IRP slot[i*t]=o[i] → replicated-block slot[k*D+j]=o[j].
