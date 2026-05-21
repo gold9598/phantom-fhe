@@ -2279,19 +2279,16 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # Lazy-level: drop the IRP-Wgate/Wup input to a deep chain so these two
         # rotation-heavy wide rect matvecs (D_MODEL×D_HIDDEN, K=2048 SCPs each —
         # the biggest matvecs in the model) run at few RNS limbs (cheap).
-        # Headroom audit: gate's output is bootstrapped (bootstrap_safe) right
-        # before silu, so it only needs to survive to chain <=15; up sits idle
-        # until the post-silu multiply (chain-aligned to silu ~chain 6→14), then
-        # h_ct is bootstrapped — so neither output has a deep downstream
-        # constraint. The matvec consumes 2 levels (sub_mask + rescale), so
-        # targeting input user_level 11 leaves both outputs at user_level 13.
-        # Binding constraint: silu tracks the gate level (its bootstrap pre-scale
-        # + Clenshaw net to the gate input chain), so the post-silu multiply with
-        # up (also ul 13) + rescale yields h_ct at ul 14 — the deepest the h_ct
-        # bootstrap_safe accepts (it must pre-scale, so needs ul < max 15). ul 12
-        # overflows h_ct to ul 15. mod_switch_to drops limbs cleanly (no added
-        # noise). Both matvecs consume the same input, so mod_switch a single
-        # shared deep copy.
+        # Headroom audit: gate AND up are refreshed together by ONE
+        # merge_bootstrap right before silu (both land at user_level ~1, fresh),
+        # so neither output has a deep downstream constraint. The matvec
+        # consumes 2 levels (sub_mask + rescale), so targeting input user_level
+        # 11 leaves both outputs at user_level 13 going into the merge. After
+        # the merge silu consumes ~7 levels (bootstrap pre-scale + Clenshaw) and
+        # up stays fresh, so the post-silu multiply aligns to silu (~ul 7→8)
+        # leaving h_ct at user_level ~9 — shallow enough that Wdown's lazy-level
+        # mod_switch handles the rest without a dedicated h-boot. Both matvecs
+        # consume the same input, so mod_switch a single shared deep copy.
         _mlp_target_ci = engine.user_level_chain_index(11)
         _x_mid_norm_deep = x_mid_norm
         if _x_mid_norm_deep.chain_index() < _mlp_target_ci:
@@ -2333,10 +2330,19 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         #    catastrophically extrapolates past the ±1.2·silu_max fit
         #    domain (silu(9.5)≈-60 vs ≈9.5), so this path MUST honor
         #    silu_t_coeffs/silu_D too. --
+        # Merge gate+up refresh into ONE bootstrap (same cost as one). This
+        # makes _up_ct fresh too, so the post-silu multiply lands h_ct shallow
+        # enough to skip the h-boot. max_abs must bound BOTH gate and up; both
+        # bounds are taken raw (no double BOOT_CALIB_MARGIN) to match the
+        # previous gate-boot which used max_abs=silu_max (raw gate).
+        _up_bound = (max_abs_calib.get("up", silu_max) / BOOT_CALIB_MARGIN
+                     if max_abs_calib else silu_max)
+        _merge_max_abs = max(silu_max, _up_bound)
+        _gate_ct, _up_ct = merge_bootstrap(
+            engine, ctx, encoder, _gate_ct, _up_ct,
+            max_abs=_merge_max_abs, slot_count=NUM_SLOTS, galois_key=galois_key)
         if silu_t_coeffs is not None and silu_D is not None:
             from blocks.silu import silu_cheb_bsgs
-            _gate_ct = bootstrap_safe(engine, ctx, encoder, _gate_ct,
-                                      max_abs=silu_max, slot_count=NUM_SLOTS)
             _silu_ct = silu_cheb_bsgs(
                 engine, ctx, encoder, relin_key, _gate_ct,
                 silu_D, silu_t_coeffs, NUM_SLOTS,
@@ -2359,10 +2365,10 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         _h_ct = phantom.rescale_to_next(ctx, _h_ct)
         _h_ct.set_scale(SCALE)
 
-        # -- bootstrap h to refresh chain (before down-proj) --
-        _h_calib = max_abs_calib.get("h", 1.26) if max_abs_calib else 1.26
-        _h_ct = bootstrap_safe(engine, ctx, encoder, _h_ct,
-                               max_abs=_h_calib, slot_count=NUM_SLOTS)
+        # h-boot eliminated: merge_bootstrap above made _up_ct fresh, so the
+        # post-silu multiply (silu @ ~7 * up @ fresh) aligns to ~7, leaving
+        # _h_ct shallow enough that Wdown's lazy-level mod_switch handles the
+        # rest without a dedicated bootstrap.
 
         # -- Wdown (tall rect IRP matvec — needs BOTH sub_mask and input_mask) --
         # Lazy-level: drop the IRP-Wdown input to a deep chain so the
