@@ -917,3 +917,99 @@ def extract_real_imag_pair(ctx, encoder, galois_key, ct_complex,
     ct_im = phantom.rescale_to_next(ctx, ct_im)
     ct_im.set_scale(user_scale)
     return ct_re, ct_im
+
+
+# ===========================================================================
+# Complex-folded SQUARE IRP (Phase-1 optimization)
+# ===========================================================================
+#
+# The square IRP plaintexts waste the imaginary half of every complex SCP
+# (real weight cast to complex with imag = 0).  For a square d x d matvec
+# y = x @ M with REAL encrypted x, fold the OUTPUT columns into the imaginary
+# part:
+#
+#     M_fold[k, c] = M[k, c] + 1j * M[k, c + d/2]    for c in [0, d/2)
+#
+# M_fold is a TALL rect (d_in = d > d_out = d/2).  Because x is real and the
+# IRP rotations + multiply-accumulate + reduce are all C-linear, the folded
+# matvec produces a complex result whose stride-t' slots carry
+#
+#     real(y_fold[c]) = (x @ M)[c]
+#     imag(y_fold[c]) = (x @ M)[c + d/2]      for c in [0, d/2).
+#
+# This rides the EXISTING tall-rect machinery: the d x (d/2) tall matrix
+# decomposes into alpha = 2 square sub-IRPs of dim d/2, so the total SCP
+# count is alpha * (d/2)^2 / N = d^2 / (2N) = K_square / 2.  HALVED disk
+# cache, encode time, and ct*pt multiplies.
+#
+# Recovery (length-d y) costs ONE conjugation (the step-0 galois key) plus
+# one chain level (the 0.5 / -0.5i multiply), exactly like merge_bootstrap.
+
+def encode_irp_diagonals_folded_host(
+    ctx,
+    encoder,
+    matrix: np.ndarray,
+    N: int,
+    d: int,
+    scale: float,
+    baby_steps: int = 1,
+) -> List:
+    """Encode a square (d x d) REAL weight into K/2 complex IRP SCPs.
+
+    Folds the output columns: M_fold[:, c] = M[:, c] + 1j*M[:, c + d/2] for
+    c in [0, d/2).  M_fold is a (d, d/2) tall rect encoded via the existing
+    tall-rect host machinery (alpha = 2 square sub-IRPs of dim d/2).
+
+    Returns alpha * (d/2)^2 / N = d^2/(2N) SCPs (HALF of the square count).
+    Consume with `irp_matvec_folded_host` + `extract_real_imag_pair`.
+    """
+    if not isinstance(matrix, np.ndarray):
+        matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape != (d, d):
+        raise ValueError(f"encode_irp_diagonals_folded_host: matrix must be "
+                         f"({d}, {d}), got {matrix.shape}")
+    if d % 2 != 0:
+        raise ValueError(f"encode_irp_diagonals_folded_host: d must be even, got {d}")
+    d_out = d // 2
+    # Square sub-IRP at dim d_out must satisfy d_out^2 % N == 0.
+    if (d_out * d_out) % N != 0:
+        raise ValueError(f"encode_irp_diagonals_folded_host: (d/2)^2={d_out*d_out} "
+                         f"must be divisible by N={N} (fold needs K_sub = (d/2)^2/N >= 1)")
+    M_fold = matrix[:, :d_out] + 1j * matrix[:, d_out:]
+    return encode_irp_diagonals_rect_host(
+        ctx, encoder, M_fold, N=N, d_in=d, d_out=d_out,
+        scale=scale, baby_steps=baby_steps,
+    )
+
+
+def irp_matvec_folded_host(
+    ctx,
+    encoder,
+    gk,
+    ct_in,
+    plaintexts: List,
+    N: int,
+    d: int,
+    baby_steps: int = 1,
+    sub_mask_pt=None,
+    input_mask_pt=None,
+) -> "phantom.ciphertext":
+    """Run the complex-folded square IRP matvec (tall-rect under the hood).
+
+    `ct_in` must be encrypted in the TALL-rect permuted layout for
+    (d_in=d, d_out=d/2) -- use `encrypt_irp_input_rect(..., d_in=d, d_out=d/2)`.
+    `plaintexts` come from `encode_irp_diagonals_folded_host`.  Returns a
+    COMPLEX ciphertext in stride-t' (t' = N/(d/2*... )) layout: slot c*t holds
+    (x@M)[c] + 1j*(x@M)[c+d/2] for c in [0, d/2).  Split with
+    `extract_real_imag_pair` -> ct_re = (x@M)[:d/2], ct_im = (x@M)[d/2:].
+
+    sub_mask_pt / input_mask_pt: tall-rect masks (encode at dim d/2).
+    """
+    if d % 2 != 0:
+        raise ValueError(f"irp_matvec_folded_host: d must be even, got {d}")
+    d_out = d // 2
+    return irp_matvec_rect_host(
+        ctx, encoder, gk, ct_in, plaintexts,
+        N=N, d_in=d, d_out=d_out, baby_steps=baby_steps,
+        sub_mask_pt=sub_mask_pt, input_mask_pt=input_mask_pt,
+    )
