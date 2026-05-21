@@ -2097,6 +2097,50 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             break
         t_layer_start = time.perf_counter()
         _t_wait = 0.0  # PERF_BREAKDOWN: default 0 when queue.get is not hit
+        # ---- 1-layer-ahead prefetch (latency-only; never a correctness dep) --
+        # The 32-layer warm run is I/O-bound: each layer cold-reads ~1.6 GB of
+        # IRP SCP blobs + ~1.4 GB of fp64 weights from a 57 GB cache (> RAM →
+        # page-cache thrash), adding ~4.6 s/layer of disk read on top of ~5.9 s
+        # compute. Background-LOAD the NEXT layer's 5 IRP blobs + numpy weights
+        # (encoder-FREE: mmap + scp_from_bytes + np.load only — the encoder's
+        # expand happens later, per-matvec, ON THIS MAIN THREAD) so the next
+        # layer's read overlaps this layer's GPU compute. The wrappers
+        # (*_plaintexts_cached / get_layer_weights) await the pending future or
+        # fall back to a synchronous load on a RAM miss, so a skipped/failed
+        # prefetch only costs latency, never correctness. Cold MISS (no blob)
+        # is left to the synchronous encode path — never threaded.
+        _next_li = layer_idx + 1
+        _do_prefetch_next = (_next_li < NUM_DECODERS and
+                             (max_layer is None or _next_li <= max_layer))
+        # Prefetch constants mirror the actual call sites exactly:
+        #   Wq/Wo: d=D_TOTAL(=4096), baby_steps=16 (fhe_attention_dense_full)
+        #   MLP  : d_in=D_MODEL, d_out=16384, baby_steps=_BABY_STEPS_IRP_MLP_RECT=16
+        _PF_BABY_ATTN = 16
+        _PF_BABY_MLP = 16
+        _PF_MLP_DIN = D_MODEL
+        _PF_MLP_DOUT = 16384
+        if _do_prefetch_next:
+            _irp_cache.prefetch_layer(
+                _next_li, P_local=P_local, d=D_TOTAL,
+                mlp_d_in=_PF_MLP_DIN, mlp_d_out=_PF_MLP_DOUT,
+                scale=SCALE, baby_steps_attn=_PF_BABY_ATTN,
+                baby_steps_mlp=_PF_BABY_MLP)
+            _irp_cache.prefetch_layer_weights(
+                _next_li, ("Wo",), load_layer_weights_subset)
+            # NOTE: no numpy prefetch for (Wgate, Wup, Wdown) — those are now
+            # LAZY (passed as 0-arg loaders to the IRP cache wrappers). On a
+            # warm run the SCP blobs hit and the loaders never fire, so a
+            # background numpy prefetch would only re-introduce the ~1.4 GB/
+            # layer of WASTED I/O this change exists to eliminate. The
+            # IRP-SCP prefetch above (prefetch_layer) is what overlaps the
+            # real reads with compute.
+        # Trim RAM entries for layers older than the current one (the LRU bound
+        # already caps memory; this keeps only current + next layer resident).
+        _irp_cache.evict_layers_before(
+            layer_idx, P_local=P_local, d=D_TOTAL,
+            mlp_d_in=_PF_MLP_DIN, mlp_d_out=_PF_MLP_DOUT,
+            scale=SCALE, baby_steps_attn=_PF_BABY_ATTN,
+            baby_steps_mlp=_PF_BABY_MLP)
         verbose = (debug_layer is not None and layer_idx == debug_layer)
         # DIAGNOSTIC ONLY: tag stage dumps with the current layer so the
         # offline rel-RMS harness can pick the right file. No-op when
@@ -2313,8 +2357,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         _K = apply_rope_np(_K, cos_all, sin_all)
         _K_h = np.repeat(_K, N_KV_GROUPS, axis=1)[:_real_nt_g]
         _xn_q = _xn[P_local]
-        _Wo = load_layer_weights_subset(
-            layer_idx, keys=("Wo",))["Wo"]
+        _Wo = _irp_cache.get_layer_weights(
+            layer_idx, ("Wo",), load_layer_weights_subset)["Wo"]
         _V = (_xn @ _Wv.T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
         _V_h = np.repeat(_V, N_KV_GROUPS, axis=1)[:_real_nt_g]
         _fres = fhe_attention_dense_full(
@@ -2355,24 +2399,47 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         _D_PAD_OUT_MLP = 16384  # D_HIDDEN=14336 padded to pow-2 multiple of D_MODEL (α=4)
 
         # Wgate/Wup/Wdown are R_P-independent and may not be in w's hot
-        # subset (same situation as Wo) — load via subset loader.
-        _mlp_ws = load_layer_weights_subset(
-            layer_idx, keys=("Wgate", "Wup", "Wdown"))
-        _Wgate = np.asarray(_mlp_ws["Wgate"], dtype=np.float64)  # (D_HIDDEN, D_MODEL)
-        _Wup   = np.asarray(_mlp_ws["Wup"],   dtype=np.float64)  # (D_HIDDEN, D_MODEL)
-        _Wdown = np.asarray(_mlp_ws["Wdown"], dtype=np.float64)  # (D_MODEL,  D_HIDDEN)
-
+        # subset (same situation as Wo). They are LAZY: the ~1.4 GB fp64 load +
+        # zero-pad below is wrapped in 0-arg callables and passed straight to
+        # the IRP cache wrappers. On a WARM run the SCP blobs hit on disk, the
+        # wrappers return the cached SCPs WITHOUT calling the loader, and the
+        # big numpy load/pad never fires — dropping ~1.4 GB/layer of wasted I/O
+        # so the prefetch can finally hide the IRP-only reads. On a COLD MISS
+        # the three loaders share ONE memoized subset load (so a triple-miss
+        # reads the weights off disk once, not 3×).
+        #
         # Convention: irp_matvec_rect_host computes y = x @ M.
-        # For Wgate/Wup we want gate = x @ Wgate.T → pass M = Wgate.T
-        # padded to (D_MODEL, D_PAD_OUT) with trailing (D_PAD_OUT-D_HIDDEN)
-        # columns zero. Wdown.T padded to (D_PAD_OUT, D_MODEL) with
-        # trailing rows zero.
-        _Wgate_padded = np.zeros((D_MODEL, _D_PAD_OUT_MLP), dtype=np.float64)
-        _Wgate_padded[:, :D_HIDDEN] = _Wgate.T
-        _Wup_padded = np.zeros((D_MODEL, _D_PAD_OUT_MLP), dtype=np.float64)
-        _Wup_padded[:, :D_HIDDEN] = _Wup.T
-        _Wdown_padded = np.zeros((_D_PAD_OUT_MLP, D_MODEL), dtype=np.float64)
-        _Wdown_padded[:D_HIDDEN, :] = _Wdown.T
+        # For Wgate/Wup we want gate = x @ Wgate.T → M = Wgate.T padded to
+        # (D_MODEL, D_PAD_OUT) with trailing columns zero. Wdown.T padded to
+        # (D_PAD_OUT, D_MODEL) with trailing rows zero.
+        _mlp_ws_cache = {}
+
+        def _load_mlp_subset():
+            # COLD-MISS ONLY: load (Wgate, Wup, Wdown) once, memoized so the
+            # three lazy loaders below share a single ~1.4 GB disk read.
+            if not _mlp_ws_cache:
+                _mlp_ws_cache.update(_irp_cache.get_layer_weights(
+                    layer_idx, ("Wgate", "Wup", "Wdown"),
+                    load_layer_weights_subset))
+            return _mlp_ws_cache
+
+        def _load_gate_padded():
+            _Wgate = np.asarray(_load_mlp_subset()["Wgate"], dtype=np.float64)
+            p = np.zeros((D_MODEL, _D_PAD_OUT_MLP), dtype=np.float64)
+            p[:, :D_HIDDEN] = _Wgate.T
+            return p
+
+        def _load_up_padded():
+            _Wup = np.asarray(_load_mlp_subset()["Wup"], dtype=np.float64)
+            p = np.zeros((D_MODEL, _D_PAD_OUT_MLP), dtype=np.float64)
+            p[:, :D_HIDDEN] = _Wup.T
+            return p
+
+        def _load_down_padded():
+            _Wdown = np.asarray(_load_mlp_subset()["Wdown"], dtype=np.float64)
+            p = np.zeros((_D_PAD_OUT_MLP, D_MODEL), dtype=np.float64)
+            p[:D_HIDDEN, :] = _Wdown.T
+            return p
 
         # Encode IRP-rect SCPs. Wgate/Wup are WIDE (d_in=D_MODEL < d_out=D_PAD_OUT).
         # They are complex output-FOLDED (K/2 SCPs each): the folded matvec
@@ -2384,15 +2451,15 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # wrapper) → mlp_out comes out NATURAL order, no un-permute.
         _D_OUT_FOLD_MLP = _D_PAD_OUT_MLP // 2  # 8192
         _gate_irp = _irp_cache.gate_plaintexts_cached(
-            ctx, encoder, _Wgate_padded, N=NUM_SLOTS,
+            ctx, encoder, _load_gate_padded, N=NUM_SLOTS,
             d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
         _up_irp = _irp_cache.up_plaintexts_cached(
-            ctx, encoder, _Wup_padded, N=NUM_SLOTS,
+            ctx, encoder, _load_up_padded, N=NUM_SLOTS,
             d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
         _down_irp = _irp_cache.down_plaintexts_cached(
-            ctx, encoder, _Wdown_padded, N=NUM_SLOTS,
+            ctx, encoder, _load_down_padded, N=NUM_SLOTS,
             d_in=_D_PAD_OUT_MLP, d_out=D_MODEL, scale=SCALE,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx,
             gate_up_d_in=D_MODEL, gate_up_d_out=_D_PAD_OUT_MLP)
