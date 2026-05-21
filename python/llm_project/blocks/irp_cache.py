@@ -210,20 +210,34 @@ def up_plaintexts_cached(ctx, encoder, Wup_padded, N, d_in, d_out, scale,
 
 def down_plaintexts_cached(ctx, encoder, Wdown_padded, N, d_in, d_out, scale,
                             baby_steps, layer_idx, gate_up_d_in, gate_up_d_out):
-    """Wdown (padded tall) -> UNFOLDED IRP-rect SCPs, rows ROW-PERMUTED to
-    absorb the gate/up interleave layout.
+    """Wdown (padded tall) -> complex output-FOLDED IRP-rect SCPs (K/2), rows
+    ROW-PERMUTED to absorb the gate/up interleave layout.
 
-    The MLP fold path feeds Wdown an interleaved-layout input produced by
-    interleave_recombine on the gate/up folded matvecs of dims
-    (gate_up_d_in, gate_up_d_out). interleave_output_order returns the row
-    permutation that makes this tall matvec consume the interleaved layout and
-    emit NATURAL order (no un-permute). `_perm` key tag keeps it distinct from
-    the old naturally-ordered down blob.
+    Two orthogonal transforms compose on Wdown:
+      ROWS (d_in=16384): interleave_output_order absorbs the gate/up interleave
+        layout — the folded TALL matvec consumes the interleaved h and emits
+        the gate/up-natural output order. Applied first.
+      COLUMNS (d_out=4096): encode_irp_diagonals_rect_folded_host folds the
+        output columns into the imaginary part (K=2048→1024 SCPs, the biggest
+        remaining fold). The matvec emits a complex ct split downstream by
+        extract_real_imag_pair; the output SK bridge recombines to natural
+        order in numpy and re-encrypts for residual2.
+
+    Rows and columns are independent, so row-permute THEN column-fold gives
+    h_il @ fold(Wdown_perm) == h @ Wdown (validated max|err| 1.7e-13). `_fold`
+    key tag keeps the halved blobs distinct from the stale unfolded `_perm` blob.
+
+    NOTE: the FOLDED matvec runs the rect machinery at d_out_fold = d_out/2,
+    so it consumes its input in the TALL layout for (d_in, d_out/2) — a FINER
+    permutation than the unfolded (d_in, d_out) layout. The row permutation
+    that absorbs the interleave must therefore be computed against the FOLDED
+    output dim d_out//2, not d_out (the unfolded d_out gives a layout mismatch
+    that blows up the recombine).
     """
     order = _irp.interleave_output_order(
-        N, gate_up_d_in, gate_up_d_out, down_d_in=d_in, down_d_out=d_out)
+        N, gate_up_d_in, gate_up_d_out, down_d_in=d_in, down_d_out=d_out // 2)
     Wdown_perm = Wdown_padded[order, :]
-    key = (f"down_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}_perm"
+    key = (f"down_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}_fold"
            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
-    return _cached_rect(key, ctx, encoder, Wdown_perm, N, d_in, d_out,
-                        scale, baby_steps)
+    return _cached_rect_folded(key, ctx, encoder, Wdown_perm, N, d_in, d_out,
+                               scale, baby_steps)

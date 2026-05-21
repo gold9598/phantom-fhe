@@ -396,12 +396,24 @@ def build_user_steps_mrpc():
     irp_fold_recombine_steps = [
         (NUM_SLOTS - _t_fold // 2) % NUM_SLOTS,  # interleave right-rotate
     ]
+    # MLP Wdown is now complex output-FOLDED too (d_out 4096 → d_out_fold 2048,
+    # the biggest remaining tall fold). The folded TALL matvec runs the rect
+    # machinery at d_out_fold = D_MODEL/2 (alpha doubles 4→8), needing finer
+    # input-alignment / reduce rotations than the unfolded (D_PAD_OUT, D_MODEL)
+    # tall path. The output is split by extract_real_imag_pair (conj step 0,
+    # auto-generated — NOT added) and bridged out (decrypt + numpy recombine +
+    # re-encrypt), so no interleave-recombine rotation here.
+    _D_OUT_FOLD_DOWN = D_MODEL // 2  # 2048
+    irp_rect_tall_fold_steps = list(_irp.irp_required_steps_rect(
+        NUM_SLOTS, _D_PAD_OUT_MLP, _D_OUT_FOLD_DOWN,
+        baby_steps=_BABY_STEPS_IRP_MLP_RECT))
 
     user_steps = sorted(set(
         rms_steps + bsgs_steps + qkt_steps + smx_steps
         + score_v_steps + bcast_steps + irp_steps + sdpa_steps
         + irp_rect_wide_steps + irp_rect_tall_steps
         + irp_rect_fold_steps + irp_fold_recombine_steps
+        + irp_rect_tall_fold_steps
     ))
     # Chain-depth buckets (dense pipeline trace, restarts at 16 each
     # bootstrap): BSGS Wq + compute_qkt inner-sum fire post-bootstrap at
@@ -2411,36 +2423,67 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # _h_ct shallow enough that Wdown's lazy-level mod_switch handles the
         # rest without a dedicated bootstrap.
 
-        # -- Wdown (tall rect IRP matvec — needs BOTH sub_mask and input_mask) --
+        # -- Wdown (tall rect IRP matvec — COMPLEX OUTPUT-FOLDED, K=2048→1024
+        #    SCPs, the biggest remaining tall fold) --
+        # The folded matvec runs the rect machinery at d_out_fold = D_MODEL/2,
+        # so it consumes its input in the TALL layout for (D_PAD_OUT, D_MODEL/2)
+        # — the row-permutation absorbing the gate/up interleave is computed at
+        # this folded dim in the cache wrapper (down_plaintexts_cached). Masks
+        # are therefore encoded at the FOLDED dims (d_in=D_PAD_OUT,
+        # d_out=D_MODEL/2): tall path needs sub_mask_pt (at chain+1) AND
+        # input_mask_pt (square mask at d=d_out_fold).
         # Lazy-level: drop the IRP-Wdown input to a deep chain so the
         # rotation-heavy tall rect matvec runs at few RNS limbs (cheap).
-        # Headroom audit: Wdown consumes ~2 levels (input_mask + sub_mask),
-        # then a rescale (+1), then residual2 (chain-aligning, 0 levels). The
-        # resulting y_ct is discarded — the next layer re-encrypts fresh — so
-        # there is no downstream bootstrap-with-scaling constraint. Targeting
-        # input user_level 10 leaves the output at user_level ~13 (< max 15)
-        # before residual2. mod_switch_to drops limbs cleanly (no added noise).
+        # Headroom audit: the folded matvec consumes ~2 levels (input_mask +
+        # sub_mask), a rescale (+1), then extract_real_imag_pair (+1 for the
+        # conj-split multiply) — one more level than the old unfolded path. The
+        # split halves are then DECRYPTED by the output SK bridge (the result
+        # is decrypted for residual2 anyway), recombined to natural order in
+        # numpy, and RE-ENCRYPTED fresh, so downstream is unaffected. Targeting
+        # input user_level 10 leaves the pre-decrypt cts at user_level ~12-13
+        # (< max 15). mod_switch_to drops limbs cleanly (no added noise).
+        _D_OUT_FOLD_DOWN = D_MODEL // 2  # 2048
         _wdown_target_ci = engine.user_level_chain_index(10)
         if _h_ct.chain_index() < _wdown_target_ci:
             _h_ct = phantom.mod_switch_to(ctx, _h_ct, _wdown_target_ci)
         _input_mask_down = _irp_mlp.encode_irp_mask(
-            ctx, encoder, N=NUM_SLOTS, d=D_MODEL, scale=SCALE,
+            ctx, encoder, N=NUM_SLOTS, d=_D_OUT_FOLD_DOWN, scale=SCALE,
             chain_index=_h_ct.chain_index())
         _sub_mask_down = _irp_mlp.encode_irp_mask_rect(
-            ctx, encoder, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=D_MODEL,
+            ctx, encoder, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=_D_OUT_FOLD_DOWN,
             scale=SCALE, chain_index=_h_ct.chain_index() + 1)
-        mlp_out = _irp_mlp.irp_matvec_rect_host(
+        _mlp_complex = _irp_mlp.irp_matvec_rect_folded_host(
             ctx, encoder, galois_key, _h_ct, _down_irp,
             N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=D_MODEL,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT,
             sub_mask_pt=_sub_mask_down,
             input_mask_pt=_input_mask_down)
-        # Snap SCALE^2 → SCALE (same as gate/up above) so residual sees
-        # canonical scale matching x_mid_ct.
-        mlp_out = phantom.rescale_to_next(ctx, mlp_out)
-        mlp_out.set_scale(SCALE)
+        # Snap SCALE^2 → SCALE before the conj-split (pipeline convention).
+        _mlp_complex = phantom.rescale_to_next(ctx, _mlp_complex)
+        _mlp_complex.set_scale(SCALE)
+        _mlp_re, _mlp_im = _irp_mlp.extract_real_imag_pair(
+            ctx, encoder, galois_key, _mlp_complex, NUM_SLOTS, SCALE)
+        # -- OUTPUT SK BRIDGE: decrypt both halves, recombine to natural order
+        #    in numpy (free + legitimate — mlp_out is decrypted anyway), then
+        #    re-encrypt fresh in the stride-T_MODEL layout residual2's other
+        #    operand (x_mid_ct) uses. This near-lossless bridge also refreshes
+        #    the chain. The TALL fold decode (real=out[:d/2], imag=out[d/2:])
+        #    mirrors /tmp/irp_rect_fold_fhe_test.py's _folded reader. --
+        _dec_re = np.asarray(encoder.decode_double_vector(
+            ctx, sk.decrypt(ctx, _mlp_re)), dtype=np.float64)
+        _dec_im = np.asarray(encoder.decode_double_vector(
+            ctx, sk.decrypt(ctx, _mlp_im)), dtype=np.float64)
+        _y_lo = _irp_mlp.decode_irp_output_rect(
+            _dec_re, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=_D_OUT_FOLD_DOWN)
+        _y_hi = _irp_mlp.decode_irp_output_rect(
+            _dec_im, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=_D_OUT_FOLD_DOWN)
+        _mlp_natural = np.concatenate([_y_lo, _y_hi])  # natural order, length D_MODEL
+        _mlp_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+        _mlp_slots[::T_MODEL][:D_MODEL] = _mlp_natural
+        mlp_out = sk.encrypt_symmetric(
+            ctx, encoder.encode_double_vector(ctx, _mlp_slots, SCALE, fresh_ci))
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
-        # residual2
+        # residual2 (both operands now natural stride-T_MODEL at fresh_ci)
         y_ct = residual(ctx, x_mid_ct, mlp_out)
         if verbose: _probe("post-residual2 y_ct", ctx, encoder, sk, y_ct)
         layer_ms = (time.perf_counter() - t_layer_start) * 1000
