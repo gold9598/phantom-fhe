@@ -166,20 +166,43 @@ def _cached_rect_folded(key, ctx, encoder, matrix, N, d_in, d_out, scale,
     return pts
 
 
+def _cached_square_folded(key, ctx, encoder, matrix, N, d, scale, baby_steps):
+    """Cache wrapper for the complex output-folded SQUARE encoding (K/2 SCPs).
+
+    Folds the output columns of a d×d weight into the imaginary part
+    (d×d → d×(d/2) tall rect), halving the SCP count. Consume with
+    irp_matvec_folded_host + extract_real_imag_pair.
+    """
+    path = _blob_path(key)
+    if _has_blob(path):
+        return _load_blob(path)
+    pts = _irp.encode_irp_diagonals_folded_host(
+        ctx, encoder, matrix, N=N, d=d, scale=scale, baby_steps=baby_steps)
+    _save_blob(path, pts)
+    return pts
+
+
 def wq_plaintexts_cached(ctx, encoder, Wq_baked_T, N, d, scale, baby_steps,
                           layer_idx, P_local):
-    """Wq_baked.T (R_P-baked, transposed) -> IRP SCPs. Key includes P_local."""
-    key = (f"wq_L{int(layer_idx)}_q{int(P_local)}_d{int(d)}"
+    """Wq_baked.T (R_P-baked, transposed) -> complex output-FOLDED IRP SCPs
+    (K/2). Key includes P_local. `_fold` tag keeps the halved blobs distinct
+    from stale unfolded ones. Consume with irp_matvec_folded_host +
+    extract_real_imag_pair."""
+    key = (f"wq_L{int(layer_idx)}_q{int(P_local)}_d{int(d)}_fold"
            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
-    return _cached_square(key, ctx, encoder, Wq_baked_T, N, d, scale, baby_steps)
+    return _cached_square_folded(key, ctx, encoder, Wq_baked_T, N, d, scale,
+                                 baby_steps)
 
 
 def wo_plaintexts_cached(ctx, encoder, Wo_T, N, d, scale, baby_steps,
                           layer_idx):
-    """Wo.T -> IRP SCPs. R_P-independent, layer-keyed only."""
-    key = (f"wo_L{int(layer_idx)}_d{int(d)}"
+    """Wo.T -> complex output-FOLDED IRP SCPs (K/2). R_P-independent,
+    layer-keyed only. `_fold` tag keeps the halved blobs distinct from stale
+    unfolded ones. Consume with irp_matvec_folded_host + extract_real_imag_pair."""
+    key = (f"wo_L{int(layer_idx)}_d{int(d)}_fold"
            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
-    return _cached_square(key, ctx, encoder, Wo_T, N, d, scale, baby_steps)
+    return _cached_square_folded(key, ctx, encoder, Wo_T, N, d, scale,
+                                 baby_steps)
 
 
 def gate_plaintexts_cached(ctx, encoder, Wgate_padded, N, d_in, d_out, scale,

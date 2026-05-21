@@ -407,13 +407,22 @@ def build_user_steps_mrpc():
     irp_rect_tall_fold_steps = list(_irp.irp_required_steps_rect(
         NUM_SLOTS, _D_PAD_OUT_MLP, _D_OUT_FOLD_DOWN,
         baby_steps=_BABY_STEPS_IRP_MLP_RECT))
+    # Wq + Wo are now complex output-FOLDED SQUARE matvecs (d=D_TOTAL,
+    # d_out_fold = D_TOTAL/2, K=512→256 SCPs each). The folded square matvec
+    # runs the TALL-rect machinery at (d_in=D_TOTAL, d_out=D_TOTAL/2, alpha=2),
+    # then extract_real_imag_pair (conj step 0, auto-generated — NOT added) and
+    # an output SK bridge (decrypt + numpy recombine + re-encrypt). The rect
+    # steps here are already a subset of the square IRP set (verified empty
+    # diff), but provision them explicitly so the keys survive a dim change.
+    irp_sq_fold_steps = list(_irp.irp_required_steps_rect(
+        NUM_SLOTS, D_TOTAL, D_TOTAL // 2, baby_steps=_BABY_STEPS_IRP))
 
     user_steps = sorted(set(
         rms_steps + bsgs_steps + qkt_steps + smx_steps
         + score_v_steps + bcast_steps + irp_steps + sdpa_steps
         + irp_rect_wide_steps + irp_rect_tall_steps
         + irp_rect_fold_steps + irp_fold_recombine_steps
-        + irp_rect_tall_fold_steps
+        + irp_rect_tall_fold_steps + irp_sq_fold_steps
     ))
     # Chain-depth buckets (dense pipeline trace, restarts at 16 each
     # bootstrap): BSGS Wq + compute_qkt inner-sum fire post-bootstrap at
@@ -1350,37 +1359,77 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # stride-t layout (slot[i*t]=q[i]) — directly consumed by compute_qkt_irp.
     from blocks import irp as _irp
     _BABY_STEPS_IRP_Q = 16  # M=16, G=32 for d=4096 K=512 (~sqrt(K))
+    # COMPLEX OUTPUT-FOLDED Wq (K=512→256 SCPs, the cleanest square fold).
+    # encode_irp_diagonals_folded_host folds the output columns into the imag
+    # part (d×d → d×(d/2) tall rect, alpha=2), so the folded matvec runs the
+    # tall-rect machinery at d_out_fold = D/2 and consumes its input in the
+    # TALL layout for (d_in=D, d_out=D/2). The result is a complex ct split by
+    # extract_real_imag_pair, then SK-bridged: decrypt both halves, recombine
+    # to natural length-D q in numpy, re-encrypt FRESH in the stride-t_k
+    # layout compute_qkt_irp consumes (slot[i*t_k]=q[i]). The bridge is
+    # near-lossless and refreshes the chain (q enters compute_qkt_irp fresh,
+    # giving the Stage-A bootstrap maximum headroom — strictly safer than the
+    # old lazy-leveled q).
+    _D_OUT_FOLD_Q = D // 2  # 2048
     wq_irp = _irp_cache.wq_plaintexts_cached(
         ctx, encoder,
         np.ascontiguousarray(np.asarray(Wq_baked, dtype=np.float64).T),
         N=NUM_SLOTS, d=D, scale=SCALE, baby_steps=_BABY_STEPS_IRP_Q,
         layer_idx=layer_idx, P_local=P_local)
-    x_irp_ct = _irp.encrypt_irp_input(
+    # Folded input: permuted TALL layout for (d_in=D, d_out=D/2).
+    x_irp_ct = _irp.encrypt_irp_input_rect(
         ctx, encoder, sk, np.asarray(xn_query, dtype=np.float64),
-        N=NUM_SLOTS, d=D, scale=SCALE, chain_index=chain_index)
-    # Lazy-level: drop the IRP-Wq input to a deep chain so the rotation-heavy
-    # matvec (~48 keyswitches) runs at few RNS limbs (cheap). Headroom audit:
-    # downstream (compute_qkt_irp + tree-agg + Stage-A sub) consumes 4 user
-    # levels before the Stage-A bootstrap, which pre-scales (1 level) and so
-    # must enter at user_level < max_user_level (15). Targeting input
-    # user_level 9 leaves the Stage-A bootstrap at user_level 13 (2-level
-    # margin). mod_switch_to drops limbs cleanly (no added noise).
+        N=NUM_SLOTS, d_in=D, d_out=_D_OUT_FOLD_Q, scale=SCALE,
+        chain_index=chain_index)
+    # Lazy-level: drop the folded-IRP input to a deep chain so the rotation-
+    # heavy matvec runs at few RNS limbs (cheap). The folded matvec + conj-
+    # split consumes ~1 extra level vs the unfolded path, but the output is
+    # immediately SK-bridged (decrypt + re-encrypt fresh below), so there is
+    # no downstream bootstrap-with-scaling constraint on these cts — only the
+    # matvec's own ~2-3 levels matter. Target input user_level 9 leaves the
+    # pre-decrypt cts at user_level ~12-13 (< max). mod_switch_to drops limbs
+    # cleanly (no added noise). Tall masks at the FOLDED dim d_out=D/2:
+    # input_mask (square at d=D/2, at input chain) + sub_mask (rect at chain+1).
     _wq_target_ci = engine.user_level_chain_index(9)
     if x_irp_ct.chain_index() < _wq_target_ci:
         x_irp_ct = phantom.mod_switch_to(ctx, x_irp_ct, _wq_target_ci)
-    mask_pt_q = _irp.encode_irp_mask(
-        ctx, encoder, NUM_SLOTS, D, SCALE, x_irp_ct.chain_index())
-    q_irp_ct = _irp.irp_matvec_host(
+    _input_mask_q = _irp.encode_irp_mask(
+        ctx, encoder, NUM_SLOTS, _D_OUT_FOLD_Q, SCALE, x_irp_ct.chain_index())
+    _sub_mask_q = _irp.encode_irp_mask_rect(
+        ctx, encoder, NUM_SLOTS, D, _D_OUT_FOLD_Q, SCALE,
+        x_irp_ct.chain_index() + 1)
+    _q_complex = _irp.irp_matvec_folded_host(
         ctx, encoder, galois_key, x_irp_ct, wq_irp,
-        N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_Q, mask_pt=mask_pt_q)
-    # Snap scale SCALE^2 → SCALE (irp_matvec_host's mask leaves ct at SCALE^2;
-    # compute_qkt_irp needs q at canonical scale).
-    q_irp_ct = phantom.rescale_to_next(ctx, q_irp_ct)
-    q_irp_ct.set_scale(SCALE)
-    # Wq output bootstrap removed: chain audit showed QKT+tree-agg+Stage-A-sub
-    # only reaches user_level 3 before the Stage A bootstrap refreshes; the
-    # Wq-output bootstrap (fired at user_level 2) was redundant. Saves ~170ms.
-    q_ct = q_irp_ct
+        N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_Q,
+        sub_mask_pt=_sub_mask_q, input_mask_pt=_input_mask_q)
+    # Snap SCALE^2 → SCALE before the conj-split (pipeline convention).
+    _q_complex = phantom.rescale_to_next(ctx, _q_complex)
+    _q_complex.set_scale(SCALE)
+    _q_re, _q_im = _irp.extract_real_imag_pair(
+        ctx, encoder, galois_key, _q_complex, NUM_SLOTS, SCALE)
+    # OUTPUT SK BRIDGE: decrypt both halves, recombine to natural length-D q
+    # in numpy (TALL fold decode: real=q[:D/2], imag=q[D/2:]), then re-encrypt
+    # in the stride-t_k layout compute_qkt_irp consumes (slot[i*t_k]=q[i]).
+    # CRITICAL: re-encrypt at the SAME chain the OLD unfolded path produced
+    # (user_level 11 = input ul9 + matvec mask rescale +1 + the external
+    # SCALE^2→SCALE rescale +1) so the entire downstream §5.1 / Stage-A /
+    # softmax / score_v chain budget — and the finalize(17)/score_v(23) galois
+    # target chains tuned for it — are unchanged. (Re-encrypting fresh would
+    # shift every downstream op ~11 levels shallower than its galois key's
+    # target chain → illegal memory access.) The K cache below encodes at
+    # q_ct.chain_index(), so it tracks this chain automatically.
+    _q_target_ci = engine.user_level_chain_index(11)
+    _t_fold_q = NUM_SLOTS // _D_OUT_FOLD_Q   # 16
+    _q_dec_re = np.asarray(encoder.decode_double_vector(
+        ctx, sk.decrypt(ctx, _q_re)), dtype=np.float64)
+    _q_dec_im = np.asarray(encoder.decode_double_vector(
+        ctx, sk.decrypt(ctx, _q_im)), dtype=np.float64)
+    _q_lo = _q_dec_re[::_t_fold_q][:_D_OUT_FOLD_Q]
+    _q_hi = _q_dec_im[::_t_fold_q][:_D_OUT_FOLD_Q]
+    _q_natural = np.concatenate([_q_lo, _q_hi])   # natural order, length D
+    q_ct = _irp.encrypt_irp_input(
+        ctx, encoder, sk, _q_natural,
+        N=NUM_SLOTS, d=D, scale=SCALE, chain_index=_q_target_ci)
     # Cachemir §5.1 compute_qkt_irp on IRP-Wq output. K cache packs t_k =
     # NUM_SLOTS//D tokens per ct in interleaved layout
     # (slot[h*d_head*t + r*t + p] = K[c*t + p, h, r]); compute_qkt_irp on
@@ -1686,44 +1735,69 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         for j in range(H):
             fhe_attn_o[h, j] = _av_irp[(h * H + j) * t_k]
 
-    # ---- IRP-Wo (Cachemir §4.1). K=d²/N=512 SCPs × 512 KB = 256 MB per Wo
-    # (8× fewer SCPs than dense BSGS's 4096). Path B: input SK bridge
-    # ELIMINATED — score_times_v_irp_multi output (attn_h) is already in IRP
-    # stride-t layout (slot[i*t] = attn[i] for i = h*d_head + j), the same
-    # layout irp_matvec_host consumes. Only the output bridge remains
-    # (re-encrypt to replicated-block period D_TOTAL for downstream residual
-    # + rms2); eliminating that requires IRP'ing residual/rms2 (out of scope).
+    # ---- IRP-Wo (Cachemir §4.1) — COMPLEX OUTPUT-FOLDED (K=512→256 SCPs).
+    # encode_irp_diagonals_folded_host folds Wo.T's output columns into the
+    # imag part (d×d → d×(d/2) tall rect, alpha=2), so the folded matvec runs
+    # the TALL-rect machinery at d_out_fold = D/2 and consumes its input in the
+    # TALL layout for (d_in=D, d_out=D/2). Path B: the score·V output (attn_h)
+    # is already decrypted above (_av_irp, for the diagnostic), so the Wo INPUT
+    # bridge is free — re-encrypt the natural length-D attn vector in the
+    # folded tall-rect layout. The matvec emits a complex ct split by
+    # extract_real_imag_pair; the output is ALREADY SK-bridged (decrypt +
+    # re-encrypt to replicated-block for residual + rms2), so the recombine is
+    # absorbed into that existing bridge at zero extra cost.
     from blocks import irp as _irp
     _BABY_STEPS_IRP_WO = 16  # M=16, G=32 for d=4096 K=512 (~sqrt(K))
     t_wo = NUM_SLOTS // D                          # = 8 for D=4096
-    # Encode Wo as IRP SCPs (pass Wo.T to match irp_matvec's y = x @ M
-    # convention; gives o = Wo @ attn).
+    _D_OUT_FOLD_WO = D // 2  # 2048
+    # Folded Wo SCPs (pass Wo.T to match irp_matvec's y = x @ M convention;
+    # gives o = Wo @ attn). The fold halves the SCP count + disk cache.
     _wo_irp = _irp_cache.wo_plaintexts_cached(
         ctx, encoder,
         np.ascontiguousarray(np.asarray(Wo, dtype=np.float64).T),
         N=NUM_SLOTS, d=D, scale=SCALE, baby_steps=_BABY_STEPS_IRP_WO,
         layer_idx=layer_idx)
-    # Lazy-level: drop the IRP-Wo input to a deep chain so the rotation-heavy
-    # matvec runs at few RNS limbs (cheap). Headroom audit: Wo's output is
-    # immediately SK-bridged (decrypt + re-encrypt FRESH below), so there is
-    # no downstream bootstrap-with-scaling constraint on this ct — only the
-    # matvec's own ~1-2 levels matter. Targeting input user_level 13 leaves
-    # the output at user_level ~14 (< max_user_level 15) before the bridge
-    # discards the chain. mod_switch_to drops limbs cleanly (no added noise).
-    _wo_target_ci = engine.user_level_chain_index(13)
-    if attn_h.chain_index() < _wo_target_ci:
-        attn_h = phantom.mod_switch_to(ctx, attn_h, _wo_target_ci)
-    _mask_pt_wo = _irp.encode_irp_mask(
-        ctx, encoder, NUM_SLOTS, D, SCALE, attn_h.chain_index())
-    _o_ct_irp = _irp.irp_matvec_host(
-        ctx, encoder, galois_key, attn_h, _wo_irp,
+    # INPUT bridge: rebuild the natural length-D attn vector from the already-
+    # decrypted _av_irp (IRP stride-t_wo: slot[i*t_wo] = attn[i]), then encrypt
+    # in the FOLDED tall-rect layout for (d_in=D, d_out=D/2). Lazy-level: drop
+    # to user_level 12 so the rotation-heavy folded matvec runs cheap. Headroom:
+    # the folded matvec + conj-split consumes ~3 levels, landing the pre-decrypt
+    # cts at user_level ~15 (≤ max) before the output bridge discards the chain.
+    _attn_natural = _av_irp[::t_wo][:D]
+    _wo_input_ci = engine.user_level_chain_index(12)
+    av_folded = _irp.encrypt_irp_input_rect(
+        ctx, encoder, sk, np.asarray(_attn_natural, dtype=np.float64),
+        N=NUM_SLOTS, d_in=D, d_out=_D_OUT_FOLD_WO, scale=SCALE,
+        chain_index=_wo_input_ci)
+    # Tall masks at the FOLDED dim d_out=D/2: input_mask (square at d=D/2, at
+    # input chain) + sub_mask (rect at chain+1).
+    _input_mask_wo = _irp.encode_irp_mask(
+        ctx, encoder, NUM_SLOTS, _D_OUT_FOLD_WO, SCALE, av_folded.chain_index())
+    _sub_mask_wo = _irp.encode_irp_mask_rect(
+        ctx, encoder, NUM_SLOTS, D, _D_OUT_FOLD_WO, SCALE,
+        av_folded.chain_index() + 1)
+    _o_complex = _irp.irp_matvec_folded_host(
+        ctx, encoder, galois_key, av_folded, _wo_irp,
         N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_WO,
-        mask_pt=_mask_pt_wo)
-    # SK bridge: IRP slot[i*t]=o[i] → replicated-block slot[k*D+j]=o[j].
-    _o_dec = np.asarray(
-        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _o_ct_irp)),
+        sub_mask_pt=_sub_mask_wo, input_mask_pt=_input_mask_wo)
+    # Snap SCALE^2 → SCALE before the conj-split (pipeline convention).
+    _o_complex = phantom.rescale_to_next(ctx, _o_complex)
+    _o_complex.set_scale(SCALE)
+    _o_re, _o_im = _irp.extract_real_imag_pair(
+        ctx, encoder, galois_key, _o_complex, NUM_SLOTS, SCALE)
+    # OUTPUT SK BRIDGE (already required): decrypt both halves, recombine to
+    # natural length-D o in numpy (TALL fold decode: real=o[:D/2], imag=o[D/2:]),
+    # then re-encrypt to replicated-block slot[k*D+j]=o[j] for residual + rms2.
+    _t_fold_wo = NUM_SLOTS // _D_OUT_FOLD_WO   # 16
+    _o_dec_re = np.asarray(
+        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _o_re)),
         dtype=np.float64)
-    _o_vec = _o_dec[::t_wo][:D]
+    _o_dec_im = np.asarray(
+        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _o_im)),
+        dtype=np.float64)
+    _o_lo = _o_dec_re[::_t_fold_wo][:_D_OUT_FOLD_WO]
+    _o_hi = _o_dec_im[::_t_fold_wo][:_D_OUT_FOLD_WO]
+    _o_vec = np.concatenate([_o_lo, _o_hi])   # natural order, length D
     _o_slots_rep = np.zeros(NUM_SLOTS, dtype=np.float64)
     for _k in range(NUM_SLOTS // D):
         _o_slots_rep[_k * D:(_k + 1) * D] = _o_vec
