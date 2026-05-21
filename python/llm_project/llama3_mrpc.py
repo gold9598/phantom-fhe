@@ -1334,12 +1334,13 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         ctx, encoder, galois_key, x_irp_ct, wq_irp,
         N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_Q, mask_pt=mask_pt_q)
     # Snap scale SCALE^2 → SCALE (irp_matvec_host's mask leaves ct at SCALE^2;
-    # bootstrap expects engine.user_scale()=SCALE) and bootstrap-refresh chain.
+    # compute_qkt_irp needs q at canonical scale).
     q_irp_ct = phantom.rescale_to_next(ctx, q_irp_ct)
     q_irp_ct.set_scale(SCALE)
-    _q_calib = q_max_abs if q_max_abs is not None else 2.5
-    q_ct = bootstrap_safe(engine, ctx, encoder, q_irp_ct,
-                          max_abs=_q_calib, slot_count=NUM_SLOTS)
+    # Wq output bootstrap removed: chain audit showed QKT+tree-agg+Stage-A-sub
+    # only reaches user_level 3 before the Stage A bootstrap refreshes; the
+    # Wq-output bootstrap (fired at user_level 2) was redundant. Saves ~170ms.
+    q_ct = q_irp_ct
     # Cachemir §5.1 compute_qkt_irp on IRP-Wq output. K cache packs t_k =
     # NUM_SLOTS//D tokens per ct in interleaved layout
     # (slot[h*d_head*t + r*t + p] = K[c*t + p, h, r]); compute_qkt_irp on
