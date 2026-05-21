@@ -1114,3 +1114,154 @@ def irp_matvec_rect_folded_host(
         N=N, d_in=d_in, d_out=d_out_fold, baby_steps=baby_steps,
         sub_mask_pt=sub_mask_pt, input_mask_pt=input_mask_pt,
     )
+
+
+# ===========================================================================
+# In-FHE interleave-recombine for the complex output-fold (Phase-1.5)
+# ===========================================================================
+#
+# `extract_real_imag_pair` on a folded RECT matvec output gives two cts that
+# BOTH live in the same folded-rect output layout (wide: permuted stride-t' for
+# d_out/2; tall: stride-t = N/(d_out/2)).  ct_re holds y[:d_out/2], ct_im holds
+# y[d_out/2:], each at valid stride `t_fold` = N / d_out_fold.
+#
+# Instead of decrypting and concatenating in numpy, recombine the two halves
+# IN FHE by interleaving them onto a finer stride `t_fold/2`:
+#
+#     recombined = ct_re + rotate(ct_im, right by t_fold/2)
+#
+# After this, valid data sits at stride `t_fold/2`; at the c-th valid position
+# (slot c * t_fold/2) the value alternates re/im:
+#     slot (2j)   * (t_fold/2)  = y[:d_out/2] half, j-th valid output of ct_re
+#     slot (2j+1) * (t_fold/2)  = y[d_out/2:] half, j-th valid output of ct_im
+# i.e. the d_out outputs appear INTERLEAVED in the folded-rect halves' order.
+# Cost: exactly 1 galois rotation + 1 add, 0 chain levels (no multiply/rescale).
+#
+# The interleave permutation is INVARIANT under elementwise ops (silu, mult):
+# silu(interleaved) == interleaved(silu).  A downstream matvec ABSORBS the
+# permutation for free by reordering its weight ROWS at encode time to match
+# the interleaved input order (see `interleave_output_order`).
+
+def interleave_recombine(ctx, gk, ct_re, ct_im, N: int, d_out_fold: int):
+    """Recombine the two folded-rect halves onto stride t_fold/2 IN FHE.
+
+    ct_re, ct_im come from `extract_real_imag_pair` on a folded matvec whose
+    folded output dim is `d_out_fold` (= d_out/2).  Each half has valid data
+    at stride t_fold = N / d_out_fold.  Returns one ciphertext whose valid data
+    sits at stride t_fold/2, alternating ct_re / ct_im per the folded layout.
+
+    Cost: 1 rotate + 1 add, 0 chain levels.  The result keeps ct_re's scale and
+    chain index (ct_im must share them; they do, both from extract_real_imag_pair).
+    """
+    if (N % d_out_fold) != 0:
+        raise ValueError(f"interleave_recombine: N={N} not divisible by "
+                         f"d_out_fold={d_out_fold}")
+    t_fold = N // d_out_fold
+    if t_fold % 2 != 0:
+        raise ValueError(f"interleave_recombine: t_fold={t_fold} must be even "
+                         f"(need a half-stride slot to interleave into)")
+    half = t_fold // 2
+    # Right-rotate ct_im by `half` = left-rotate by (N - half): moves the value
+    # at slot c*t_fold to slot c*t_fold + half (the gap between ct_re slots).
+    ct_im_shift = phantom.rotate(ctx, ct_im, int((N - half) % N), gk)
+    return phantom.add(ctx, ct_re, ct_im_shift)
+
+
+def _interleave_recombine_slot_to_y(N: int, d_in: int, d_out: int) -> dict:
+    """Map {physical slot -> natural y-index} that `interleave_recombine`
+    produces for a FOLDED matvec of a (d_in, d_out) weight.
+
+    ct_re carries y[:d_out/2], ct_im carries y[d_out/2:], each in the FOLDED
+    rect output layout at stride t_fold = N/(d_out/2).  interleave_recombine
+    shifts ct_im by +t_fold/2 so:
+        slot c*t_fold            -> ct_re's c-th valid output (y[:d_out/2])
+        slot c*t_fold + t_fold/2 -> ct_im's c-th valid output (y[d_out/2:])
+    The c-th valid output's natural local index is given by the folded rect
+    output layout (wide: permuted stride-t'; tall/square: natural stride-t).
+    """
+    if d_out % 2 != 0:
+        raise ValueError(f"interleave slot map: d_out must be even, got {d_out}")
+    d_out_fold = d_out // 2
+    t_fold = N // d_out_fold
+    half = t_fold // 2
+    if d_in < d_out_fold:
+        # Wide folded: half[c_perm] holds natural local index c'+q*d.
+        d = d_in
+        alpha = d_out_fold // d
+        half_local = np.zeros(d_out_fold, dtype=np.int64)
+        for c_perm in range(d_out_fold):
+            half_local[c_perm] = (c_perm // alpha) + (c_perm % alpha) * d
+    else:
+        # Tall / square folded: half in natural stride-t order.
+        half_local = np.arange(d_out_fold, dtype=np.int64)
+    slot_to_y = {}
+    for c in range(d_out_fold):
+        slot_to_y[c * t_fold] = int(half_local[c])               # re -> y[:d/2]
+        slot_to_y[c * t_fold + half] = int(half_local[c]) + d_out_fold  # im
+    return slot_to_y
+
+
+def _rect_consume_slot_to_input(N: int, d_in: int, d_out: int) -> dict:
+    """Map {physical slot -> natural input index a[k]} that a downstream rect
+    matvec READS, mirroring `encrypt_irp_input_rect`.
+
+    Wide / square: slot[i*t] = a[i], t = N/d_in.
+    Tall: slot[i*t + q*t'] = a[i + q*d], d = d_out, alpha = d_in/d_out,
+          t = N/d, t' = N/(alpha*d) = N/d_in.
+    """
+    slot_to_input = {}
+    if d_in <= d_out:
+        t = N // d_in
+        for i in range(d_in):
+            slot_to_input[i * t] = i
+    else:
+        d = d_out
+        alpha = d_in // d
+        t = N // d
+        t_prime = N // (alpha * d)
+        for q in range(alpha):
+            for i in range(d):
+                slot_to_input[i * t + q * t_prime] = i + q * d
+    return slot_to_input
+
+
+def interleave_output_order(N: int, d_in: int, d_out: int,
+                            down_d_in: int = None,
+                            down_d_out: int = None) -> "np.ndarray":
+    """Row permutation a downstream rect matvec uses to ABSORB the interleave.
+
+    For a FOLDED matvec of a (d_in, d_out) weight, `interleave_recombine`
+    yields a ciphertext whose slots carry the d_out natural outputs in a
+    layout described by `_interleave_recombine_slot_to_y`.  A downstream
+    UNFOLDED rect matvec (down_d_in, down_d_out) reads that ciphertext as its
+    input per `_rect_consume_slot_to_input`.
+
+    Returns `order` (length down_d_in == d_out): the downstream matvec's input
+    index k carries natural y[order[k]].  Reorder the downstream weight ROWS to
+    `W_perm = W[order, :]` (numpy-time, free) so that
+        interleaved_input @ W_perm == natural_y @ W,
+    outputting NATURAL order with NO numpy un-permute.
+
+    `down_d_in`/`down_d_out` default to (d_out, ...) for a square-ish consumer;
+    pass the real downstream dims when the consumer is rect (e.g. Wdown tall).
+    """
+    if down_d_in is None:
+        down_d_in = d_out
+    if down_d_in != d_out:
+        raise ValueError(f"interleave_output_order: downstream input dim "
+                         f"{down_d_in} must equal folded matvec output {d_out}")
+    if down_d_out is None:
+        down_d_out = d_out  # square placeholder
+    slot_to_y = _interleave_recombine_slot_to_y(N, d_in, d_out)
+    slot_to_input = _rect_consume_slot_to_input(N, down_d_in, down_d_out)
+    order = np.full(down_d_in, -1, dtype=np.int64)
+    for slot, k in slot_to_input.items():
+        if slot in slot_to_y:
+            order[k] = slot_to_y[slot]
+    if (order < 0).any():
+        missing = int((order < 0).sum())
+        raise ValueError(f"interleave_output_order: {missing} downstream input "
+                         f"slots have no interleaved data (layout mismatch)")
+    if len(set(order.tolist())) != down_d_in:
+        raise ValueError("interleave_output_order: result is not a permutation")
+    return order
