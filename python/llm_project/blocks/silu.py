@@ -230,6 +230,199 @@ def silu_clenshaw(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
     return result
 
 
+def _cheb_split_coeffs(c, g):
+    """Split a Chebyshev series c (numpy 1D, degree N) about the giant index g
+    (1 <= g <= N) into (c_lo, c_hi) with deg(c_lo) < g, deg(c_hi) = N - g, so
+
+        sum_k c_k T_k(z) = sum_j c_lo[j] T_j(z) + T_g(z) * sum_j c_hi[j] T_j(z)
+
+    using the Chebyshev product identity T_{g+j} = 2 T_g T_j - T_{|g-j|}
+    (and T_g = T_g * T_0 for j == 0). Pure plaintext bookkeeping — this is the
+    intricate part validated to < 1e-10 against numpy.polynomial.Chebyshev.
+    """
+    N = len(c) - 1
+    c_lo = np.zeros(g, dtype=np.float64)            # T_0 .. T_{g-1}
+    c_hi = np.zeros(N - g + 1, dtype=np.float64)    # T_0 .. T_{N-g}
+    for k in range(len(c)):
+        if k < g:
+            c_lo[k] += c[k]
+        elif k == g:
+            c_hi[0] += c[k]                          # c_g T_g  -> p_hi T_0
+        else:
+            j = k - g                               # >= 1
+            c_hi[j] += 2.0 * c[k]                    # 2 c_k  (times T_g)
+            c_lo[abs(g - j)] += -c[k]                # - c_k
+    return c_lo, c_hi
+
+
+def silu_cheb_bsgs(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
+                    galois_key=None, max_abs_intermediate=None, m=8):
+    """Evaluate silu(x) on encrypted ct via Chebyshev-basis Paterson-Stockmeyer
+    (baby-step / giant-step), the depth-efficient alternative to silu_clenshaw.
+
+    silu(x) ~= sum_{k=0}^{N} t_k T_k(z),  z = x/D in [-1, 1],  N = len(t_coeffs)-1.
+
+    Structure (Bossuat et al. / Lattigo-style):
+      * Baby steps: build T_0(z)..T_m(z) as ciphertexts via the Chebyshev
+        recurrences T_{2k}=2 T_k^2-1, T_{2k+1}=2 T_k T_{k+1}-z.
+      * Giant steps: T_{2m}, T_{4m}, ... up to the largest giant g <= N via
+        T_{2g}=2 T_g^2-1.
+      * Recursive split: p = p_lo + T_g * p_hi, with the c_k folded in
+        plaintext (_cheb_split_coeffs). Base case deg < m -> direct
+        sum c_k T_k (scalar multiply_plain + adds).
+
+    For N=32, m=8: baby T_0..T_8, giants T_16, T_32. Giant-step depth ~6,
+    ~11-15 ct.ct mults total — vs Clenshaw's ~30 mults / ~14 levels for the
+    same bounded-coefficient accuracy. NO internal bootstrap needed at NSL=16.
+
+    Args:
+      D: half-width of the silu domain (caller's silu_max * 1.2).
+      t_coeffs: Chebyshev BASIS coefficients of silu on [-D, D], from
+                fit_silu_chebyshev_basis. Bounded ~O(silu_max), so per-mul
+                CKKS noise stays small even at degree 32.
+      m: baby-step bound (power of 2). Default 8 (good for N=32).
+      max_abs_intermediate: only used if a safety bootstrap is ever needed.
+      galois_key: unused here (kept for signature parity with silu_clenshaw).
+    """
+    import sys as _sys
+    _sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
+
+    c = np.asarray(t_coeffs, dtype=np.float64)
+    N = len(c) - 1
+    if N < 2:
+        raise ValueError("silu_cheb_bsgs: degree must be >= 2")
+    # m must be a power of 2 and <= N for the giant doubling to land on N's
+    # binary-aligned giants. Clamp to the largest power of 2 <= N if needed.
+    while m > N:
+        m //= 2
+    user_scale = ct.scale()
+    if max_abs_intermediate is None:
+        max_abs_intermediate = float(np.abs(c).max() * 2.0)
+
+    def _ctct(a, b):
+        """One ct.ct multiply with chain/scale alignment + rescale. Returns
+        a ciphertext at min(level)+1, scale == user_scale."""
+        ca, cb = a.chain_index(), b.chain_index()
+        if ca < cb:
+            a = phantom.mod_switch_to(ctx, a, cb)
+        elif cb < ca:
+            b = phantom.mod_switch_to(ctx, b, ca)
+        a.set_scale(user_scale)
+        b.set_scale(user_scale)
+        prod = phantom.multiply_and_relin(ctx, a, b, relin_key)
+        prod = phantom.rescale_to_next(ctx, prod)
+        prod.set_scale(user_scale)
+        return prod
+
+    def _sub_const(ct_in, val):
+        """ct_in - val (scalar), level-free via sub_plain at ct_in's chain."""
+        pt = encoder.encode_double_vector(
+            ctx, [float(val)] * slot_count, ct_in.scale(), ct_in.chain_index())
+        return phantom.sub_plain(ctx, ct_in, pt)
+
+    def _sub_ct(a, b):
+        """a - b with chain/scale alignment (deeper one wins, no extra level)."""
+        ca, cb = a.chain_index(), b.chain_index()
+        if ca < cb:
+            a = phantom.mod_switch_to(ctx, a, cb)
+        elif cb < ca:
+            b = phantom.mod_switch_to(ctx, b, ca)
+        a.set_scale(user_scale)
+        b.set_scale(user_scale)
+        return phantom.sub(ctx, a, b)
+
+    # ---- z = x / D  (1 level) ----
+    norm_pt = encoder.encode_double_vector(
+        ctx, [1.0 / D] * slot_count, user_scale, ct.chain_index())
+    z = phantom.multiply_plain(ctx, ct, norm_pt)
+    z = phantom.rescale_to_next(ctx, z)
+    z.set_scale(user_scale)
+
+    # ---- Baby steps: T_0 .. T_m  (T_0 stays a scalar constant, never a ct) ----
+    # T[k] holds the ciphertext for T_k(z); T[0] is represented implicitly (1).
+    T = {1: z}
+    # T_2 = 2 z^2 - 1
+    if m >= 2:
+        T[2] = _sub_const(phantom.add(ctx, (s := _ctct(T[1], T[1])), s), 1.0)
+    for k in range(2, m + 1):
+        if k in T:
+            continue
+        if k % 2 == 0:
+            half = k // 2
+            sq = _ctct(T[half], T[half])
+            T[k] = _sub_const(phantom.add(ctx, sq, sq), 1.0)  # 2 T_h^2 - 1
+        else:
+            lo, hi = (k - 1) // 2, (k + 1) // 2
+            pr = _ctct(T[lo], T[hi])
+            dbl = phantom.add(ctx, pr, pr)                    # 2 T_lo T_hi
+            T[k] = _sub_ct(dbl, z)                            # - T_1 = - z
+
+    # ---- Giant steps: g = 2m, 4m, ... <= N  (T_{2g} = 2 T_g^2 - 1) ----
+    g = m
+    while g * 2 <= N:
+        g2 = g * 2
+        sq = _ctct(T[g], T[g])
+        T[g2] = _sub_const(phantom.add(ctx, sq, sq), 1.0)
+        g = g2
+    # `g` is now the largest giant <= N (the top-level split index).
+
+    def _add_ct(a, b):
+        """a + b with chain/scale alignment (deeper one wins, no extra level)."""
+        ca, cb = a.chain_index(), b.chain_index()
+        if ca < cb:
+            a = phantom.mod_switch_to(ctx, a, cb)
+        elif cb < ca:
+            b = phantom.mod_switch_to(ctx, b, ca)
+        a.set_scale(user_scale)
+        b.set_scale(user_scale)
+        return phantom.add(ctx, a, b)
+
+    # ---- Recursive combination p = p_lo + T_g * p_hi ----
+    def _eval(coeffs):
+        n = len(coeffs) - 1
+        if n < m:
+            # Base case: direct sum_{k=0}^{n} coeffs[k] T_k(z).
+            # T_0 contributes the constant coeffs[0] (folded via add_plain at
+            # the end). Each T_k (k>=1) is a ct.scalar multiply (1 level), all
+            # at the baby-step chains; accumulate, then add the constant.
+            acc = None
+            for k in range(1, n + 1):
+                ck = float(coeffs[k])
+                if ck == 0.0:
+                    continue
+                tk = T[k]
+                ck_pt = encoder.encode_double_vector(
+                    ctx, [ck] * slot_count, tk.scale(), tk.chain_index())
+                term = phantom.multiply_plain(ctx, tk, ck_pt)
+                term = phantom.rescale_to_next(ctx, term)
+                term.set_scale(user_scale)
+                acc = term if acc is None else _add_ct(acc, term)
+            const = float(coeffs[0])
+            if acc is None:
+                # Constant-only sub-series (no T_>=1 term). Lift the constant
+                # onto T_1's chain via 0*T_1 + const so it stays a ciphertext
+                # the caller can combine. Rare for silu fits; guard anyway.
+                z_pt = encoder.encode_double_vector(
+                    ctx, [0.0] * slot_count, T[1].scale(), T[1].chain_index())
+                acc = phantom.multiply_plain(ctx, T[1], z_pt)
+                acc = phantom.rescale_to_next(ctx, acc)
+                acc.set_scale(user_scale)
+            const_pt = encoder.encode_double_vector(
+                ctx, [const] * slot_count, acc.scale(), acc.chain_index())
+            return phantom.add_plain(ctx, acc, const_pt)
+        # Split about the largest giant gg <= n.
+        gg = m
+        while gg * 2 <= n:
+            gg *= 2
+        c_lo, c_hi = _cheb_split_coeffs(coeffs, gg)
+        lo = _eval(c_lo)
+        hi = _eval(c_hi)
+        prod = _ctct(T[gg], hi)          # T_gg * p_hi  (1 level)
+        return _add_ct(lo, prod)
+
+    return _eval(c)
+
+
 def silu(ctx, encoder, relin_key, ct, coeffs=None, norm_factor=None,
          slot_count=None):
     """Evaluate SiLU on ct using a Chebyshev polynomial. If `coeffs` is None

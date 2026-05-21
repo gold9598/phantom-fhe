@@ -2294,13 +2294,13 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         #    domain (silu(9.5)≈-60 vs ≈9.5), so this path MUST honor
         #    silu_t_coeffs/silu_D too. --
         if silu_t_coeffs is not None and silu_D is not None:
-            from blocks.silu import silu_clenshaw
-            # ul_max=14 drops one internal bootstrap (3→2) by fitting more Clenshaw iters
-            # per bootstrap session; safe since pre-scale takes 1 level → max user_level=15 < NSL=16
-            _silu_ct = silu_clenshaw(
+            from blocks.silu import silu_cheb_bsgs
+            _gate_ct = bootstrap_safe(engine, ctx, encoder, _gate_ct,
+                                      max_abs=silu_max, slot_count=NUM_SLOTS)
+            _silu_ct = silu_cheb_bsgs(
                 engine, ctx, encoder, relin_key, _gate_ct,
                 silu_D, silu_t_coeffs, NUM_SLOTS,
-                galois_key=galois_key, ul_max=14)
+                galois_key=galois_key)
         else:
             _silu_ct = silu(ctx, encoder, relin_key, _gate_ct,
                             coeffs=silu_coeffs,
