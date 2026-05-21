@@ -2273,14 +2273,18 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
 
         # Encode IRP-rect SCPs. Wgate/Wup are WIDE (d_in=D_MODEL < d_out=D_PAD_OUT).
         # Wdown is TALL (d_in=D_PAD_OUT > d_out=D_MODEL).
-        # Warm path: all 3 blobs present -> parallel load via ThreadPoolExecutor(3)
-        # (encoder-free, thread-safe). Cold/partial path: sequential encode.
-        _gate_irp, _up_irp, _down_irp = _irp_cache.mlp_plaintexts_batch_cached(
-            ctx, encoder, _Wgate_padded, _Wup_padded, _Wdown_padded,
-            N=NUM_SLOTS, d_in_wide=D_MODEL, d_out_wide=_D_PAD_OUT_MLP,
-            d_in_tall=_D_PAD_OUT_MLP, d_out_tall=D_MODEL,
-            scale=SCALE, baby_steps=_BABY_STEPS_IRP_MLP_RECT,
-            layer_idx=layer_idx)
+        _gate_irp = _irp_cache.gate_plaintexts_cached(
+            ctx, encoder, _Wgate_padded, N=NUM_SLOTS,
+            d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
+            baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
+        _up_irp = _irp_cache.up_plaintexts_cached(
+            ctx, encoder, _Wup_padded, N=NUM_SLOTS,
+            d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
+            baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
+        _down_irp = _irp_cache.down_plaintexts_cached(
+            ctx, encoder, _Wdown_padded, N=NUM_SLOTS,
+            d_in=_D_PAD_OUT_MLP, d_out=D_MODEL, scale=SCALE,
+            baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
 
         # Lazy-level: drop the IRP-Wgate/Wup input to a deep chain so these two
         # rotation-heavy wide rect matvecs (D_MODEL×D_HIDDEN, K=2048 SCPs each —
