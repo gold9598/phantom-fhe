@@ -1913,13 +1913,21 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     NSL_MAX = NUM_SCALE_LEVELS - 1
     T_BOOT_MS = 182.0
     OUTPUT_LEVEL_AFTER_IRP = USER_LEVEL_IRP_ATTN + 2
+    # output_level here is the planner's REMAINING-BUDGET level (NSL_MAX = fresh,
+    # 0 = exhausted), the inverse of the runtime's consumed-level view.
+    # attention output is SK-bridged (decrypted + re-encrypted at fresh_ci, see
+    # the attn_out re-encrypt below), so it emerges FRESH — NOT at the IRP output
+    # level. Modeling it as fresh stops the planner scheduling a redundant
+    # bootstrap_before rms2 (which was firing on a user_level-0 ct). NOTE: revert
+    # to OUTPUT_LEVEL_AFTER_IRP if the SK output bridge is ever removed (bridgeless
+    # autonomous path), where attention really does emerge deep.
     placement_table = [
-        ("rms1",      7,  29.4, True,  None, True),
-        ("attention", 0, 521.0, True,  OUTPUT_LEVEL_AFTER_IRP, False),
-        ("residual1", 0,   1.0, True,  None, False),
-        ("rms2",      7,  27.4, True,  None, True),
+        ("rms1",      7,  29.4, True,  None,    True),
+        ("attention", 0, 521.0, True,  NSL_MAX, False),
+        ("residual1", 0,   1.0, True,  None,    False),
+        ("rms2",      7,  27.4, True,  None,    True),
         ("mlp",       0, 624.1, True,  OUTPUT_LEVEL_AFTER_IRP, False),
-        ("residual2", 0,   1.0, True,  None, False),
+        ("residual2", 0,   1.0, True,  None,    False),
     ]
     layers_for_dag = build_layers_from_table(placement_table)
     plan = find_optimal_placement(layers_for_dag, NSL_MAX, T_BOOT_MS)
