@@ -153,6 +153,19 @@ def _cached_rect(key, ctx, encoder, matrix, N, d_in, d_out, scale, baby_steps):
     return pts
 
 
+def _cached_rect_folded(key, ctx, encoder, matrix, N, d_in, d_out, scale,
+                         baby_steps):
+    """Cache wrapper for the complex output-folded rect encoding (K/2 SCPs)."""
+    path = _blob_path(key)
+    if _has_blob(path):
+        return _load_blob(path)
+    pts = _irp.encode_irp_diagonals_rect_folded_host(
+        ctx, encoder, matrix, N=N, d_in=d_in, d_out=d_out,
+        scale=scale, baby_steps=baby_steps)
+    _save_blob(path, pts)
+    return pts
+
+
 def wq_plaintexts_cached(ctx, encoder, Wq_baked_T, N, d, scale, baby_steps,
                           layer_idx, P_local):
     """Wq_baked.T (R_P-baked, transposed) -> IRP SCPs. Key includes P_local."""
@@ -171,26 +184,46 @@ def wo_plaintexts_cached(ctx, encoder, Wo_T, N, d, scale, baby_steps,
 
 def gate_plaintexts_cached(ctx, encoder, Wgate_padded, N, d_in, d_out, scale,
                             baby_steps, layer_idx):
-    """Wgate (padded wide) -> IRP-rect SCPs. Layer-keyed."""
-    key = (f"gate_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}"
+    """Wgate (padded wide) -> complex output-FOLDED IRP-rect SCPs (K/2).
+
+    `_fold` key tag keeps the halved blobs distinct from stale unfolded ones.
+    Consume with irp_matvec_rect_folded_host + extract_real_imag_pair +
+    interleave_recombine.
+    """
+    key = (f"gate_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}_fold"
            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
-    return _cached_rect(key, ctx, encoder, Wgate_padded, N, d_in, d_out,
-                        scale, baby_steps)
+    return _cached_rect_folded(key, ctx, encoder, Wgate_padded, N, d_in, d_out,
+                               scale, baby_steps)
 
 
 def up_plaintexts_cached(ctx, encoder, Wup_padded, N, d_in, d_out, scale,
                           baby_steps, layer_idx):
-    """Wup (padded wide) -> IRP-rect SCPs. Layer-keyed."""
-    key = (f"up_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}"
+    """Wup (padded wide) -> complex output-FOLDED IRP-rect SCPs (K/2).
+
+    `_fold` key tag keeps the halved blobs distinct from stale unfolded ones.
+    """
+    key = (f"up_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}_fold"
            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
-    return _cached_rect(key, ctx, encoder, Wup_padded, N, d_in, d_out,
-                        scale, baby_steps)
+    return _cached_rect_folded(key, ctx, encoder, Wup_padded, N, d_in, d_out,
+                               scale, baby_steps)
 
 
 def down_plaintexts_cached(ctx, encoder, Wdown_padded, N, d_in, d_out, scale,
-                            baby_steps, layer_idx):
-    """Wdown (padded tall) -> IRP-rect SCPs. Layer-keyed."""
-    key = (f"down_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}"
+                            baby_steps, layer_idx, gate_up_d_in, gate_up_d_out):
+    """Wdown (padded tall) -> UNFOLDED IRP-rect SCPs, rows ROW-PERMUTED to
+    absorb the gate/up interleave layout.
+
+    The MLP fold path feeds Wdown an interleaved-layout input produced by
+    interleave_recombine on the gate/up folded matvecs of dims
+    (gate_up_d_in, gate_up_d_out). interleave_output_order returns the row
+    permutation that makes this tall matvec consume the interleaved layout and
+    emit NATURAL order (no un-permute). `_perm` key tag keeps it distinct from
+    the old naturally-ordered down blob.
+    """
+    order = _irp.interleave_output_order(
+        N, gate_up_d_in, gate_up_d_out, down_d_in=d_in, down_d_out=d_out)
+    Wdown_perm = Wdown_padded[order, :]
+    key = (f"down_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}_perm"
            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
-    return _cached_rect(key, ctx, encoder, Wdown_padded, N, d_in, d_out,
+    return _cached_rect(key, ctx, encoder, Wdown_perm, N, d_in, d_out,
                         scale, baby_steps)
