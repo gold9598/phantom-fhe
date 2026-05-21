@@ -1554,12 +1554,18 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         ctx, encoder, relin_key, galois_key,
         e_ct, num_tokens=nt_pad, iters=ITERS)
 
-    # ---- Bootstrap-3 (post-softmax, before distribute + score_v). Needed
-    # because softmax_correct consumes 2*ITERS levels and score_v_irp_multi
-    # adds ~3 more (distribute mask + ct·ct + output mask).
-    weights_ct = bootstrap_safe(
-        engine, ctx, encoder, weights_ct,
-        max_abs=1.0, slot_count=NUM_SLOTS)
+    # ---- (Former Bootstrap-3 removed.) finalize_softmax_irp_t outputs
+    # weights_ct at user_level 7; the only downstream consumers are
+    # tree-distribute (3 levels for nt_pad=64 / 8 chunks), score_times_v_irp_
+    # multi (2 levels), and IRP-Wo (lazy-leveled via mod_switch to user_level
+    # 13, independent of the input level). So the real chain budget is
+    # 7 + 3 + 2 = 12 at the score_v output, well under max_user_level 15
+    # (3 levels of headroom). Wo's lazy mod_switch only ever drops deeper
+    # (guarded `if chain_index < target`), so entering distribute at level 7
+    # is safe. The earlier audit's "12 levels" referred to softmax_correct
+    # inside finalize_softmax_irp_t, which runs UPSTREAM of this point — not a
+    # downstream constraint. Dropping this bootstrap removes its ~170ms and its
+    # injected noise.
 
     # ---- Tree-distribute global weights → n_chunks_pow2 per-chunk cts.
     # Inverse of tree-agg: at each level, split one ct into "lower" and
