@@ -2258,28 +2258,50 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             scale=SCALE, baby_steps=_BABY_STEPS_IRP_MLP_RECT,
             layer_idx=layer_idx)
 
+        # Lazy-level: drop the IRP-Wgate/Wup input to a deep chain so these two
+        # rotation-heavy wide rect matvecs (D_MODEL×D_HIDDEN, K=2048 SCPs each —
+        # the biggest matvecs in the model) run at few RNS limbs (cheap).
+        # Headroom audit: gate's output is bootstrapped (bootstrap_safe) right
+        # before silu, so it only needs to survive to chain <=15; up sits idle
+        # until the post-silu multiply (chain-aligned to silu ~chain 6→14), then
+        # h_ct is bootstrapped — so neither output has a deep downstream
+        # constraint. The matvec consumes 2 levels (sub_mask + rescale), so
+        # targeting input user_level 11 leaves both outputs at user_level 13.
+        # Binding constraint: silu tracks the gate level (its bootstrap pre-scale
+        # + Clenshaw net to the gate input chain), so the post-silu multiply with
+        # up (also ul 13) + rescale yields h_ct at ul 14 — the deepest the h_ct
+        # bootstrap_safe accepts (it must pre-scale, so needs ul < max 15). ul 12
+        # overflows h_ct to ul 15. mod_switch_to drops limbs cleanly (no added
+        # noise). Both matvecs consume the same input, so mod_switch a single
+        # shared deep copy.
+        _mlp_target_ci = engine.user_level_chain_index(11)
+        _x_mid_norm_deep = x_mid_norm
+        if _x_mid_norm_deep.chain_index() < _mlp_target_ci:
+            _x_mid_norm_deep = phantom.mod_switch_to(ctx, x_mid_norm, _mlp_target_ci)
+
         # Per K-2 test (blocks/kv_cache_test.py:115-127): wide path needs
         # only sub_mask_pt; tall path needs BOTH sub_mask_pt (at chain+1)
         # AND input_mask_pt (at chain, encoded at d=d_out as square mask).
         # WIDE rect path: ct_in goes directly into irp_matvec_host with
         # mask_pt=sub_mask. The mask op fires INSIDE irp_matvec_host at
         # ct_in's chain (no input_mask consumes a level first like TALL
-        # does). So sub_mask must be at x_mid_norm.chain_index(), NOT +1.
+        # does). So sub_mask must align to the matvec input's chain, which is
+        # now the lazy-leveled _x_mid_norm_deep, NOT x_mid_norm.
         _sub_mask_gate_up = _irp_mlp.encode_irp_mask_rect(
             ctx, encoder, N=NUM_SLOTS, d_in=D_MODEL, d_out=_D_PAD_OUT_MLP,
-            scale=SCALE, chain_index=x_mid_norm.chain_index())
+            scale=SCALE, chain_index=_x_mid_norm_deep.chain_index())
 
         # -- Wgate (wide rect IRP matvec) --
         _gate_ct = _irp_mlp.irp_matvec_rect_host(
-            ctx, encoder, galois_key, x_mid_norm, _gate_irp,
+            ctx, encoder, galois_key, _x_mid_norm_deep, _gate_irp,
             N=NUM_SLOTS, d_in=D_MODEL, d_out=_D_PAD_OUT_MLP,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT,
             sub_mask_pt=_sub_mask_gate_up, input_mask_pt=None)
         _gate_ct = phantom.rescale_to_next(ctx, _gate_ct)
         _gate_ct.set_scale(SCALE)
-        # -- Wup (wide rect IRP matvec — reuses x_mid_norm same chain/mask) --
+        # -- Wup (wide rect IRP matvec — reuses _x_mid_norm_deep same chain/mask) --
         _up_ct = _irp_mlp.irp_matvec_rect_host(
-            ctx, encoder, galois_key, x_mid_norm, _up_irp,
+            ctx, encoder, galois_key, _x_mid_norm_deep, _up_irp,
             N=NUM_SLOTS, d_in=D_MODEL, d_out=_D_PAD_OUT_MLP,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT,
             sub_mask_pt=_sub_mask_gate_up, input_mask_pt=None)
