@@ -1013,3 +1013,104 @@ def irp_matvec_folded_host(
         N=N, d_in=d, d_out=d_out, baby_steps=baby_steps,
         sub_mask_pt=sub_mask_pt, input_mask_pt=input_mask_pt,
     )
+
+
+# ===========================================================================
+# Complex-folded RECTANGULAR IRP (Phase-1b optimization)
+# ===========================================================================
+#
+# Generalizes the square output-fold to RECT weights (the MLP gate/up/down,
+# K = alpha * d^2/N each).  For a (d_in, d_out) matvec y = x @ M with REAL
+# encrypted x, fold the OUTPUT columns into the imaginary part:
+#
+#     M_fold[k, c] = M[k, c] + 1j * M[k, c + d_out/2]    for c in [0, d_out/2)
+#
+# M_fold is (d_in, d_out/2).  Halving d_out preserves the orientation:
+#   wide  (d_in < d_out)  stays wide   (d_in < d_out/2 once d_out > 2*d_in)
+#   tall  (d_in > d_out)  stays tall and gets *more* tall (alpha doubles)
+# The fold rides the EXISTING rect machinery: the rect rotations (preprocess,
+# babies, giants, reduce, combine/align) and the multiply-accumulate are all
+# C-linear, and x is real, so each output slot carries
+#   real(y_fold[c]) = (x @ M)[c]   ,   imag(y_fold[c]) = (x @ M)[c + d_out/2].
+# SCP count = alpha_fold * (d_min_fold)^2 / N = (full rect K) / 2 -- HALVED.
+#
+# Recovery: split real/imag (extract_real_imag_pair, +1 conjugation + 1 level),
+# then read each half with the rect output layout (wide: permuted stride-t';
+# tall: stride-t) and concatenate -> length-d_out y.
+
+def encode_irp_diagonals_rect_folded_host(
+    ctx,
+    encoder,
+    matrix: np.ndarray,
+    N: int,
+    d_in: int,
+    d_out: int,
+    scale: float,
+    baby_steps: int = 1,
+) -> List:
+    """Encode a (d_in, d_out) REAL rect weight into HALF the rect SCPs.
+
+    Folds the output columns: M_fold[:, c] = M[:, c] + 1j*M[:, c + d_out/2]
+    for c in [0, d_out/2).  M_fold is (d_in, d_out/2), encoded via the existing
+    rect host machinery (orientation preserved).  Returns
+    (full rect K)/2 = alpha_fold * min(d_in, d_out/2)^2 / N complex SCPs.
+
+    Consume with `irp_matvec_rect_folded_host` + `extract_real_imag_pair`.
+    """
+    if not isinstance(matrix, np.ndarray):
+        matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape != (d_in, d_out):
+        raise ValueError(f"encode_irp_diagonals_rect_folded_host: matrix must be "
+                         f"({d_in}, {d_out}), got {matrix.shape}")
+    if d_out % 2 != 0:
+        raise ValueError(f"encode_irp_diagonals_rect_folded_host: d_out must be "
+                         f"even, got {d_out}")
+    d_out_fold = d_out // 2
+    if d_in == d_out_fold:
+        raise ValueError("encode_irp_diagonals_rect_folded_host: folded d_out == "
+                         "d_in (square) -- use encode_irp_diagonals_folded_host")
+    d_fold = min(d_in, d_out_fold)
+    if (d_fold * d_fold) % N != 0:
+        raise ValueError(f"encode_irp_diagonals_rect_folded_host: folded sub-IRP "
+                         f"dim^2={d_fold * d_fold} must be divisible by N={N}")
+    M_fold = matrix[:, :d_out_fold] + 1j * matrix[:, d_out_fold:]
+    return encode_irp_diagonals_rect_host(
+        ctx, encoder, M_fold, N=N, d_in=d_in, d_out=d_out_fold,
+        scale=scale, baby_steps=baby_steps,
+    )
+
+
+def irp_matvec_rect_folded_host(
+    ctx,
+    encoder,
+    gk,
+    ct_in,
+    plaintexts: List,
+    N: int,
+    d_in: int,
+    d_out: int,
+    baby_steps: int = 1,
+    sub_mask_pt=None,
+    input_mask_pt=None,
+) -> "phantom.ciphertext":
+    """Run the complex-folded RECT IRP matvec (rect machinery under the hood).
+
+    `ct_in` must be encrypted in the rect input layout for (d_in, d_out/2)
+    -- use `encrypt_irp_input_rect(..., d_in=d_in, d_out=d_out//2)`.
+    `plaintexts` come from `encode_irp_diagonals_rect_folded_host`.  Returns a
+    COMPLEX ciphertext in the folded rect output layout (wide: permuted
+    stride-t' for d_out/2; tall: stride-t = N/(d_out/2)).  Split with
+    `extract_real_imag_pair` then read each half with the folded rect layout:
+    real -> (x@M)[:d_out/2], imag -> (x@M)[d_out/2:].
+
+    sub_mask_pt / input_mask_pt: rect masks encoded at the folded dims.
+    """
+    if d_out % 2 != 0:
+        raise ValueError(f"irp_matvec_rect_folded_host: d_out must be even, "
+                         f"got {d_out}")
+    d_out_fold = d_out // 2
+    return irp_matvec_rect_host(
+        ctx, encoder, gk, ct_in, plaintexts,
+        N=N, d_in=d_in, d_out=d_out_fold, baby_steps=baby_steps,
+        sub_mask_pt=sub_mask_pt, input_mask_pt=input_mask_pt,
+    )
