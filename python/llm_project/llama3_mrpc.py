@@ -1328,8 +1328,18 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     x_irp_ct = _irp.encrypt_irp_input(
         ctx, encoder, sk, np.asarray(xn_query, dtype=np.float64),
         N=NUM_SLOTS, d=D, scale=SCALE, chain_index=chain_index)
+    # Lazy-level: drop the IRP-Wq input to a deep chain so the rotation-heavy
+    # matvec (~48 keyswitches) runs at few RNS limbs (cheap). Headroom audit:
+    # downstream (compute_qkt_irp + tree-agg + Stage-A sub) consumes 4 user
+    # levels before the Stage-A bootstrap, which pre-scales (1 level) and so
+    # must enter at user_level < max_user_level (15). Targeting input
+    # user_level 9 leaves the Stage-A bootstrap at user_level 13 (2-level
+    # margin). mod_switch_to drops limbs cleanly (no added noise).
+    _wq_target_ci = engine.user_level_chain_index(9)
+    if x_irp_ct.chain_index() < _wq_target_ci:
+        x_irp_ct = phantom.mod_switch_to(ctx, x_irp_ct, _wq_target_ci)
     mask_pt_q = _irp.encode_irp_mask(
-        ctx, encoder, NUM_SLOTS, D, SCALE, chain_index)
+        ctx, encoder, NUM_SLOTS, D, SCALE, x_irp_ct.chain_index())
     q_irp_ct = _irp.irp_matvec_host(
         ctx, encoder, galois_key, x_irp_ct, wq_irp,
         N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_Q, mask_pt=mask_pt_q)
@@ -1657,6 +1667,16 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         np.ascontiguousarray(np.asarray(Wo, dtype=np.float64).T),
         N=NUM_SLOTS, d=D, scale=SCALE, baby_steps=_BABY_STEPS_IRP_WO,
         layer_idx=layer_idx)
+    # Lazy-level: drop the IRP-Wo input to a deep chain so the rotation-heavy
+    # matvec runs at few RNS limbs (cheap). Headroom audit: Wo's output is
+    # immediately SK-bridged (decrypt + re-encrypt FRESH below), so there is
+    # no downstream bootstrap-with-scaling constraint on this ct — only the
+    # matvec's own ~1-2 levels matter. Targeting input user_level 13 leaves
+    # the output at user_level ~14 (< max_user_level 15) before the bridge
+    # discards the chain. mod_switch_to drops limbs cleanly (no added noise).
+    _wo_target_ci = engine.user_level_chain_index(13)
+    if attn_h.chain_index() < _wo_target_ci:
+        attn_h = phantom.mod_switch_to(ctx, attn_h, _wo_target_ci)
     _mask_pt_wo = _irp.encode_irp_mask(
         ctx, encoder, NUM_SLOTS, D, SCALE, attn_h.chain_index())
     _o_ct_irp = _irp.irp_matvec_host(
@@ -2305,6 +2325,17 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                                max_abs=_h_calib, slot_count=NUM_SLOTS)
 
         # -- Wdown (tall rect IRP matvec — needs BOTH sub_mask and input_mask) --
+        # Lazy-level: drop the IRP-Wdown input to a deep chain so the
+        # rotation-heavy tall rect matvec runs at few RNS limbs (cheap).
+        # Headroom audit: Wdown consumes ~2 levels (input_mask + sub_mask),
+        # then a rescale (+1), then residual2 (chain-aligning, 0 levels). The
+        # resulting y_ct is discarded — the next layer re-encrypts fresh — so
+        # there is no downstream bootstrap-with-scaling constraint. Targeting
+        # input user_level 10 leaves the output at user_level ~13 (< max 15)
+        # before residual2. mod_switch_to drops limbs cleanly (no added noise).
+        _wdown_target_ci = engine.user_level_chain_index(10)
+        if _h_ct.chain_index() < _wdown_target_ci:
+            _h_ct = phantom.mod_switch_to(ctx, _h_ct, _wdown_target_ci)
         _input_mask_down = _irp_mlp.encode_irp_mask(
             ctx, encoder, N=NUM_SLOTS, d=D_MODEL, scale=SCALE,
             chain_index=_h_ct.chain_index())
