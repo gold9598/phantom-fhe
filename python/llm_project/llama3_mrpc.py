@@ -60,6 +60,7 @@ from blocks import kv_layout_dense as _dense_oracle
 from blocks import kv_layout_dense_fhe as _dense_fhe
 from blocks import dense_bsgs_cache as _dense_bsgs_cache
 from blocks import irp_cache as _irp_cache
+from blocks import calib_cache as _calib_cache
 from blocks.lm_head import yes_no_logits_np
 from blocks.residual import residual
 from blocks.rmsnorm import (
@@ -2007,14 +2008,23 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if precomputed_calib is not None:
             z1_l, z2_l, max_abs_calib = precomputed_calib[layer_idx]
         else:
-            # layer_weights[layer_idx] is the subset; reload the full dict
-            # per-layer and drop after calib so the heap doesn't grow to
-            # 60 GB across the 32-layer loop.
-            _w_full = load_layer_weights(layer_idx)
-            z1_l, z2_l, max_abs_calib = compute_layer_calib_n(
-                x_btd, _w_full, cos_all, sin_all, num_tokens, P_local)
-            del _w_full
-            import gc as _gc; _gc.collect()
+            # Disk-cached calibration: load_layer_weights() pulls the full
+            # ~1.4 GB weight dict (Wo/Wgate/Wup/Wdown) purely to run the numpy
+            # shadow forward, then discards it. The (z1,z2,max_abs) output is
+            # deterministic in (x_btd, layer, num_tokens, query_position), so
+            # cache it — warm runs skip both the weight load and the forward.
+            def _compute_calib():
+                # layer_weights[layer_idx] is the subset; reload the full dict
+                # per-layer and drop after calib so the heap doesn't grow to
+                # 60 GB across the 32-layer loop.
+                _w_full = load_layer_weights(layer_idx)
+                r = compute_layer_calib_n(
+                    x_btd, _w_full, cos_all, sin_all, num_tokens, P_local)
+                del _w_full
+                import gc as _gc; _gc.collect()
+                return r
+            z1_l, z2_l, max_abs_calib = _calib_cache.calib_cached(
+                x_btd, layer_idx, num_tokens, P_local, _compute_calib)
         z1_min, z1_max = rms_z_window(z1_l)
         z2_min, z2_max = rms_z_window(z2_l)
         rms1_p = _make_rms_params_local(z1_min, z1_max)
