@@ -24,6 +24,7 @@ namespace phantom {
             const std::int64_t *src_signed,
             std::uint64_t *dst,
             const DModulus *moduli,
+            std::int64_t scale_2,
             std::size_t num_towers,
             std::size_t N);
 
@@ -338,12 +339,15 @@ namespace phantom {
                             d_signed.get(), pt_dst, base_rns, scale_2,
                             num_towers, N);
                 } else {
+                    const std::int64_t scale_2 = (scp.coeff_scale > 0.0)
+                            ? static_cast<std::int64_t>(std::llround(scp.scale / scp.coeff_scale))
+                            : 1;
                     auto d_signed = phantom::util::make_cuda_auto_ptr<std::int64_t>(N, stream);
                     cudaMemcpyAsync(d_signed.get(), scp.coeffs64.data(),
                                     N * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice, stream);
                     light_pt_expand_per_tower_kernel<<<blocks, threads, 0, stream>>>(
-                            d_signed.get(), pt_dst, base_rns,
+                            d_signed.get(), pt_dst, base_rns, scale_2,
                             num_towers, N);
                 }
 
