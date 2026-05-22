@@ -43,9 +43,10 @@ from typing import Any
 import pyPhantom as phantom
 
 
-# v2: per-SCP .bin files hold int16 coeffs and the index carries coeff_scale.
-# Bumped from v1 (int64) so stale caches are rejected and cold-re-encoded.
-CACHE_VERSION = 2
+# v4: per-SCP .bin files hold block-floating-point int8 payloads ([N int8][N/B
+# fp32]) and the index carries coeff_scale + is_int8_bfp + block_size. Bumped
+# from v2 (int16) / v1 (int64) so stale caches are rejected and cold-re-encoded.
+CACHE_VERSION = 4
 
 
 def _is_scp(obj: Any) -> bool:
@@ -66,6 +67,7 @@ def _walk_collect(obj: Any, entries: list, path_prefix: str) -> Any:
             "fname": fname,
             "scale": float(obj.get_scale()),
             "coeff_scale": float(obj.get_coeff_scale()),
+            "block_size": int(obj.get_block_size()),
             "N": int(obj.N),
             "bytes": obj.coeffs_bytes(),
         })
@@ -103,7 +105,8 @@ def _walk_rebuild(tree: Any, entries_meta: list, root: str) -> Any:
                 data = f.read()
             return phantom.scp_from_bytes(
                 data, meta["scale"], meta["N"],
-                meta.get("coeff_scale", meta["scale"]))
+                meta.get("coeff_scale", meta["scale"]),
+                meta.get("block_size", 0))
         if "__tuple__" in tree:
             return tuple(_walk_rebuild(v, entries_meta, root)
                          for v in tree["__tuple__"])
@@ -141,10 +144,14 @@ def save_scp_dict_to_disk(scp_dict: Any, path: str) -> None:
             fp = os.path.join(tmp_dir, e["fname"])
             with open(fp, "wb") as f:
                 f.write(e["bytes"])
-        # Build index.json with bytes stripped (keep only metadata).
+        # Build index.json with bytes stripped (keep only metadata). coeff_scale
+        # + block_size are required to reconstruct int16 (scale_2) and int8
+        # block-FP SCPs respectively.
         index = {
             "version": CACHE_VERSION,
-            "entries": [{"fname": e["fname"], "scale": e["scale"], "N": e["N"]}
+            "entries": [{"fname": e["fname"], "scale": e["scale"],
+                         "coeff_scale": e["coeff_scale"],
+                         "block_size": e["block_size"], "N": e["N"]}
                         for e in entries],
             "tree": tree,
         }

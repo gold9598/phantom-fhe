@@ -454,21 +454,37 @@ PYBIND11_MODULE(pyPhantom, m) {
                                    [](const phantom::SingleChainPlaintext &p) { return p.coeff_scale; })
             .def_property_readonly("is_int16",
                                    [](const phantom::SingleChainPlaintext &p) { return p.is_int16; })
+            .def_property_readonly("is_int8_bfp",
+                                   [](const phantom::SingleChainPlaintext &p) { return p.is_int8_bfp; })
+            .def_property_readonly("block_size",
+                                   [](const phantom::SingleChainPlaintext &p) { return p.block_size; })
             .def_property_readonly("nbytes",
                                    [](const phantom::SingleChainPlaintext &p) { return p.nbytes(); })
             .def_property_readonly("N",
                                    [](const phantom::SingleChainPlaintext &p) { return p.N(); })
-            // Raw coeffs as py::bytes (int16 -> N*2, int64 -> N*8 depending on
-            // is_int16). Releases the GIL during the copy so concurrent workers
-            // can serialize cache entries in parallel; the SCP buffer is in
-            // pinned host memory and is safe to read while other threads run.
+            // Raw coeffs as py::bytes. For int8 block-FP the payload is
+            // [N int8 mantissas][num_blocks fp32 block scales] concatenated;
+            // otherwise int16 -> N*2 or int64 -> N*8. Releases the GIL during the
+            // copy so concurrent workers can serialize cache entries in parallel;
+            // the SCP buffers are in pinned host memory and safe to read while
+            // other threads run.
             .def("coeffs_bytes",
                  [](const phantom::SingleChainPlaintext &p) {
+                     if (p.is_int8_bfp) {
+                         const std::size_t mant_bytes = p.coeffs8.nbytes();
+                         const std::size_t scale_bytes = p.block_scales.nbytes();
+                         std::string buf;
+                         buf.resize(mant_bytes + scale_bytes);
+                         std::memcpy(&buf[0], p.coeffs8.data(), mant_bytes);
+                         std::memcpy(&buf[mant_bytes], p.block_scales.data(), scale_bytes);
+                         return py::bytes(buf);
+                     }
                      return py::bytes(reinterpret_cast<const char *>(p.coeff_ptr()),
                                       p.nbytes());
                  },
-                 "Return the SCP's coefficient buffer as raw bytes (length N*2 "
-                 "for int16, N*8 for int64). Pair with scp_from_bytes to "
+                 "Return the SCP's coefficient buffer as raw bytes. For int8 "
+                 "block-FP: [N int8 mantissas][num_blocks fp32 scales]; else "
+                 "N*2 (int16) or N*8 (int64). Pair with scp_from_bytes to "
                  "round-trip an SCP to/from disk.")
             .def("get_scale",
                  [](const phantom::SingleChainPlaintext &p) { return p.scale; },
@@ -479,7 +495,13 @@ PYBIND11_MODULE(pyPhantom, m) {
                  "full-scale SCPs, 2^16 for quantized IRP weight SCPs).")
             .def("get_is_int16",
                  [](const phantom::SingleChainPlaintext &p) { return p.is_int16; },
-                 "True if coeffs are stored as int16 (quantized), False if int64.");
+                 "True if coeffs are stored as int16 (quantized), False if int64.")
+            .def("get_is_int8_bfp",
+                 [](const phantom::SingleChainPlaintext &p) { return p.is_int8_bfp; },
+                 "True if coeffs use block-floating-point int8 storage (Q8_0/MXFP8).")
+            .def("get_block_size",
+                 [](const phantom::SingleChainPlaintext &p) { return p.block_size; },
+                 "Block size (coeffs per shared fp32 scale) for int8 block-FP; 0 otherwise.");
 
     // numpy-array fast path for encode_single_chain_plaintext: pybind11
     // dispatches here when callers pass a numpy complex128 array directly.
@@ -490,7 +512,7 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("encode_single_chain_plaintext",
           [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
              py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> arr,
-             double scale, double coeff_scale) {
+             double scale, double coeff_scale, std::size_t block_size) {
               if (arr.ndim() != 1)
                   throw std::runtime_error(
                       "encode_single_chain_plaintext: array must be 1-D");
@@ -498,20 +520,21 @@ PYBIND11_MODULE(pyPhantom, m) {
               const std::size_t n = static_cast<std::size_t>(arr.shape(0));
               std::vector<std::complex<double>> slots(src, src + n);
               py::gil_scoped_release release;
-              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale, coeff_scale);
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale, coeff_scale, block_size);
           },
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"),
-          py::arg("coeff_scale") = 0.0,
+          py::arg("coeff_scale") = 0.0, py::arg("block_size") = 0,
           "Encode a numpy complex128 1-D array into a SingleChainPlaintext. "
           "Faster than the list-based overload — no Python object iteration. "
-          "coeff_scale (default 0 = use scale) sets the int16 quantization scale.");
+          "coeff_scale (default 0 = use scale) sets the int16 quantization scale. "
+          "block_size > 0 selects block-floating-point int8 storage (Q8_0/MXFP8).");
 
     // numpy-array fast path with real (float64) input. Promotes to complex
     // inside the C++ boundary while the GIL is held only briefly.
     m.def("encode_single_chain_plaintext",
           [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
              py::array_t<double, py::array::c_style | py::array::forcecast> arr,
-             double scale, double coeff_scale) {
+             double scale, double coeff_scale, std::size_t block_size) {
               if (arr.ndim() != 1)
                   throw std::runtime_error(
                       "encode_single_chain_plaintext: array must be 1-D");
@@ -522,16 +545,17 @@ PYBIND11_MODULE(pyPhantom, m) {
                   slots[i] = std::complex<double>(src[i], 0.0);
               }
               py::gil_scoped_release release;
-              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale, coeff_scale);
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale, coeff_scale, block_size);
           },
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"),
-          py::arg("coeff_scale") = 0.0,
+          py::arg("coeff_scale") = 0.0, py::arg("block_size") = 0,
           "Encode a numpy float64 1-D array into a SingleChainPlaintext (real "
           "values promoted to complex). Faster than the list-based overload.");
 
     m.def("encode_single_chain_plaintext",
           [](const PhantomContext &ctx, PhantomCKKSEncoder &encoder,
-             std::vector<std::complex<double>> slots, double scale, double coeff_scale) {
+             std::vector<std::complex<double>> slots, double scale, double coeff_scale,
+             std::size_t block_size) {
               // `slots` is already a C++ vector at this point (pybind11
               // unpacked the Python list during argument marshalling), so
               // we no longer need the GIL for the NTT + encode work below.
@@ -539,10 +563,10 @@ PYBIND11_MODULE(pyPhantom, m) {
               // parallel during the Wq IRP pre-encode phase (32 layers x
               // 256 SCPs = 8,192 calls per example).
               py::gil_scoped_release release;
-              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale, coeff_scale);
+              return phantom::encode_single_chain_plaintext(ctx, encoder, slots, scale, coeff_scale, block_size);
           },
           py::arg("context"), py::arg("encoder"), py::arg("slots"), py::arg("scale"),
-          py::arg("coeff_scale") = 0.0);
+          py::arg("coeff_scale") = 0.0, py::arg("block_size") = 0);
 
     // Reconstruct a SingleChainPlaintext from raw coeff bytes + scale.
     // Allocates pinned host memory and memcpy's the bytes in. Used by the
@@ -550,11 +574,41 @@ PYBIND11_MODULE(pyPhantom, m) {
     // process restarts. No target_chain_index needed: SCPs are
     // level-agnostic, the chain index is supplied at expand-time only.
     m.def("scp_from_bytes",
-          [](py::bytes data, double scale, std::size_t N, double coeff_scale) {
+          [](py::bytes data, double scale, std::size_t N, double coeff_scale,
+             std::size_t block_size) {
               // Extract the bytes into a std::string while we still hold
               // the GIL — converting py::bytes -> std::string touches the
               // Python object.
               std::string s(data);
+              // block_size > 0 => block-floating-point int8: the payload is
+              // [N int8 mantissas][num_blocks fp32 scales].
+              if (block_size > 0) {
+                  if (N % block_size != 0)
+                      throw std::runtime_error(
+                          "scp_from_bytes: N not divisible by block_size");
+                  const std::size_t num_blocks = N / block_size;
+                  const std::size_t expect = N * sizeof(std::int8_t) +
+                                             num_blocks * sizeof(float);
+                  if (s.size() != expect)
+                      throw std::runtime_error(
+                          "scp_from_bytes (int8 block-FP): byte length mismatch (got " +
+                          std::to_string(s.size()) + ", expected " +
+                          std::to_string(expect) + ")");
+                  py::gil_scoped_release release;
+                  phantom::SingleChainPlaintext out;
+                  out.scale = scale;
+                  out.coeff_scale = scale;   // block scales already restore 2^40
+                  out.is_int16 = false;
+                  out.is_int8_bfp = true;
+                  out.block_size = block_size;
+                  out.coeffs8 = phantom::PinnedHostInt8Buffer(N);
+                  out.block_scales = phantom::PinnedHostFloatBuffer(num_blocks);
+                  std::memcpy(out.coeffs8.data(), s.data(), N * sizeof(std::int8_t));
+                  std::memcpy(out.block_scales.data(),
+                              s.data() + N * sizeof(std::int8_t),
+                              num_blocks * sizeof(float));
+                  return out;
+              }
               // Adaptive: byte length selects the storage width (int16 -> N*2,
               // int64 -> N*8). Round-trips coeffs_bytes() for either case.
               const bool is_i16 = (s.size() == N * sizeof(std::int16_t));
@@ -584,10 +638,10 @@ PYBIND11_MODULE(pyPhantom, m) {
               return out;
           },
           py::arg("data"), py::arg("scale"), py::arg("N"),
-          py::arg("coeff_scale") = 0.0,
-          "Reconstruct a SingleChainPlaintext from raw coefficient bytes "
-          "(length N*2 for int16, N*8 for int64), an effective scale, and a "
-          "coeff_scale (default 0 = use scale). Inverse of coeffs_bytes().");
+          py::arg("coeff_scale") = 0.0, py::arg("block_size") = 0,
+          "Reconstruct a SingleChainPlaintext from raw coefficient bytes. For "
+          "int8 block-FP (block_size > 0): [N int8][num_blocks fp32]; else N*2 "
+          "(int16) or N*8 (int64). Inverse of coeffs_bytes().");
 
     m.def("expand_single_chain_to_full", &phantom::expand_single_chain_to_full,
           py::arg("context"), py::arg("scp"), py::arg("target_chain_index"),

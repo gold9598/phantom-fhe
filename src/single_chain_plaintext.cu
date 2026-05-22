@@ -44,6 +44,18 @@ namespace phantom {
             std::size_t num_towers,
             std::size_t N);
 
+    // Block-floating-point int8 expand (Q8_0 / MXFP8 style): recovers
+    // coeff_i = round(int8[i] * block_scale[i / block_size]) at the full 2^40
+    // message scale, then reduces mod q_j per RNS tower.
+    __global__ void light_pt_expand_per_tower_i8_bfp_kernel(
+            const std::int8_t *src_mantissa,
+            const float *block_scales,
+            std::uint64_t *dst,
+            const DModulus *moduli,
+            std::size_t block_size,
+            std::size_t num_towers,
+            std::size_t N);
+
     namespace {
         inline void check_cuda(cudaError_t err, const char *what) {
             if (err != cudaSuccess) {
@@ -167,6 +179,106 @@ namespace phantom {
         return *this;
     }
 
+    // ===== PinnedHostInt8Buffer =====
+
+    PinnedHostInt8Buffer::PinnedHostInt8Buffer(std::size_t n) : n_(n) {
+        if (n == 0) return;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n * sizeof(std::int8_t)),
+                   "cudaMallocHost");
+    }
+
+    PinnedHostInt8Buffer::~PinnedHostInt8Buffer() {
+        if (ptr_ != nullptr) {
+            cudaFreeHost(ptr_);
+            ptr_ = nullptr;
+        }
+    }
+
+    PinnedHostInt8Buffer::PinnedHostInt8Buffer(const PinnedHostInt8Buffer &other) : n_(other.n_) {
+        if (n_ == 0) return;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n_ * sizeof(std::int8_t)),
+                   "cudaMallocHost (copy)");
+        std::memcpy(ptr_, other.ptr_, n_ * sizeof(std::int8_t));
+    }
+
+    PinnedHostInt8Buffer &PinnedHostInt8Buffer::operator=(const PinnedHostInt8Buffer &other) {
+        if (this == &other) return *this;
+        if (ptr_ != nullptr) { cudaFreeHost(ptr_); ptr_ = nullptr; }
+        n_ = other.n_;
+        if (n_ == 0) return *this;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n_ * sizeof(std::int8_t)),
+                   "cudaMallocHost (copy-assign)");
+        std::memcpy(ptr_, other.ptr_, n_ * sizeof(std::int8_t));
+        return *this;
+    }
+
+    PinnedHostInt8Buffer::PinnedHostInt8Buffer(PinnedHostInt8Buffer &&other) noexcept
+            : ptr_(other.ptr_), n_(other.n_) {
+        other.ptr_ = nullptr;
+        other.n_ = 0;
+    }
+
+    PinnedHostInt8Buffer &PinnedHostInt8Buffer::operator=(PinnedHostInt8Buffer &&other) noexcept {
+        if (this != &other) {
+            if (ptr_ != nullptr) cudaFreeHost(ptr_);
+            ptr_ = other.ptr_;
+            n_ = other.n_;
+            other.ptr_ = nullptr;
+            other.n_ = 0;
+        }
+        return *this;
+    }
+
+    // ===== PinnedHostFloatBuffer =====
+
+    PinnedHostFloatBuffer::PinnedHostFloatBuffer(std::size_t n) : n_(n) {
+        if (n == 0) return;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n * sizeof(float)),
+                   "cudaMallocHost");
+    }
+
+    PinnedHostFloatBuffer::~PinnedHostFloatBuffer() {
+        if (ptr_ != nullptr) {
+            cudaFreeHost(ptr_);
+            ptr_ = nullptr;
+        }
+    }
+
+    PinnedHostFloatBuffer::PinnedHostFloatBuffer(const PinnedHostFloatBuffer &other) : n_(other.n_) {
+        if (n_ == 0) return;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n_ * sizeof(float)),
+                   "cudaMallocHost (copy)");
+        std::memcpy(ptr_, other.ptr_, n_ * sizeof(float));
+    }
+
+    PinnedHostFloatBuffer &PinnedHostFloatBuffer::operator=(const PinnedHostFloatBuffer &other) {
+        if (this == &other) return *this;
+        if (ptr_ != nullptr) { cudaFreeHost(ptr_); ptr_ = nullptr; }
+        n_ = other.n_;
+        if (n_ == 0) return *this;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n_ * sizeof(float)),
+                   "cudaMallocHost (copy-assign)");
+        std::memcpy(ptr_, other.ptr_, n_ * sizeof(float));
+        return *this;
+    }
+
+    PinnedHostFloatBuffer::PinnedHostFloatBuffer(PinnedHostFloatBuffer &&other) noexcept
+            : ptr_(other.ptr_), n_(other.n_) {
+        other.ptr_ = nullptr;
+        other.n_ = 0;
+    }
+
+    PinnedHostFloatBuffer &PinnedHostFloatBuffer::operator=(PinnedHostFloatBuffer &&other) noexcept {
+        if (this != &other) {
+            if (ptr_ != nullptr) cudaFreeHost(ptr_);
+            ptr_ = other.ptr_;
+            n_ = other.n_;
+            other.ptr_ = nullptr;
+            other.n_ = 0;
+        }
+        return *this;
+    }
+
     // ===== encode_single_chain_plaintext =====
 
     SingleChainPlaintext encode_single_chain_plaintext(
@@ -174,11 +286,16 @@ namespace phantom {
             PhantomCKKSEncoder &encoder,
             const std::vector<std::complex<double>> &slots,
             double scale,
-            double coeff_scale) {
+            double coeff_scale,
+            std::size_t block_size) {
         const auto &stream = cudaStreamPerThread;
 
-        // coeff_scale <= 0 means "use scale" (full-scale SCP, scale_2 == 1).
-        const double enc_scale = (coeff_scale > 0.0) ? coeff_scale : scale;
+        // Block-floating-point int8 encodes the coeffs at the FULL message scale
+        // (the per-block fp32 scale absorbs the entire magnitude). For the int16/
+        // int64 adaptive path, coeff_scale <= 0 means "use scale".
+        const double enc_scale = (block_size > 0)
+                ? scale
+                : ((coeff_scale > 0.0) ? coeff_scale : scale);
 
         // Encode at chain_index = 1 (first usable index) to drive q_0 selection.
         // Single-chain storage is level-agnostic; the picked level only fixes
@@ -222,6 +339,50 @@ namespace phantom {
                                    cudaMemcpyDeviceToHost, stream),
                    "D2H signed coeffs");
         check_cuda(cudaStreamSynchronize(stream), "stream sync after encode");
+
+        // Block-floating-point int8 storage (Q8_0 / MXFP8 style). Partition the
+        // N coeffs (now at the full 2^40 message scale) into blocks of
+        // `block_size`; per block store one fp32 scale = absmax/127 and
+        // `block_size` int8 mantissas q = round(coeff / scale) clamped to
+        // [-127, 127]. The expand kernel recovers round(q * block_scale).
+        if (block_size > 0) {
+            if (N % block_size != 0) {
+                throw std::invalid_argument(
+                        "encode_single_chain_plaintext: N must be divisible by "
+                        "block_size for block-floating-point int8");
+            }
+            const std::size_t num_blocks = N / block_size;
+            SingleChainPlaintext out;
+            out.scale = scale;
+            out.coeff_scale = scale;   // BFP block scales already restore 2^40
+            out.is_int16 = false;
+            out.is_int8_bfp = true;
+            out.block_size = block_size;
+            out.coeffs8 = PinnedHostInt8Buffer(N);
+            out.block_scales = PinnedHostFloatBuffer(num_blocks);
+            for (std::size_t b = 0; b < num_blocks; ++b) {
+                std::int64_t absmax = 0;
+                for (std::size_t k = 0; k < block_size; ++k) {
+                    std::int64_t a = std::llabs(host64[b * block_size + k]);
+                    if (a > absmax) absmax = a;
+                }
+                // fp32 scale: a Q8_0-style fp16 d would overflow (absmax ~ 2^28,
+                // d ~ 2^21 > fp16 max ~2^16). All-zero block -> scale 1.
+                const float bscale = (absmax > 0)
+                        ? static_cast<float>(static_cast<double>(absmax) / 127.0)
+                        : 1.0f;
+                out.block_scales.data()[b] = bscale;
+                const double inv = 1.0 / static_cast<double>(bscale);
+                for (std::size_t k = 0; k < block_size; ++k) {
+                    const std::size_t i = b * block_size + k;
+                    long q = std::lround(static_cast<double>(host64[i]) * inv);
+                    if (q > 127) q = 127;
+                    else if (q < -127) q = -127;
+                    out.coeffs8.data()[i] = static_cast<std::int8_t>(q);
+                }
+            }
+            return out;
+        }
 
         // Adaptive storage: int16 when every coeff fits (quantized IRP weight
         // SCPs at coeff_scale=2^16), int64 otherwise (full-scale SCPs whose
@@ -283,7 +444,23 @@ namespace phantom {
         const std::size_t total = coeff_modulus_size * N;
         const std::size_t blocks = (total + threads - 1) / threads;
 
-        if (scp.is_int16) {
+        if (scp.is_int8_bfp) {
+            // Block-floating-point int8: dequant per block via the fp32 scales.
+            const std::size_t num_blocks = N / scp.block_size;
+            auto d_mant = phantom::util::make_cuda_auto_ptr<std::int8_t>(N, stream);
+            auto d_bscale = phantom::util::make_cuda_auto_ptr<float>(num_blocks, stream);
+            check_cuda(cudaMemcpyAsync(d_mant.get(), scp.coeffs8.data(),
+                                       N * sizeof(std::int8_t),
+                                       cudaMemcpyHostToDevice, stream),
+                       "H2D int8 mantissas");
+            check_cuda(cudaMemcpyAsync(d_bscale.get(), scp.block_scales.data(),
+                                       num_blocks * sizeof(float),
+                                       cudaMemcpyHostToDevice, stream),
+                       "H2D block scales");
+            light_pt_expand_per_tower_i8_bfp_kernel<<<blocks, threads, 0, stream>>>(
+                    d_mant.get(), d_bscale.get(), pt.data(), moduli,
+                    scp.block_size, coeff_modulus_size, N);
+        } else if (scp.is_int16) {
             // scale_2 restores the full message scale (scp.scale) from the
             // coeffs' quantization scale (scp.coeff_scale); 1 if they are equal.
             const std::int64_t scale_2 = (scp.coeff_scale > 0.0)

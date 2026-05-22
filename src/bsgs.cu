@@ -35,6 +35,17 @@ namespace phantom {
             std::size_t num_towers,
             std::size_t N);
 
+    // Block-floating-point int8 expand: recovers each coeff as
+    // round(int8[i] * block_scale[i / block_size]) at the 2^40 message scale.
+    __global__ void light_pt_expand_per_tower_i8_bfp_kernel(
+            const std::int8_t *src_mantissa,
+            const float *block_scales,
+            std::uint64_t *dst,
+            const DModulus *moduli,
+            std::size_t block_size,
+            std::size_t num_towers,
+            std::size_t N);
+
     namespace {
 
         inline bool is_power_of_two(std::size_t x) {
@@ -306,8 +317,22 @@ namespace phantom {
 
                 // H2D async into a device scratch buffer first, since the source
                 // lives in pinned host memory. Dispatch on the SCP's storage
-                // width: int16 (quantized) applies scale_2; int64 (full-scale).
-                if (scp.is_int16) {
+                // form: int8 block-FP (Q8_0/MXFP8) dequants per fp32 block scale;
+                // int16 (quantized) applies scale_2; int64 (full-scale).
+                if (scp.is_int8_bfp) {
+                    const std::size_t num_blocks = N / scp.block_size;
+                    auto d_mant = phantom::util::make_cuda_auto_ptr<std::int8_t>(N, stream);
+                    auto d_bscale = phantom::util::make_cuda_auto_ptr<float>(num_blocks, stream);
+                    cudaMemcpyAsync(d_mant.get(), scp.coeffs8.data(),
+                                    N * sizeof(std::int8_t),
+                                    cudaMemcpyHostToDevice, stream);
+                    cudaMemcpyAsync(d_bscale.get(), scp.block_scales.data(),
+                                    num_blocks * sizeof(float),
+                                    cudaMemcpyHostToDevice, stream);
+                    light_pt_expand_per_tower_i8_bfp_kernel<<<blocks, threads, 0, stream>>>(
+                            d_mant.get(), d_bscale.get(), pt_dst, base_rns,
+                            scp.block_size, num_towers, N);
+                } else if (scp.is_int16) {
                     const std::int64_t scale_2 = (scp.coeff_scale > 0.0)
                             ? static_cast<std::int64_t>(std::llround(scp.scale / scp.coeff_scale))
                             : 1;

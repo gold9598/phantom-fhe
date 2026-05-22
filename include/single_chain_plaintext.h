@@ -34,6 +34,58 @@ namespace phantom {
         std::size_t n_ = 0;
     };
 
+    // RAII wrapper for pinned host int8 buffer. Used for block-floating-point
+    // (Q8_0 / MXFP8 style) quantized IRP weight SCPs: the signed-centered coeffs
+    // at the 2^40 message scale span a ~21-29-bit dynamic range that a single
+    // per-SCP scale cannot capture in int8 (7-bit mantissa). Instead the N coeffs
+    // are partitioned into blocks of `block_size`; each block stores one fp32
+    // shared scale and B int8 mantissas. int8 (1 B) + fp32 scales (4 B per
+    // block_size coeffs) shrinks the IRP cache ~7.5x vs int64.
+    class PinnedHostInt8Buffer {
+    public:
+        PinnedHostInt8Buffer() = default;
+        explicit PinnedHostInt8Buffer(std::size_t n);
+        ~PinnedHostInt8Buffer();
+        PinnedHostInt8Buffer(const PinnedHostInt8Buffer &other);
+        PinnedHostInt8Buffer &operator=(const PinnedHostInt8Buffer &other);
+        PinnedHostInt8Buffer(PinnedHostInt8Buffer &&other) noexcept;
+        PinnedHostInt8Buffer &operator=(PinnedHostInt8Buffer &&other) noexcept;
+
+        std::int8_t *data() noexcept { return ptr_; }
+        const std::int8_t *data() const noexcept { return ptr_; }
+        std::size_t size() const noexcept { return n_; }
+        std::size_t nbytes() const noexcept { return n_ * sizeof(std::int8_t); }
+
+    private:
+        std::int8_t *ptr_ = nullptr;
+        std::size_t n_ = 0;
+    };
+
+    // RAII wrapper for pinned host fp32 buffer. Holds the per-block shared scales
+    // for block-floating-point int8 SCPs (one fp32 scale per `block_size`
+    // mantissas). fp32 is required: a Q8_0-style fp16 scale would overflow
+    // (block scale d = absmax/127 ~ 2^21 at the 2^40 message scale > fp16's
+    // ~2^16 max). fp32 holds it exactly.
+    class PinnedHostFloatBuffer {
+    public:
+        PinnedHostFloatBuffer() = default;
+        explicit PinnedHostFloatBuffer(std::size_t n);
+        ~PinnedHostFloatBuffer();
+        PinnedHostFloatBuffer(const PinnedHostFloatBuffer &other);
+        PinnedHostFloatBuffer &operator=(const PinnedHostFloatBuffer &other);
+        PinnedHostFloatBuffer(PinnedHostFloatBuffer &&other) noexcept;
+        PinnedHostFloatBuffer &operator=(PinnedHostFloatBuffer &&other) noexcept;
+
+        float *data() noexcept { return ptr_; }
+        const float *data() const noexcept { return ptr_; }
+        std::size_t size() const noexcept { return n_; }
+        std::size_t nbytes() const noexcept { return n_ * sizeof(float); }
+
+    private:
+        float *ptr_ = nullptr;
+        std::size_t n_ = 0;
+    };
+
     // RAII wrapper for pinned host int16 buffer. Used for quantized IRP weight
     // SCPs: the signed-centered coeffs at coeff_scale=2^16 are ~30, fitting
     // int16 with wide margin; the full 2^40 message scale is restored at expand
@@ -78,20 +130,29 @@ namespace phantom {
     //                 coeff_scale == scale).
     struct SingleChainPlaintext {
         PinnedHostInt16Buffer coeffs;       // populated when is_int16
-        PinnedHostInt64Buffer coeffs64;     // populated when !is_int16
+        PinnedHostInt64Buffer coeffs64;     // populated when !is_int16 && !is_int8_bfp
+        PinnedHostInt8Buffer coeffs8;       // mantissas, populated when is_int8_bfp
+        PinnedHostFloatBuffer block_scales; // per-block fp32 scales (is_int8_bfp)
         bool is_int16 = true;
+        bool is_int8_bfp = false;           // block-floating-point int8 storage
+        std::size_t block_size = 0;         // coeffs per shared fp32 scale (BFP)
         double scale = 1.0;
         double coeff_scale = 1.0;
 
         // Polynomial length N from whichever buffer is active.
         std::size_t N() const {
+            if (is_int8_bfp) return coeffs8.size();
             return is_int16 ? coeffs.size() : coeffs64.size();
         }
-        // Raw coefficient bytes (N * 2 if int16, else N * 8).
+        // Raw coefficient bytes of the PRIMARY mantissa buffer (N * 1 for int8
+        // BFP, N * 2 for int16, N * 8 for int64). The block-scale buffer is
+        // serialized separately (see binding.cu coeffs_bytes / scp_from_bytes).
         std::size_t nbytes() const {
+            if (is_int8_bfp) return coeffs8.nbytes();
             return is_int16 ? coeffs.nbytes() : coeffs64.nbytes();
         }
         const void *coeff_ptr() const {
+            if (is_int8_bfp) return static_cast<const void *>(coeffs8.data());
             return is_int16 ? static_cast<const void *>(coeffs.data())
                             : static_cast<const void *>(coeffs64.data());
         }
@@ -105,12 +166,20 @@ namespace phantom {
     // plaintext reports). `coeff_scale` is the scale used for the actual integer
     // encoding; pass <= 0 to use `scale` (full-scale, scale_2 == 1). The encoder
     // stores the coeffs as int16 when they fit (lossless) and int64 otherwise.
+    //
+    // `block_size > 0` selects block-floating-point int8 storage (Q8_0 / MXFP8
+    // style): the signed-centered coeffs at the FULL message `scale` are
+    // partitioned into blocks of `block_size`; each block stores one fp32 shared
+    // scale (absmax/127) and `block_size` int8 mantissas. The expand kernel
+    // recovers coeff_i = round(int8_i * block_scale[i / block_size]), already at
+    // the 2^40 message scale (no scale_2). Used for the IRP weight SCPs only.
     SingleChainPlaintext encode_single_chain_plaintext(
             const PhantomContext &ctx,
             PhantomCKKSEncoder &encoder,
             const std::vector<std::complex<double>> &slots,
             double scale,
-            double coeff_scale = 0.0);
+            double coeff_scale = 0.0,
+            std::size_t block_size = 0);
 
     // Re-tile + forward NTT to produce a full-RNS NTT-form PhantomPlaintext at
     // `target_chain_index`. Caller drops it after the multiply.

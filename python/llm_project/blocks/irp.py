@@ -18,24 +18,31 @@ import numpy as np
 import pyPhantom as phantom
 
 
-# Quantization scale for IRP WEIGHT SingleChainPlaintexts. The signed-centered
-# IRP diagonal coefficients are stored as int16 at this scale; the full message
-# scale (engine user_scale, 2^40) is restored at expand time by the per-tower
-# scale_2 = round(scale / coeff_scale) multiply in the C++ kernel.
+# Block-floating-point int8 storage for IRP WEIGHT SingleChainPlaintexts
+# (Q8_0 / MXFP8 style). The signed-centered IRP diagonal coefficients at the
+# full 2^40 message scale span a ~21-29-bit dynamic range that a single per-SCP
+# scale CANNOT capture in int8's 7-bit mantissa. Instead the encoder partitions
+# the N coeffs into blocks of IRP_BLOCK_SIZE; each block stores one fp32 shared
+# scale (= absmax/127) and IRP_BLOCK_SIZE int8 mantissas. The expand kernel
+# recovers coeff_i = round(int8_i * block_scale[i // B]) at the 2^40 scale.
 #
-# Scale choice: int16 holds +/-32767. The coeffs must use enough of that range
-# that integer ROUNDING is negligible. Empirically (random N(0,0.02) weights,
-# the worst case): at 2^16 coeffs peak ~22 -> rounding loses ~7%/coeff -> output
-# rel-RMS ~5.6e-2 (catastrophic). At 2^24 coeffs peak ~5600 -> rel-RMS ~2e-4
-# (well below the ~4.2e-3 baseline) with ~6x int16 headroom against per-weight
-# outliers. 2^24 is the lossless sweet spot that still fits int16 (4x smaller
-# cache than int64). Larger scales (>=2^28) overflow int16 and fall back to
-# int64 storage in the encoder (lossless but no size win).
+# Cite:
+#   - llama.cpp Q8_0 (GGUF block-size-32, per-block fp16 d=absmax/127, int8
+#     quants; near-lossless on LLaMA-3.1-8B, WikiText PPL 7.32->7.33).
+#   - Microscaling / Block-Floating-Point (MXFP8) literature: block-shared-scale
+#     fixed-point, near-lossless W8A8 for LLaMA-3.1-8B (8-bit survey, 2026).
+#     Lineage: AWQ (arXiv:2306.00978), GPTQ (arXiv:2210.17323), SmoothQuant.
 #
-# Only the IRP weight encoders below pass this; every other SCP (rmsnorm gammas,
-# merge-bootstrap constants, masks, the complex-bridge half/neg-half constants)
-# encodes at full scale, where coeff_scale == scale => scale_2 == 1 (unchanged).
-IRP_COEFF_SCALE = 2.0 ** 24
+# Block-size choice: STEP-0 numpy de-risk on real L31 IRP SCP coeffs (per-SCP
+# rel-RMS, fp32 block scale): B=32 -> 5.3e-3, B=256 -> 7.0e-3. B=32 gives ~7.1x
+# cache shrink vs int64 (N int8 + N/32 fp32 = 72 KB vs 512 KB per N=65536 SCP).
+# fp32 (not Q8_0's fp16) scales are mandatory: the block scale absmax/127 ~ 2^21
+# at the 2^40 message scale overflows fp16's ~2^16 max.
+#
+# Only the IRP weight encoders below pass IRP_BLOCK_SIZE; every other SCP
+# (rmsnorm gammas, merge-bootstrap constants, masks, the complex-bridge
+# half/neg-half constants) encodes at full int64 scale (block_size=0, unchanged).
+IRP_BLOCK_SIZE = 32
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +153,9 @@ def encode_irp_diagonals_host(
     # Pass numpy complex arrays directly — avoids the GIL-held tolist()
     # marshalling that previously dominated the Wq IRP pre-encode phase
     # (~50 ms per call × 256 SCPs × 32 layers = ~6 min per worker).
+    # block_size=IRP_BLOCK_SIZE selects block-floating-point int8 storage.
     return [phantom.encode_single_chain_plaintext(
-                ctx, encoder, s, scale, IRP_COEFF_SCALE)
+                ctx, encoder, s, scale, 0.0, IRP_BLOCK_SIZE)
             for s in slot_arrays]
 
 
@@ -910,8 +918,9 @@ def encode_irp_diagonals_rect_pair_host(
             combined = sr.real + 1j * si.real
             # Pass numpy complex array directly — fast path via binding's
             # numpy overload (no Python iteration of 65K complex objects).
+            # Weight SCP -> block-floating-point int8 storage (IRP_BLOCK_SIZE).
             plaintexts.append(phantom.encode_single_chain_plaintext(
-                ctx, encoder, combined, scale, IRP_COEFF_SCALE))
+                ctx, encoder, combined, scale, 0.0, IRP_BLOCK_SIZE))
     return plaintexts
 
 

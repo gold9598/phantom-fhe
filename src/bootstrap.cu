@@ -720,6 +720,52 @@ namespace phantom {
         }
     }
 
+    // Block-floating-point int8 expand (Q8_0 / MXFP8 style) for the IRP weight
+    // SCPs. Each coefficient i is recovered as round(int8[i] * block_scale[i/B]),
+    // which already sits at the full 2^40 message scale (the per-block fp32 scale
+    // absorbs the whole magnitude — there is no separate scale_2). The recovered
+    // int64 coeff is then reduced mod q_j per RNS tower exactly like the int16/
+    // int64 paths. block_size B is a power of two; block index = i / B.
+    //
+    // Cite: llama.cpp Q8_0 (GGUF block-size-32, per-block fp16 d=absmax/127, int8
+    // quants) and Microscaling / Block-Floating-Point (MXFP8) literature; here
+    // the block scale is fp32 because the 2^40-scaled coeffs overflow fp16.
+    __global__ void light_pt_expand_per_tower_i8_bfp_kernel(
+            const std::int8_t *__restrict__ src_mantissa,
+            const float *__restrict__ block_scales,
+            std::uint64_t *__restrict__ dst,  // size num_towers * N
+            const DModulus *__restrict__ moduli,
+            std::size_t block_size,
+            std::size_t num_towers,
+            std::size_t N) {
+        const std::size_t total = num_towers * N;
+        for (std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+             tid < total;
+             tid += blockDim.x * gridDim.x) {
+            const std::size_t j = tid / N;
+            const std::size_t i = tid - j * N;
+            const DModulus mod = moduli[j];
+            const std::uint64_t qj = mod.value();
+            const std::uint64_t mu_hi = mod.const_ratio()[1];
+            const float bscale = block_scales[i / block_size];
+            // Dequantize to the full 2^40-scale integer coefficient. The product
+            // (|int8| <= 127) * (block_scale ~ 2^21) ~ 2^28 fits double exactly
+            // and llround lands the integer coeff with no loss.
+            const std::int64_t c = static_cast<std::int64_t>(
+                    llround(static_cast<double>(src_mantissa[i]) *
+                            static_cast<double>(bscale)));
+            std::uint64_t out;
+            if (c >= 0) {
+                out = barrett_reduce_uint64_uint64(static_cast<std::uint64_t>(c), qj, mu_hi);
+            } else {
+                const std::uint64_t mag = static_cast<std::uint64_t>(-c);
+                std::uint64_t mag_mod = barrett_reduce_uint64_uint64(mag, qj, mu_hi);
+                out = (mag_mod == 0) ? 0ULL : (qj - mag_mod);
+            }
+            dst[tid] = out;
+        }
+    }
+
     // Encode a complex diagonal into a compact LightPlaintext.
     //
     // Implementation (one-shot, slow path used only at key generation):
