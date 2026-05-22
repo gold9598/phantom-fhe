@@ -684,6 +684,42 @@ namespace phantom {
         }
     }
 
+    // Int16 variant of light_pt_expand_per_tower_kernel for SingleChainPlaintext
+    // storage (coeffs stored as int16 at coeff_scale). Multiplies each coeff by
+    // scale_2 before the per-tower mod-q_j reduction to restore the full message
+    // scale: a quantized SCP (coeff_scale=2^16) uses scale_2=2^24, a full-scale
+    // SCP (coeff_scale=2^40) uses scale_2=1 (unchanged vs the int64 kernel).
+    // The product |coeff| * scale_2 (~30 * 2^24 ~ 2^29) fits int64 with margin.
+    __global__ void light_pt_expand_per_tower_i16_kernel(
+            const std::int16_t *__restrict__ src_signed,
+            std::uint64_t *__restrict__ dst,  // size num_towers * N
+            const DModulus *__restrict__ moduli,
+            std::int64_t scale_2,
+            std::size_t num_towers,
+            std::size_t N) {
+        const std::size_t total = num_towers * N;
+        for (std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+             tid < total;
+             tid += blockDim.x * gridDim.x) {
+            const std::size_t j = tid / N;
+            const std::size_t i = tid - j * N;
+            const DModulus mod = moduli[j];
+            const std::uint64_t qj = mod.value();
+            const std::uint64_t mu_hi = mod.const_ratio()[1];
+            const std::int64_t c =
+                static_cast<std::int64_t>(src_signed[i]) * scale_2;
+            std::uint64_t out;
+            if (c >= 0) {
+                out = barrett_reduce_uint64_uint64(static_cast<std::uint64_t>(c), qj, mu_hi);
+            } else {
+                const std::uint64_t mag = static_cast<std::uint64_t>(-c);
+                std::uint64_t mag_mod = barrett_reduce_uint64_uint64(mag, qj, mu_hi);
+                out = (mag_mod == 0) ? 0ULL : (qj - mag_mod);
+            }
+            dst[tid] = out;
+        }
+    }
+
     // Encode a complex diagonal into a compact LightPlaintext.
     //
     // Implementation (one-shot, slow path used only at key generation):

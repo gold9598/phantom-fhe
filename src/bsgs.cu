@@ -1,7 +1,9 @@
 #include "bsgs.h"
 
+#include <cmath>
 #include <complex>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 
@@ -13,13 +15,23 @@
 
 namespace phantom {
 
-    // Forward declaration of kernel defined in src/bootstrap.cu (non-static,
+    // Forward declarations of kernels defined in src/bootstrap.cu (non-static,
     // namespace phantom). Reused here to share one source of truth with the
-    // single-chain expand path.
+    // single-chain expand path. The int16 variant applies scale_2 to restore
+    // the full message scale from the SCP's quantization scale; the int64
+    // variant is used for full-scale SCPs (scale_2 implicitly 1).
     __global__ void light_pt_expand_per_tower_kernel(
             const std::int64_t *src_signed,
             std::uint64_t *dst,
             const DModulus *moduli,
+            std::size_t num_towers,
+            std::size_t N);
+
+    __global__ void light_pt_expand_per_tower_i16_kernel(
+            const std::int16_t *src_signed,
+            std::uint64_t *dst,
+            const DModulus *moduli,
+            std::int64_t scale_2,
             std::size_t num_towers,
             std::size_t N);
 
@@ -281,29 +293,40 @@ namespace phantom {
             // expand sweep finishes).
             for (std::size_t b = 0; b < M; ++b) {
                 const auto &scp = diags.diagonals[base + b];
-                if (scp.coeffs.size() != N) {
+                if (scp.N() != N) {
                     throw std::invalid_argument(
                             "bsgs_apply_giants_with_babies: scp coeff length != N");
                 }
 
                 std::uint64_t *pt_dst = pooled.get() + b * per_poly;
 
-                // H2D async into a device scratch buffer first, since the source lives
-                // in pinned host memory.
-                auto d_signed = phantom::util::make_cuda_auto_ptr<std::int64_t>(N, stream);
-                cudaMemcpyAsync(d_signed.get(), scp.coeffs.data(),
-                                N * sizeof(std::int64_t),
-                                cudaMemcpyHostToDevice, stream);
-
                 const std::size_t threads = 256;
                 const std::size_t total = num_towers * N;
                 const std::size_t blocks = (total + threads - 1) / threads;
-                light_pt_expand_per_tower_kernel<<<blocks, threads, 0, stream>>>(
-                        d_signed.get(),
-                        pt_dst,
-                        base_rns,
-                        num_towers,
-                        N);
+
+                // H2D async into a device scratch buffer first, since the source
+                // lives in pinned host memory. Dispatch on the SCP's storage
+                // width: int16 (quantized) applies scale_2; int64 (full-scale).
+                if (scp.is_int16) {
+                    const std::int64_t scale_2 = (scp.coeff_scale > 0.0)
+                            ? static_cast<std::int64_t>(std::llround(scp.scale / scp.coeff_scale))
+                            : 1;
+                    auto d_signed = phantom::util::make_cuda_auto_ptr<std::int16_t>(N, stream);
+                    cudaMemcpyAsync(d_signed.get(), scp.coeffs.data(),
+                                    N * sizeof(std::int16_t),
+                                    cudaMemcpyHostToDevice, stream);
+                    light_pt_expand_per_tower_i16_kernel<<<blocks, threads, 0, stream>>>(
+                            d_signed.get(), pt_dst, base_rns, scale_2,
+                            num_towers, N);
+                } else {
+                    auto d_signed = phantom::util::make_cuda_auto_ptr<std::int64_t>(N, stream);
+                    cudaMemcpyAsync(d_signed.get(), scp.coeffs64.data(),
+                                    N * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice, stream);
+                    light_pt_expand_per_tower_kernel<<<blocks, threads, 0, stream>>>(
+                            d_signed.get(), pt_dst, base_rns,
+                            num_towers, N);
+                }
 
                 // Forward NTT per baby. Empirically faster than the batched
                 // variant at LLaMA scale because a single-poly NTT already

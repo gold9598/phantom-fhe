@@ -14,7 +14,7 @@ On-disk layout (one directory per cache, atomic via tempfile+rename):
 
   <root>/
     index.json          -- version tag + structure metadata
-    <key>.bin           -- one file per SCP holding raw int64 bytes
+    <key>.bin           -- one file per SCP holding raw int16 bytes
 
 The index.json records:
   {
@@ -43,7 +43,9 @@ from typing import Any
 import pyPhantom as phantom
 
 
-CACHE_VERSION = 1
+# v2: per-SCP .bin files hold int16 coeffs and the index carries coeff_scale.
+# Bumped from v1 (int64) so stale caches are rejected and cold-re-encoded.
+CACHE_VERSION = 2
 
 
 def _is_scp(obj: Any) -> bool:
@@ -63,6 +65,7 @@ def _walk_collect(obj: Any, entries: list, path_prefix: str) -> Any:
         entries.append({
             "fname": fname,
             "scale": float(obj.get_scale()),
+            "coeff_scale": float(obj.get_coeff_scale()),
             "N": int(obj.N),
             "bytes": obj.coeffs_bytes(),
         })
@@ -98,7 +101,9 @@ def _walk_rebuild(tree: Any, entries_meta: list, root: str) -> Any:
             path = os.path.join(root, meta["fname"])
             with open(path, "rb") as f:
                 data = f.read()
-            return phantom.scp_from_bytes(data, meta["scale"], meta["N"])
+            return phantom.scp_from_bytes(
+                data, meta["scale"], meta["N"],
+                meta.get("coeff_scale", meta["scale"]))
         if "__tuple__" in tree:
             return tuple(_walk_rebuild(v, entries_meta, root)
                          for v in tree["__tuple__"])
@@ -121,7 +126,7 @@ def save_scp_dict_to_disk(scp_dict: Any, path: str) -> None:
     """Serialize an arbitrary dict-of-SCPs (or dict-of-dicts) to a directory.
 
     Format: index.json (structure + scales + sizes) plus one .bin per SCP
-    (raw int64 bytes). Atomic via tempfile + rename: the destination
+    (raw int16 bytes). Atomic via tempfile + rename: the destination
     directory is fully populated under a sibling temp dir, then renamed
     over `path`. If `path` already exists, it is replaced.
     """
