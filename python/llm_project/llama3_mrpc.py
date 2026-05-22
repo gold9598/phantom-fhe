@@ -51,7 +51,7 @@ sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
 from blocks.attention import (
     qkt_required_steps, score_v_required_steps, broadcast_required_steps,
 )
-from blocks.bootstrap import bootstrap_safe, merge_bootstrap
+from blocks.bootstrap import bootstrap, merge_bootstrap
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
 )
@@ -224,7 +224,7 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
 
     Returns:
       z1, z2: rmsnorm input variance estimates for rms1 / rms2.
-      max_abs: dict of bootstrap_safe max_abs values for the in-block sites.
+      max_abs: dict of bootstrap max_abs values for the in-block sites.
     """
     g1, g2 = w["g1"], w["g2"]
     Wq, Wk, Wv, Wo = w["Wq"], w["Wk"], w["Wv"], w["Wo"]
@@ -856,7 +856,7 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
         score_cts.append(sc)
 
     # ---- Bootstrap after stage A (before ps_exp), mirroring the IRP path's
-    # post-stage-A bootstrap (fhe_attention_multi_ct: bootstrap_safe at
+    # post-stage-A bootstrap (fhe_attention_multi_ct: bootstrap at
     # max_abs=_calib["scores"]). Without it the ps_exp(3) + squarings(NSQ) +
     # mask(1) + softmax_correct(2*ITERS) depth overruns a single fresh chain
     # ("end of modulus switching chain reached"). The dense gate is a
@@ -864,7 +864,7 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
     # site, so it bootstraps exactly like the live IRP softmax. ----
     _SCORES_CALIB = 45.10  # same static post-stage-A bound the IRP path uses
     score_cts = [
-        bootstrap_safe(engine, ctx, encoder, sc,
+        bootstrap(engine, ctx, encoder, sc,
                        max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS)
         for sc in score_cts
     ]
@@ -912,7 +912,7 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
                     if _max_head_denom > _SOFTMAX_TARGET else 1.0)
 
     # ---- Dense-layout-correct per-shard pre-bootstrap mean (H2 fix). ----
-    # bootstrap_safe assumes a ~mean-zero input; the mean-sub-before /
+    # bootstrap assumes a ~mean-zero input; the mean-sub-before /
     # mean-add-after pair must use the shard ciphertext's TRUE mean. The
     # old hardcoded 0.4487 is the IRP head-major layout's empirical mean;
     # the dense token-major shard layout has a different populated/junk
@@ -996,7 +996,7 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
         phantom.square_iterations_damped_inplace(
             ctx, encoder, relin_key, e_ct, damps)
         # Mean-subtract BEFORE the bootstrap, mean-add AFTER — EXACTLY the IRP
-        # path's _stage_b_ps_exp (sub) / _stage_c_post (add). bootstrap_safe
+        # path's _stage_b_ps_exp (sub) / _stage_c_post (add). bootstrap
         # assumes an approximately mean-zero input (its docstring); but after
         # ps_exp + damped squarings the off-support slots all sit at
         # pipeline(0) ≈ TARGET_MAG ≈ 0.45, so the ciphertext mean is ≈ 0.45.
@@ -1012,7 +1012,7 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
         # IRP-tuned 0.4487 so the bootstrap input is actually mean-zero.
         _PRE_FINSMX_MEAN = float(_dense_pre_mean[b])
         # DIAGNOSTIC ONLY (PROBE_DENSE_SMX=1): decrypt this dense shard ct's
-        # TRUE mean right before the mean-sub. bootstrap_safe assumes an
+        # TRUE mean right before the mean-sub. bootstrap assumes an
         # ~mean-zero input; `_PRE_FINSMX_MEAN` should equal this true mean.
         # Any gap is added uniformly to every slot by the mean-add-back and
         # de-centers the bootstrap input -> value-independent absolute `e`
@@ -1029,7 +1029,7 @@ def fhe_attention_dense_softmax(engine, ctx, encoder, sk, relin_key, galois_key,
             ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
             e_ct.scale(), e_ct.chain_index())
         e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
-        e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
+        e_ct = bootstrap(engine, ctx, encoder, e_ct,
                               max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
         _mean_pt2 = encoder.encode_double_vector(
             ctx, np.full(NUM_SLOTS, _PRE_FINSMX_MEAN, dtype=np.float64),
@@ -1354,7 +1354,7 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # ---- QK^T via IRP-Wq (Cachemir §4.1) + compute_qkt_irp (Cachemir §5.1).
     # Wq: K=d²/N=512 SCPs (8× fewer than dense BSGS's 4096); irp_matvec_host
     # computes y = x @ M so we pass Wq_baked.T to get q = Wq_baked @ xn_query.
-    # Post-matvec scale snap SCALE^2 → SCALE, then bootstrap_safe refreshes
+    # Post-matvec scale snap SCALE^2 → SCALE, then bootstrap refreshes
     # chain so compute_qkt_irp sees q at canonical scale. q stays in IRP
     # stride-t layout (slot[i*t]=q[i]) — directly consumed by compute_qkt_irp.
     from blocks import irp as _irp
@@ -1536,7 +1536,7 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
 
     # ---- Bootstrap-1 (post-Stage-A). Single ct vs dense's per-shard 4×.
     _SCORES_CALIB = 45.10
-    S_global = bootstrap_safe(
+    S_global = bootstrap(
         engine, ctx, encoder, S_global,
         max_abs=_SCORES_CALIB, slot_count=NUM_SLOTS)
 
@@ -1605,7 +1605,7 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         e_ct.scale(), e_ct.chain_index())
     e_ct = phantom.sub_plain(ctx, e_ct, _mean_pt)
     # Bootstrap-2 (mean-centered).
-    e_ct = bootstrap_safe(
+    e_ct = bootstrap(
         engine, ctx, encoder, e_ct,
         max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
     _mean_pt2 = encoder.encode_double_vector(
@@ -2159,7 +2159,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # (Wo/Wgate/Wup/Wdown) per-layer inside the attention / MLP blocks.
         w = layer_weights[layer_idx]
 
-        # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware).
+        # Per-layer rmsnorm + bootstrap calibration (num_tokens-aware).
         # When `precomputed_calib` is supplied (parallel sweep), skip the
         # per-example shadow forward pass entirely — calib was precomputed
         # once at startup using a representative example, which also lets
@@ -2296,7 +2296,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             # (from pytorch_ref[layer_idx]) and feed the previous layer's
             # output ciphertext forward instead. 625ea9c called
             # engine.bootstrap_inplace(y_ct) directly to refresh it to a
-            # fresh level; the SK-free equivalent here is bootstrap_safe
+            # fresh level; the SK-free equivalent here is bootstrap
             # with the same x_in calibration the pipeline already trusts
             # for x_ct (line below mirrors the boot_before["rms1"] site).
             # This restores y_ct to the freshest chain index / SCALE that
@@ -2304,7 +2304,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             # layout is already preserved by the decoder pipeline (same
             # layout that y_full[::T_MODEL][:D_MODEL] decodes).
             assert _y_ct_carry is not None, "autonomous: missing y_ct carry"
-            x_ct = bootstrap_safe(engine, ctx, encoder, _y_ct_carry,
+            x_ct = bootstrap(engine, ctx, encoder, _y_ct_carry,
                                    max_abs=max_abs_calib.get("x_in", 1.0),
                                    slot_count=NUM_SLOTS)
         t_encrypt = time.perf_counter() - t_encrypt0
@@ -2318,7 +2318,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 _probe(f"input v_ct[{kk}]", ctx, encoder, sk, vct)
         # rms1
         if boot_before.get("rms1", False):
-            x_ct = bootstrap_safe(engine, ctx, encoder, x_ct,
+            x_ct = bootstrap(engine, ctx, encoder, x_ct,
                                     max_abs=max_abs_calib.get("x_in", 1.0),
                                     slot_count=NUM_SLOTS)
         x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
@@ -2326,7 +2326,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if verbose: _probe("post-rms1", ctx, encoder, sk, x_norm)
         # attention (multi-ct)
         if boot_before.get("attention", False):
-            x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
+            x_norm = bootstrap(engine, ctx, encoder, x_norm,
                                       max_abs=max_abs_calib.get("rms1_out", 1.0),
                                       slot_count=NUM_SLOTS)
         # Dense token-major attention (THE compute path — IRP deleted).
@@ -2377,7 +2377,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
         # rms2
         if boot_before.get("rms2", False):
-            x_mid_ct = bootstrap_safe(engine, ctx, encoder, x_mid_ct,
+            x_mid_ct = bootstrap(engine, ctx, encoder, x_mid_ct,
                                         max_abs=max_abs_calib.get("x_mid", 1.0),
                                         slot_count=NUM_SLOTS)
         x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
@@ -2385,7 +2385,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if verbose: _probe("post-rms2", ctx, encoder, sk, x_mid_norm)
         # mlp
         if boot_before.get("mlp", False):
-            x_mid_norm = bootstrap_safe(engine, ctx, encoder, x_mid_norm,
+            x_mid_norm = bootstrap(engine, ctx, encoder, x_mid_norm,
                                            max_abs=max_abs_calib.get("rms2_out", 1.0),
                                            slot_count=NUM_SLOTS)
         # ---- IRP-rect MLP (Cachemir §4.1 rect host).

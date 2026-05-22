@@ -100,9 +100,9 @@ RMS_Z_MARGIN = 0.30  # ±30% multiplicative window for per-layer z calibration
 #   SDPA C:      ~4 levels  (finalize_softmax, score_v ct*ct+rescale, mask+replicate)  → bootstrap between B and C
 #   Wo IRP:      1 level
 #   rms2:        ~5 levels  → bootstrap before rms2
-#   MLP gate/up: 1 level each IRP → bootstrap_safe refresh (fresh chain ~13 ul above msg)
+#   MLP gate/up: 1 level each IRP → bootstrap refresh (fresh chain ~13 ul above msg)
 #   silu:        ~4 levels  (deg-8 poly)  ← fits within freshened budget
-#   swiglu:      1 level    (ct*ct)       → bootstrap_safe refresh before Wdown
+#   swiglu:      1 level    (ct*ct)       → bootstrap refresh before Wdown
 #   Wdown IRP:   1 level
 # Total per sub-stage ≤ 10; NSL=14 (13 usable) gives comfortable headroom.
 NUM_SCALE_LEVELS = int(__import__("os").environ.get("NSL",
@@ -189,11 +189,11 @@ def rms_z_window(z):
     return (z * (1.0 - RMS_Z_MARGIN), z * (1.0 + RMS_Z_MARGIN))
 
 BOOT_CALIB_MARGIN = 1.5  # safety margin over numpy-predicted max|.| at each
-                          # bootstrap_safe site, to absorb FHE-side noise drift.
+                          # bootstrap site, to absorb FHE-side noise drift.
 
 
 def compute_layer_max_abs(x_btd, w, cos_all, sin_all, P, margin=BOOT_CALIB_MARGIN):
-    """Trace numpy forward and record max|.| at every bootstrap_safe site.
+    """Trace numpy forward and record max|.| at every bootstrap site.
     Returns a dict of per-site max_abs values (margined) for this layer's
     actual input distribution. Used by fhe_attention_irp_bootstrap and
     fhe_mlp_irp_bootstrap to calibrate the in-block CKKS bootstraps."""

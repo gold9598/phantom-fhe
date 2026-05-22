@@ -163,7 +163,7 @@ boundaries, not in the decoder body.
 
 ### Bootstrap mechanism
 
-The Cachemir IRP path uses `bootstrap_safe` — a static-bound wrapper that
+The Cachemir IRP path uses `bootstrap` — a static-bound wrapper that
 pre-scales the input by a plaintext constant chosen per call site, runs
 `engine.bootstrap_inplace`, then unscales.
 
