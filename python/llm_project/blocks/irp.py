@@ -608,24 +608,6 @@ def encode_irp_mask_rect(
     return encode_irp_mask(ctx, encoder, N=N, d=d, scale=scale, chain_index=chain_index)
 
 
-def encode_irp_output_mask_wide(
-    ctx,
-    encoder,
-    N: int,
-    d_in: int,
-    d_out: int,
-    scale: float,
-    chain_index: int,
-):
-    """Final-output mask for wide IRP: 1 at every stride-t' slot, else 0."""
-    if d_in >= d_out:
-        raise ValueError("encode_irp_output_mask_wide: only for wide d_in < d_out")
-    t_out = N // d_out
-    slots = np.zeros(N, dtype=np.float64)
-    slots[::t_out][:d_out] = 1.0
-    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
-
-
 def irp_required_steps_rect(
     N: int,
     d_in: int,

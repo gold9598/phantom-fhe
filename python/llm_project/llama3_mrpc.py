@@ -94,17 +94,6 @@ def _make_rms_params_local(zmin, zmax):
     return p
 
 
-def compute_layer_z_n(x_btd, w, num_tokens, query_position):
-    """num_tokens-aware version of llama3.compute_layer_z (which hardcodes
-    NUM_TOKENS=4). Returns (z_rms1, z_rms2)."""
-    z1 = float((x_btd[query_position] ** 2).mean() + EPSILON)
-    xn = rmsnorm_np(x_btd, w["g1"])
-    Q_full = (xn @ w["Wq"].T).reshape(num_tokens, N_HEADS, D_HEAD)
-    K_full = (xn @ w["Wk"].T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
-    V_full = (xn @ w["Wv"].T).reshape(num_tokens, N_KV_HEADS, D_HEAD)
-    return z1, None  # rms2 z computed below
-
-
 def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position,
                             margin=BOOT_CALIB_MARGIN):
     """num_tokens-aware version of compute_layer_z + compute_layer_max_abs.
