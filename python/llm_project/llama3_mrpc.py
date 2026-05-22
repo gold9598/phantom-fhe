@@ -1339,10 +1339,20 @@ def run_mrpc_example(idx, truncate_to=None):
     cos_all_full = np.load(f"{PROBE_FULL}/rope_cos.npy").astype(np.float64)
     sin_all_full = np.load(f"{PROBE_FULL}/rope_sin.npy").astype(np.float64)
 
+    # Stream rp_indep per-layer from the disk cache when present, so peak RAM
+    # stays ~17 GB instead of the ~73 GB int64 upfront build that OOMs on
+    # small hosts (e.g. the 62 GB box). Falls back to in-process build when
+    # the per-layer disk cache (build_disk_cache.py) is absent.
+    _rp_root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "..", "cache", "rp_indep")
+    _rp_root = _rp_root if os.path.exists(
+        os.path.join(_rp_root, "MANIFEST.json")) else None
     yes_logit, no_logit = run_classifier_fhe(
         num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
         cos_all_full, sin_all_full, label=f"mrpc_{idx}",
-        debug_layer=DEBUG_LAYER, max_layer=MAX_LAYER, min_layer=MIN_LAYER)
+        debug_layer=DEBUG_LAYER, max_layer=MAX_LAYER, min_layer=MIN_LAYER,
+        rp_indep_cache=({} if _rp_root else None),
+        rp_indep_disk_root=_rp_root)
     fhe_pred = "Yes" if yes_logit > no_logit else "No"
     print(f"\n=== Stage 3b-f-2 result ===")
     print(f"  FHE yes={yes_logit:.4f}  no={no_logit:.4f}  pred={fhe_pred}")
