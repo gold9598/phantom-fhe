@@ -629,24 +629,6 @@ def encode_irp_mask_rect(
     return encode_irp_mask(ctx, encoder, N=N, d=d, scale=scale, chain_index=chain_index)
 
 
-def encode_irp_output_mask_wide(
-    ctx,
-    encoder,
-    N: int,
-    d_in: int,
-    d_out: int,
-    scale: float,
-    chain_index: int,
-):
-    """Final-output mask for wide IRP: 1 at every stride-t' slot, else 0."""
-    if d_in >= d_out:
-        raise ValueError("encode_irp_output_mask_wide: only for wide d_in < d_out")
-    t_out = N // d_out
-    slots = np.zeros(N, dtype=np.float64)
-    slots[::t_out][:d_out] = 1.0
-    return encoder.encode_double_vector(ctx, slots, scale, chain_index)
-
-
 def irp_required_steps_rect(
     N: int,
     d_in: int,
@@ -847,72 +829,6 @@ def irp_matvec_rect(
         else:
             out = phantom.add(ctx, out, sub_q)
     return out
-
-
-def encode_irp_diagonals_rect_pair_host(
-    ctx,
-    encoder,
-    matrix_real: np.ndarray,
-    matrix_imag: np.ndarray,
-    N: int,
-    d_in: int,
-    d_out: int,
-    scale: float,
-    baby_steps: int = 1,
-) -> List:
-    """Pack two real rect matrices into one complex IRP plaintext set.
-
-    `matrix_real` becomes the real part, `matrix_imag` the imag part of
-    each slot. A subsequent irp_matvec_host call multiplies a real-only
-    ciphertext by these complex plaintexts and accumulates a complex-
-    valued result: re(result) = matrix_real @ x, im(result) = matrix_imag @ x.
-
-    Halves the number of plaintexts vs encoding the two matrices
-    separately (since both share the same diagonal indexing). Halves
-    the matvec multiplication count for the pair.
-
-    Both matrices must have the same (d_in, d_out) shape; alpha sub-blocks
-    are folded by the rect encoder identically for both.
-    """
-    if matrix_real.shape != matrix_imag.shape:
-        raise ValueError(f"encode_irp_diagonals_rect_pair_host: shape mismatch "
-                         f"{matrix_real.shape} vs {matrix_imag.shape}")
-    if matrix_real.shape != (d_in, d_out):
-        raise ValueError(f"encode_irp_diagonals_rect_pair_host: matrices must be "
-                         f"({d_in}, {d_out}), got {matrix_real.shape}")
-    if d_in == d_out:
-        raise ValueError("encode_irp_diagonals_rect_pair_host: d_in == d_out -- use "
-                         "square pair variant instead")
-    d = min(d_in, d_out)
-    alpha = max(d_in, d_out) // d
-    _check_rect_dims(N, d, alpha)
-    t, K = _check_dims(N, d)
-    M = baby_steps
-    if not _is_pow2(M):
-        raise ValueError(f"encode_irp_diagonals_rect_pair_host: baby_steps must be power of 2, got {M}")
-    if K % M != 0:
-        raise ValueError(f"encode_irp_diagonals_rect_pair_host: baby_steps={M} must divide K={K}")
-    G = K // M
-
-    plaintexts = []
-    for q in range(alpha):
-        slice_axis = slice(None, None)
-        if d_in < d_out:
-            W_q_real = matrix_real[:, q * d:(q + 1) * d]
-            W_q_imag = matrix_imag[:, q * d:(q + 1) * d]
-        else:
-            W_q_real = matrix_real[q * d:(q + 1) * d, :]
-            W_q_imag = matrix_imag[q * d:(q + 1) * d, :]
-        slots_real = _build_irp_slots(W_q_real, N, d, t, K, M, G, dtype=complex)
-        slots_imag = _build_irp_slots(W_q_imag, N, d, t, K, M, G, dtype=complex)
-        for sr, si in zip(slots_real, slots_imag):
-            # Combine: real part from sr (already real-only), imag from si.real.
-            combined = sr.real + 1j * si.real
-            # Pass numpy complex array directly — fast path via binding's
-            # numpy overload (no Python iteration of 65K complex objects).
-            plaintexts.append(phantom.encode_single_chain_plaintext(
-                ctx, encoder, combined, scale, IRP_COEFF_SCALE))
-    return plaintexts
 
 
 def extract_real_imag_pair(ctx, encoder, galois_key, ct_complex,

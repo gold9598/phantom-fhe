@@ -12,7 +12,6 @@ the plaintext encode scale.  For BITS-uniform chains every middle prime is
 import math
 import os
 import sys
-import time
 
 import numpy as np
 
@@ -24,11 +23,11 @@ import pyPhantom as phantom
 #    used by the per-block regression tests)
 #  - package-qualified (`from blocks.attention import ...`, used by headlines)
 try:
-    from blocks.linear import inner_sum_required_steps, replicate_required_steps
+    from blocks.linear import inner_sum_required_steps
     from blocks.softmax import softmax_damping_schedule, softmax_required_steps
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from linear import inner_sum_required_steps, replicate_required_steps
+    from linear import inner_sum_required_steps
     from softmax import softmax_damping_schedule, softmax_required_steps
 
 
