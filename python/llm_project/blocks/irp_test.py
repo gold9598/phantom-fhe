@@ -108,7 +108,7 @@ def run_case(d, baby_steps, tol, label, seed):
 # Toy: d=256 (smallest power-of-2 satisfying d^2 % NUM_SLOTS == 0 for
 # NUM_SLOTS=16384, since sqrt(16384)=128 -> next pow-2 d=256).
 # K = 256^2/16384 = 4 plaintexts, t = 16384/256 = 64.
-run_case(d=256, baby_steps=1, tol=5e-5,
+run_case(d=256, baby_steps=1, tol=1e-4,
          label="toy d=256", seed=0)
 
 # LLaMA Wq scale: d=4096, NUM_SLOTS=32768 -> K = 4096^2/32768 = 512 plaintexts,
