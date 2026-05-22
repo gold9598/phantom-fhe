@@ -66,6 +66,22 @@ namespace phantom {
             const std::vector<PhantomCiphertext> &babies,
             const BsgsDiagonals &diags);
 
+    // Fused multiply-accumulate: compute Sum_b plaintexts[b] * babies[b] as a
+    // single size-2 NTT-form ciphertext via mac_accumulate_kernel.
+    //
+    // `plaintexts` MUST be ALREADY-EXPANDED full-RNS NTT-form plaintexts as
+    // produced by `expand_single_chain_to_full` (works for every SCP dtype) —
+    // they are gathered into a contiguous pooled buffer with NO re-expand and
+    // NO extra NTT. Bit-identical to running M back-to-back
+    // multiply_plain(baby, pt) + add calls. All babies and plaintexts must
+    // share the same chain_index; babies must be size-2 NTT-form. The result's
+    // scale is babies[0].scale() * plaintexts[0].scale(), matching
+    // multiply_plain_ntt's scale update.
+    PhantomCiphertext fused_mac_accumulate(
+            const PhantomContext &ctx,
+            const std::vector<PhantomCiphertext> &babies,
+            const std::vector<PhantomPlaintext> &plaintexts);
+
     // ---- Complex-folded BSGS ----
     //
     // Pack two real rows into one complex row to halve d_pad. Each diagonal
