@@ -344,8 +344,23 @@ def _wq_key(layer_idx, P_local, d, baby_steps, scale):
             f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
 
 
+def _wq_unfold_key(layer_idx, P_local, d, baby_steps, scale):
+    return (f"wq_L{int(layer_idx)}_q{int(P_local)}_d{int(d)}_unfold"
+            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
+
+
 def _wo_key(layer_idx, d, baby_steps, scale):
     return (f"wo_L{int(layer_idx)}_d{int(d)}_fold"
+            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
+
+
+def _wo_unfold_key(layer_idx, d, baby_steps, scale):
+    return (f"wo_L{int(layer_idx)}_d{int(d)}_unfold"
+            f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
+
+
+def _down_unfold_key(layer_idx, d_in, d_out, baby_steps, scale):
+    return (f"down_L{int(layer_idx)}_di{int(d_in)}_do{int(d_out)}_unfoldperm"
             f"_b{int(baby_steps)}_s{_scale_tag(scale)}")
 
 
@@ -379,7 +394,7 @@ def _cached_rect(key, ctx, encoder, matrix, N, d_in, d_out, scale, baby_steps):
     if _has_blob(path):
         return _ram_get_or_load(key, path)
     pts = _irp.encode_irp_diagonals_rect_host(
-        ctx, encoder, matrix, N=N, d_in=d_in, d_out=d_out,
+        ctx, encoder, _resolve_matrix(matrix), N=N, d_in=d_in, d_out=d_out,
         scale=scale, baby_steps=baby_steps)
     _save_blob(path, pts)
     return pts
@@ -451,6 +466,45 @@ def wo_plaintexts_cached(ctx, encoder, Wo_T, N, d, scale, baby_steps,
     key = _wo_key(layer_idx, d, baby_steps, scale)
     return _cached_square_folded(key, ctx, encoder, Wo_T, N, d, scale,
                                  baby_steps)
+
+
+def wq_unfolded_plaintexts_cached(ctx, encoder, Wq_baked_T, N, d, scale,
+                                  baby_steps, layer_idx, P_local):
+    """Wq_baked.T -> UNFOLDED square IRP SCPs (K) for the bridgeless Wq path.
+    Consume with irp_matvec_host → q in IRP stride-(N/d) layout fed directly
+    to compute_qkt_irp (no conj-split, no SK bridge). Key includes P_local."""
+    key = _wq_unfold_key(layer_idx, P_local, d, baby_steps, scale)
+    return _cached_square(key, ctx, encoder, _resolve_matrix(Wq_baked_T),
+                          N, d, scale, baby_steps)
+
+
+def wo_unfolded_plaintexts_cached(ctx, encoder, Wo_T, N, d, scale, baby_steps,
+                                  layer_idx):
+    """Wo.T -> UNFOLDED square IRP SCPs (K) for the bridgeless Wo path.
+    Consume with irp_matvec_host → o in IRP stride-(N/d)=stride-T_MODEL layout
+    directly fed to residual1 (no conj-split, no SK bridge)."""
+    key = _wo_unfold_key(layer_idx, d, baby_steps, scale)
+    return _cached_square(key, ctx, encoder, _resolve_matrix(Wo_T),
+                          N, d, scale, baby_steps)
+
+
+def down_unfolded_plaintexts_cached(ctx, encoder, Wdown_padded, N, d_in, d_out,
+                                    scale, baby_steps, layer_idx,
+                                    gate_up_d_in, gate_up_d_out):
+    """Wdown (padded tall) -> UNFOLDED IRP-rect SCPs (K=2048), rows ROW-PERMUTED
+    to absorb the gate/up interleave layout — for the bridgeless Wdown path.
+    Row permute computed against the FULL d_out (not d_out//2), giving natural
+    stride-(N/d_out) output consumable by residual2 with no SK bridge."""
+    key = _down_unfold_key(layer_idx, d_in, d_out, baby_steps, scale)
+
+    def _load_perm():
+        order = _irp.interleave_output_order(
+            N, gate_up_d_in, gate_up_d_out,
+            down_d_in=d_in, down_d_out=d_out)
+        return _resolve_matrix(Wdown_padded)[order, :]
+
+    return _cached_rect(key, ctx, encoder, _load_perm, N, d_in, d_out,
+                        scale, baby_steps)
 
 
 def gate_plaintexts_cached(ctx, encoder, Wgate_padded, N, d_in, d_out, scale,
