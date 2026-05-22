@@ -48,7 +48,7 @@ from blocks.attention import (
 )
 from blocks.softmax import softmax_damping_schedule
 from blocks.silu import silu, fit_silu_coeffs
-from blocks.bootstrap import bootstrap_safe
+from blocks.bootstrap import bootstrap
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
 )
@@ -115,9 +115,9 @@ RMS_Z_MARGIN = 0.30  # ±30% multiplicative window for per-layer z calibration
 #   SDPA C:      ~4 levels  (finalize_softmax, score_v ct*ct+rescale, mask+replicate)  → bootstrap between B and C
 #   Wo IRP:      1 level
 #   rms2:        ~5 levels  → bootstrap before rms2
-#   MLP gate/up: 1 level each IRP → bootstrap_safe refresh (fresh chain ~13 ul above msg)
+#   MLP gate/up: 1 level each IRP → bootstrap refresh (fresh chain ~13 ul above msg)
 #   silu:        ~4 levels  (deg-8 poly)  ← fits within freshened budget
-#   swiglu:      1 level    (ct*ct)       → bootstrap_safe refresh before Wdown
+#   swiglu:      1 level    (ct*ct)       → bootstrap refresh before Wdown
 #   Wdown IRP:   1 level
 # Total per sub-stage ≤ 10; NSL=14 (13 usable) gives comfortable headroom.
 NUM_SCALE_LEVELS = 14
@@ -294,11 +294,11 @@ def rms_z_window(z):
     return (z * (1.0 - RMS_Z_MARGIN), z * (1.0 + RMS_Z_MARGIN))
 
 BOOT_CALIB_MARGIN = 1.5  # safety margin over numpy-predicted max|.| at each
-                          # bootstrap_safe site, to absorb FHE-side noise drift.
+                          # bootstrap site, to absorb FHE-side noise drift.
 
 
 def compute_layer_max_abs(x_btd, w, cos_all, sin_all, P, margin=BOOT_CALIB_MARGIN):
-    """Trace numpy forward and record max|.| at every bootstrap_safe site.
+    """Trace numpy forward and record max|.| at every bootstrap site.
     Returns a dict of per-site max_abs values (margined) for this layer's
     actual input distribution. Used by fhe_attention_irp_bootstrap and
     fhe_mlp_irp_bootstrap to calibrate the in-block CKKS bootstraps."""
@@ -490,7 +490,7 @@ def run_decoder_fhe(engine, ctx, encoder, sk, relin_key, galois_key,
         if not boot_before.get(name, False):
             return ct
         t0 = time.perf_counter()
-        ct = bootstrap_safe(engine, ctx, encoder, ct,
+        ct = bootstrap(engine, ctx, encoder, ct,
                             max_abs=_BOOT_MAX_ABS[name], slot_count=NUM_SLOTS)
         stage_times["bootstrap"] += (time.perf_counter() - t0) * 1000
         print(f"  [plan] bootstrap before {name}: chain={ct.chain_index()}")
@@ -643,7 +643,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     # budget. Without this, q_ct at chain ~28 would push compute_qkt_irp +
     # mask*scale past chain 29 (= NSL_MAX) and overflow. ----
     t0 = _t()
-    q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
+    q_ct = bootstrap(engine, ctx, encoder, q_ct,
                           max_abs=_calib["q"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
     if probe_np is not None and sk is not None:
@@ -698,7 +698,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
 
     # ---- bootstrap before damped squarings. ----
     t0 = _t()
-    scores_ct = bootstrap_safe(engine, ctx, encoder, scores_ct,
+    scores_ct = bootstrap(engine, ctx, encoder, scores_ct,
                                max_abs=_calib["scores"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
     if probe_np is not None and sk is not None:
@@ -741,7 +741,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
     # pre-finalize mask, so the global slot mean is dominated by the polynomial
     # constant evaluated at zero (poly(0) ~ 0.449 with the deg-4 Chebyshev fit
     # used by ps_exp_init+damped squarings). Mean-subtract before bootstrap to
-    # keep |centered| <= TARGET_MAG and avoid the bootstrap_safe scale-down
+    # keep |centered| <= TARGET_MAG and avoid the bootstrap scale-down
     # path (which is rejected at max_user_level).
     t0 = _t()
     _PRE_FINSMX_MEAN = 0.4487
@@ -759,7 +759,7 @@ def fhe_attention_irp_bootstrap(engine, ctx, encoder, relin_key,
               f"  np_max={np.abs(exp_ref_sub).max():.2e}"
               f"  diff_max={np.abs(diff_e2).max():.2e}"
               f"  diff_rms={np.linalg.norm(diff_e2)/math.sqrt(len(diff_e2)):.2e}")
-    e_ct = bootstrap_safe(engine, ctx, encoder, e_ct,
+    e_ct = bootstrap(engine, ctx, encoder, e_ct,
                           max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
     if probe_np is not None and sk is not None:
         raw_e3 = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, e_ct)),
@@ -982,7 +982,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
         # Packed path: gate_ct already holds gate+i·up. Just bootstrap (use
         # sqrt(2)*max_abs for the complex magnitude bound), then extract
         # via conjugation.
-        gate_ct = bootstrap_safe(engine, ctx, encoder, gate_ct,
+        gate_ct = bootstrap(engine, ctx, encoder, gate_ct,
                                    max_abs=pair_max_abs * 1.42,
                                    slot_count=NUM_SLOTS)
         from blocks.irp import extract_real_imag_pair
@@ -1043,7 +1043,7 @@ def fhe_mlp_irp_bootstrap(engine, ctx, encoder, relin_key,
 
     # ---- Refresh h via homomorphic bootstrap (preserves permuted layout). ----
     t0 = _t()
-    h_fresh = bootstrap_safe(engine, ctx, encoder, h_ct,
+    h_fresh = bootstrap(engine, ctx, encoder, h_ct,
                              max_abs=_calib["h"], slot_count=NUM_SLOTS)
     # Mod-switch to IRP_MLP chain so plaintext chain indices align and GPU
     # memory stays within budget (chain 16 has 30 primes; chain 26 has 5).
@@ -1340,12 +1340,12 @@ def main():
                                       cos_all, sin_all, P)
         z1_min, z1_max = rms_z_window(z1_l)
         z2_min, z2_max = rms_z_window(z2_l)
-        # Per-layer bootstrap_safe calibrations from numpy forward.
+        # Per-layer bootstrap calibrations from numpy forward.
         max_abs_calib = compute_layer_max_abs(x_btd, w, cos_all, sin_all, P)
         # Per-layer silu polynomial fit to this layer's actual gate range.
         # max_abs_calib["gate"] is the numpy gate-magnitude × BOOT_CALIB_MARGIN
         # (1.5x). For silu we use a tighter margin (1.05x) because: (1) FHE
-        # noise on gate is ~1e-3, far less than the 1.5x bootstrap_safe margin
+        # noise on gate is ~1e-3, far less than the 1.5x bootstrap margin
         # needs; (2) deg-14 Chebyshev fit error scales rapidly with domain
         # width, so a wider-than-necessary domain costs precision near 0
         # where most gate slots cluster.

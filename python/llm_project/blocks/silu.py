@@ -129,11 +129,11 @@ def silu_clenshaw(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
                 fit_silu_chebyshev_basis.
       ul_max: user_level threshold for bootstrap.
       max_abs_intermediate: bound on Chebyshev intermediate magnitudes
-                            for bootstrap_safe scaling. Defaults to max|t_k|.
+                            for bootstrap scaling. Defaults to max|t_k|.
     """
     import sys as _sys
     _sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
-    from blocks.bootstrap import bootstrap_safe
+    from blocks.bootstrap import bootstrap
 
     N = len(t_coeffs) - 1
     if N < 2:
@@ -174,15 +174,15 @@ def silu_clenshaw(engine, ctx, encoder, relin_key, ct, D, t_coeffs, slot_count,
                                        max_abs=max_abs_intermediate,
                                        slot_count=slot_count, galois_key=galois_key)
             else:
-                b_curr = bootstrap_safe(engine, ctx, encoder, b_curr,
+                b_curr = bootstrap(engine, ctx, encoder, b_curr,
                                           max_abs=max_abs_intermediate, slot_count=slot_count)
                 if need_b_prev:
-                    b_prev = bootstrap_safe(engine, ctx, encoder, b_prev,
+                    b_prev = bootstrap(engine, ctx, encoder, b_prev,
                                               max_abs=max_abs_intermediate, slot_count=slot_count)
             # ct_z is at the deepest chain (carried through all iters). Bootstrap
             # it too if it now sits past b_curr's fresh chain.
             if ct_z.chain_index() > b_curr.chain_index():
-                ct_z = bootstrap_safe(engine, ctx, encoder, ct_z,
+                ct_z = bootstrap(engine, ctx, encoder, ct_z,
                                        max_abs=1.0, slot_count=slot_count)
         return b_curr, b_prev, ct_z
 

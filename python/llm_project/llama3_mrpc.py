@@ -47,7 +47,7 @@ from blocks.attention import (
     score_v_irp_output_mask_plaintext,
     sdpa_irp_required_steps,
 )
-from blocks.bootstrap import bootstrap_safe
+from blocks.bootstrap import bootstrap
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement, render_plan_table,
 )
@@ -111,7 +111,7 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
 
     Returns:
       z1, z2: rmsnorm input variance estimates for rms1 / rms2.
-      max_abs: dict of bootstrap_safe max_abs values for the in-block sites.
+      max_abs: dict of bootstrap max_abs values for the in-block sites.
     """
     g1, g2 = w["g1"], w["g2"]
     Wq, Wk, Wv, Wo = w["Wq"], w["Wk"], w["Wv"], w["Wo"]
@@ -414,7 +414,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
     if verbose: _probe("attn post-Wq", ctx, encoder, sk, q_ct)
     # Bootstrap q_ct
     t0 = _t()
-    q_ct = bootstrap_safe(engine, ctx, encoder, q_ct,
+    q_ct = bootstrap(engine, ctx, encoder, q_ct,
                            max_abs=_calib["q"], slot_count=NUM_SLOTS)
     _rec("bootstrap", t0)
     if verbose: _probe("attn post-q-boot", ctx, encoder, sk, q_ct)
@@ -500,7 +500,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
                 max_abs=_calib["scores"], slot_count=NUM_SLOTS,
                 galois_key=galois_key)
         else:
-            sb_i = bootstrap_safe(engine, ctx, encoder, sb_i,
+            sb_i = bootstrap(engine, ctx, encoder, sb_i,
                                     max_abs=_calib["scores"], slot_count=NUM_SLOTS)
 
         # ---- Stage B: ps_exp + damped + mean-sub. ----
@@ -512,7 +512,7 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         # Stage B e_ct enters at user_level = max_user_level (12 levels
         # consumed by ps_exp + 4 damped squarings from a fresh stage-A
         # bootstrap), leaving no level headroom for merge_bootstrap's
-        # pre-scale multiplies. Use separate bootstrap_safe — at max_abs
+        # pre-scale multiplies. Use separate bootstrap — at max_abs
         # = TARGET_MAG = 0.45 (< target_mag 0.49) it skips scaling and
         # runs bootstrap_inplace directly with no level cost.
         # Opt 3 attempted: pair these bootstraps via merge_bootstrap to
@@ -523,10 +523,10 @@ def fhe_attention_multi_ct(engine, ctx, encoder, relin_key, galois_key, sk,
         # this raises before bootstrap_inplace. Skipping this opt keeps
         # correctness; a zero-level pack would need a phantom API for
         # i-multiplication without rescale, which doesn't exist today. ----
-        e_i = bootstrap_safe(engine, ctx, encoder, e_i,
+        e_i = bootstrap(engine, ctx, encoder, e_i,
                                max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
         if j is not None:
-            e_j = bootstrap_safe(engine, ctx, encoder, e_j,
+            e_j = bootstrap(engine, ctx, encoder, e_j,
                                    max_abs=TARGET_MAG, slot_count=NUM_SLOTS)
 
         # ---- Stage C: mean-add + mask*safety_scale. ----
@@ -1033,7 +1033,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         Wq_baked, diag_wq_irp, diag_wo_irp, diag_gate_irp, diag_up_irp, diag_down_irp = \
             wq_cache[layer_idx]
 
-        # Per-layer rmsnorm + bootstrap_safe calibration (num_tokens-aware).
+        # Per-layer rmsnorm + bootstrap calibration (num_tokens-aware).
         # When `precomputed_calib` is supplied (parallel sweep), skip the
         # per-example shadow forward pass entirely — calib was precomputed
         # once at startup using a representative example, which also lets
@@ -1138,7 +1138,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                 _probe(f"input v_ct[{kk}]", ctx, encoder, sk, vct)
         # rms1
         if boot_before.get("rms1", False):
-            x_ct = bootstrap_safe(engine, ctx, encoder, x_ct,
+            x_ct = bootstrap(engine, ctx, encoder, x_ct,
                                     max_abs=max_abs_calib.get("x_in", 1.0),
                                     slot_count=NUM_SLOTS)
         x_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
@@ -1146,7 +1146,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if verbose: _probe("post-rms1", ctx, encoder, sk, x_norm)
         # attention (multi-ct)
         if boot_before.get("attention", False):
-            x_norm = bootstrap_safe(engine, ctx, encoder, x_norm,
+            x_norm = bootstrap(engine, ctx, encoder, x_norm,
                                       max_abs=max_abs_calib.get("rms1_out", 1.0),
                                       slot_count=NUM_SLOTS)
         attn_out = fhe_attention_multi_ct(
@@ -1160,7 +1160,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
         # rms2
         if boot_before.get("rms2", False):
-            x_mid_ct = bootstrap_safe(engine, ctx, encoder, x_mid_ct,
+            x_mid_ct = bootstrap(engine, ctx, encoder, x_mid_ct,
                                         max_abs=max_abs_calib.get("x_mid", 1.0),
                                         slot_count=NUM_SLOTS)
         x_mid_norm = rmsnorm_forward_stride_t(ctx, encoder, relin_key, galois_key,
@@ -1168,7 +1168,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         if verbose: _probe("post-rms2", ctx, encoder, sk, x_mid_norm)
         # mlp
         if boot_before.get("mlp", False):
-            x_mid_norm = bootstrap_safe(engine, ctx, encoder, x_mid_norm,
+            x_mid_norm = bootstrap(engine, ctx, encoder, x_mid_norm,
                                            max_abs=max_abs_calib.get("rms2_out", 1.0),
                                            slot_count=NUM_SLOTS)
         mlp_out = fhe_mlp_irp_bootstrap(

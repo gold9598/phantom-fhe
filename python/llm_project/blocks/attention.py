@@ -915,7 +915,7 @@ def attention_forward(
 #   - optionally interleaves bootstrap calls between sub-stages A/B and B/C
 #
 # This is the path used by both llama3_simulation (no bootstrap_fn) and
-# llama3 (bootstrap_fn=lambda ct: bootstrap_safe(...)).
+# llama3 (bootstrap_fn=lambda ct: bootstrap(...)).
 # ---------------------------------------------------------------------------
 
 def attention_forward_llama(
