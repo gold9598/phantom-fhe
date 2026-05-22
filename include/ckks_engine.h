@@ -155,12 +155,6 @@ namespace phantom {
         // before calling bootstrap().
         void bootstrap_inplace(PhantomCiphertext &ct);
 
-        // Diagnostic-only: identical to `bootstrap_inplace` but routes through
-        // `phantom::bootstrap_debug` which prints stage-by-stage scale/chain/slot
-        // metadata. Used exclusively by the BootstrapTo17Levels bisect probe.
-        // Mutates `ct` in place; behavior otherwise matches bootstrap_inplace.
-        void bootstrap_inplace_debug(PhantomCiphertext &ct);
-
         // ---- Read-only views (advanced; do NOT use to touch bootstrap primes) ----
         [[nodiscard]] const PhantomContext &context() const noexcept { return *ctx_; }
         [[nodiscard]] const PhantomCKKSEncoder &encoder() const noexcept { return *enc_; }
