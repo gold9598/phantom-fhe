@@ -35,7 +35,11 @@ import pyPhantom as phantom
 # Only the IRP weight encoders below pass this; every other SCP (rmsnorm gammas,
 # merge-bootstrap constants, masks, the complex-bridge half/neg-half constants)
 # encodes at full scale, where coeff_scale == scale => scale_2 == 1 (unchanged).
-IRP_COEFF_SCALE = 2.0 ** 24
+IRP_COEFF_SCALE = 2.0 ** 40   # quant-64bit control: coeff_scale==user_scale
+# => scale_2==1 (no in-kernel rescale); coeffs ~2^40 overflow int16/int32 so the
+# encoder stores them as int64 — i.e. the IRP pipeline UNQUANTIZED. This is the
+# precision-sweep anchor (same IRP/fold/bridgeless path as quant-8/16/32, only
+# the SCP dtype differs), NOT the old dense `baseline` branch.
 
 
 # ---------------------------------------------------------------------------
