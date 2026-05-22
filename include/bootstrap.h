@@ -303,27 +303,6 @@ namespace phantom {
               bool use_bootstrap_to_17_levels = false,
               int evalmod_r = 3);
 
-    // Diagnostic clone of `bootstrap` that prints scale/chain metadata and
-    // decrypted slot[0..3] values at every meaningful pipeline stage. Used
-    // exclusively by the BootstrapTo17Levels bisect probe to identify the
-    // first stage where the new chain diverges from the legacy chain on the
-    // same input. Behavior is identical to `bootstrap` modulo stdout prints;
-    // do not call from production code.
-    //
-    // `diag_sk` is the symmetric secret key associated with the same
-    // PhantomContext that produced `bk` (i.e. the engine's `sk_`). It is
-    // used only for stage-by-stage decryption and is otherwise untouched.
-    [[nodiscard]] PhantomCiphertext
-    bootstrap_debug(const PhantomContext &ctx,
-                    PhantomCKKSEncoder &encoder,
-                    const PhantomCiphertext &ct,
-                    const BootstrapKey &bk,
-                    const PhantomSecretKey &diag_sk,
-                    double user_scale,
-                    bool split_scale_down = false,
-                    bool use_bootstrap_to_17_levels = false,
-                    int evalmod_r = 3);
-
     // PROBE-ONLY: plaintext-storage precision experiment. Encodes the given
     // complex diagonal `vals` at `chain_index` and `scale` in one of two
     // forms, multiplies `ct` by it, rescales, and returns the result.

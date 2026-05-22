@@ -580,34 +580,4 @@ namespace phantom {
         ct.set_scale(cfg_.user_scale);
     }
 
-    // Diagnostic-only bootstrap (stage-by-stage prints). Mirrors
-    // bootstrap_inplace but routes through phantom::bootstrap_debug.
-    void CKKSEngine::bootstrap_inplace_debug(PhantomCiphertext &ct) {
-        const int lvl = user_level(ct);
-        (void)lvl;
-
-        const std::size_t pre_boot_index = bottom_chain_index_ - 1;
-        if (ct.chain_index() != pre_boot_index) {
-            phantom::mod_switch_to_inplace(*ctx_, ct, pre_boot_index);
-        }
-        ct.set_scale(cfg_.user_scale);
-
-        ct = phantom::bootstrap_debug(*ctx_, *enc_, ct, bk_, *sk_,
-                                      cfg_.user_scale,
-                                      cfg_.split_scale_down,
-                                      cfg_.use_bootstrap_to_17_levels,
-                                      cfg_.evalmod_r);
-
-        const std::size_t expected_chain =
-            cfg_.split_scale_down ? freshest_chain_index_ + 1
-                                  : freshest_chain_index_;
-        if (ct.chain_index() != expected_chain) {
-            throw std::logic_error(
-                "CKKSEngine::bootstrap_inplace_debug: post-bootstrap chain_index "
-                "!= expected (freshest"
-                + std::string(cfg_.split_scale_down ? "+1" : "") + ")");
-        }
-        ct.set_scale(cfg_.user_scale);
-    }
-
 }  // namespace phantom
