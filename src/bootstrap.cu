@@ -1732,35 +1732,8 @@ namespace phantom {
             }
         }
 
-        // EvalRound = K · ct − EvalMod(ct).  Internal (Phase 4 only).
-        PhantomCiphertext eval_round_k16_r3(const PhantomContext &ctx,
-                                            PhantomCKKSEncoder &encoder,
-                                            const PhantomCiphertext &ct,
-                                            const PhantomRelinKey &rk) {
-            // K · ct (level-free).
-            PhantomCiphertext kct = ct;
-            multiply_int_inplace(ctx, kct, /*k=*/16ULL);
-
-            // EvalMod(ct) — consumes 9 levels.
-            PhantomCiphertext em = evalmod_k16_r3(ctx, encoder, ct, rk);
-
-            // Align kct to em's chain_index (em is deeper).
-            if (kct.chain_index() < em.chain_index()) {
-                mod_switch_to_inplace(ctx, kct, em.chain_index());
-            }
-            // Snap scales to the same value (em's snap target). This matches
-            // evalmod's snap_scale convention: both ciphertexts must have
-            // matching scale metadata before sub_inplace.
-            kct.set_scale(em.scale());
-
-            // result = K·ct − EvalMod(ct).
-            sub_inplace(ctx, kct, em);
-            return kct;
-        }
-
         // EvalRound = K · ct − EvalMod(ct) for K=28 R=3. Internal (Phase 4 only).
-        // Same structure as eval_round_k16_r3 but with K=28 and the degree-49
-        // polynomial from the_lib. Same 9-level chain budget.
+        // K=28 with the degree-49 polynomial from the_lib. Same 9-level chain budget.
         //
         // Heterogeneous-scale fix (Step 2): On the use17 chain the ER section
         // uses 54-bit primes, but the CT entering EvalMod carries scale metadata
