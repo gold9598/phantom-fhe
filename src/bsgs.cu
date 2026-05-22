@@ -381,6 +381,103 @@ namespace phantom {
         return acc;
     }
 
+    PhantomCiphertext fused_mac_accumulate(
+            const PhantomContext &ctx,
+            const std::vector<PhantomCiphertext> &babies,
+            const std::vector<PhantomPlaintext> &plaintexts) {
+        const std::size_t M = babies.size();
+        if (M == 0) {
+            throw std::invalid_argument("fused_mac_accumulate: babies is empty");
+        }
+        if (plaintexts.size() != M) {
+            throw std::invalid_argument(
+                    "fused_mac_accumulate: plaintexts size != babies size");
+        }
+
+        const auto &stream = cudaStreamPerThread;
+        const PhantomCiphertext &x = babies[0];
+        const std::size_t target_ci = x.chain_index();
+
+        const auto &cd = ctx.get_context_data(target_ci);
+        const auto &mods = cd.parms().coeff_modulus();
+        const std::size_t num_towers = mods.size();
+        const std::size_t N = cd.parms().poly_modulus_degree();
+        const std::size_t per_poly = num_towers * N;
+        const auto *base_rns = ctx.gpu_rns_tables().modulus();
+
+        // All babies: size-2 NTT-form at the same chain_index. Cache c0/c1
+        // device pointers (same layout as build_partial's setup at 264-278).
+        std::vector<const std::uint64_t *> h_babies_c0_ptrs(M);
+        std::vector<const std::uint64_t *> h_babies_c1_ptrs(M);
+        for (std::size_t b = 0; b < M; ++b) {
+            if (babies[b].chain_index() != target_ci) {
+                throw std::invalid_argument(
+                        "fused_mac_accumulate: babies chain_index mismatch");
+            }
+            if (babies[b].size() != 2 || !babies[b].is_ntt_form()) {
+                throw std::invalid_argument(
+                        "fused_mac_accumulate: babies must be size-2 NTT-form");
+            }
+            const auto *base_ptr = babies[b].data();
+            h_babies_c0_ptrs[b] = base_ptr;
+            h_babies_c1_ptrs[b] = base_ptr + per_poly;
+        }
+        auto d_babies_c0_ptrs = phantom::util::make_cuda_auto_ptr<const std::uint64_t *>(M, stream);
+        auto d_babies_c1_ptrs = phantom::util::make_cuda_auto_ptr<const std::uint64_t *>(M, stream);
+        cudaMemcpyAsync(d_babies_c0_ptrs.get(), h_babies_c0_ptrs.data(),
+                        M * sizeof(const std::uint64_t *),
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_babies_c1_ptrs.get(), h_babies_c1_ptrs.data(),
+                        M * sizeof(const std::uint64_t *),
+                        cudaMemcpyHostToDevice, stream);
+
+        // Gather the already-expanded full-RNS NTT-form plaintexts into one
+        // contiguous pooled buffer (M * num_towers * N), exactly the layout
+        // mac_accumulate_kernel reads: pooled[b * (num_towers*N) + j*N + i].
+        // expand_single_chain_to_full already produced these as full-RNS
+        // tower-major NTT-form at the babies' chain_index, so this is a pure
+        // device-to-device gather: NO re-expand, NO extra NTT.
+        auto pooled = phantom::util::make_cuda_auto_ptr<std::uint64_t>(
+                M * per_poly, stream);
+        for (std::size_t b = 0; b < M; ++b) {
+            if (plaintexts[b].chain_index() != target_ci) {
+                throw std::invalid_argument(
+                        "fused_mac_accumulate: plaintext chain_index mismatch");
+            }
+            cudaMemcpyAsync(pooled.get() + b * per_poly, plaintexts[b].data(),
+                            per_poly * sizeof(std::uint64_t),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+
+        // Output ciphertext: size-2, NTT-form. Scale = babies' scale * pt scale,
+        // matching multiply_plain_ntt's new_scale = encrypted.scale() *
+        // plain.scale() (evaluate.cu:1306).
+        PhantomCiphertext acc;
+        acc.resize(ctx, target_ci, /*size=*/2, stream);
+        acc.set_ntt_form(true);
+        acc.set_scale(x.scale() * plaintexts[0].scale());
+        acc.set_correction_factor(x.correction_factor());
+
+        std::uint64_t *out_c0 = acc.data_ptr().get();
+        std::uint64_t *out_c1 = out_c0 + per_poly;
+
+        const std::size_t threads = 256;
+        const std::size_t total = num_towers * N;
+        const std::size_t blocks = (total + threads - 1) / threads;
+        mac_accumulate_kernel<<<blocks, threads, 0, stream>>>(
+                pooled.get(),
+                d_babies_c0_ptrs.get(),
+                d_babies_c1_ptrs.get(),
+                out_c0,
+                out_c1,
+                base_rns,
+                M,
+                num_towers,
+                N);
+
+        return acc;
+    }
+
     PhantomCiphertext bsgs_matmul_preencoded(
             const PhantomContext &ctx,
             const PhantomGaloisKey &galois_key,
