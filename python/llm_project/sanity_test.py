@@ -66,12 +66,12 @@ def main():
     # 4) Bootstrap on a deep ct (simulate post-compute chain)
     ct_deep = phantom.mod_switch_to(ctx, ct, eng.user_level_chain_index(10))
     ct_deep.set_scale(SCALE)
-    from blocks.bootstrap import bootstrap_safe
-    ct_boot = bootstrap_safe(eng, ctx, encoder, ct_deep,
+    from blocks.bootstrap import bootstrap
+    ct_boot = bootstrap(eng, ctx, encoder, ct_deep,
                               max_abs=4.0, slot_count=NUM_SLOTS)
     dec = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, ct_boot)))
     err = float(np.abs(dec - np.array(v)).max())
-    print(f"[4] bootstrap_safe (max_abs=4) max|err|={err:.3e}  {'OK' if err < 1e-2 else 'FAIL'}",
+    print(f"[4] bootstrap (max_abs=4) max|err|={err:.3e}  {'OK' if err < 1e-2 else 'FAIL'}",
           flush=True)
 
     # 5) Output norm — sanity that ct values are nonzero
