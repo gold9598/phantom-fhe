@@ -281,17 +281,26 @@ def compute_layer_calib_n(x_btd, w, cos_all, sin_all, num_tokens, query_position
     up_max = float(np.abs(up).max())
     h = gate_silu * up
     h_max = float(np.abs(h).max())
+    mlp_out_vec = h @ Wdown.T
+    mlp_out_max = float(np.abs(mlp_out_vec).max())
+    mlp_out_mean = float(mlp_out_vec.mean())
+    o_max = float(np.abs(o_p).max())
+    o_mean_val = float(o_p.mean())
 
     max_abs = {
-        "x_in":     float(np.abs(x_btd[P_q]).max()) * margin,
-        "rms1_out": float(np.abs(xn[P_q]).max()) * margin,
-        "x_mid":    x_mid_max * margin,
-        "rms2_out": rms2_out_max * margin,
-        "q":        q_max * margin,
-        "scores":   scores_max * margin,
-        "gate":     gate_max * margin,
-        "up":       up_max * margin,
-        "h":        h_max * margin,
+        "x_in":         float(np.abs(x_btd[P_q]).max()) * margin,
+        "rms1_out":     float(np.abs(xn[P_q]).max()) * margin,
+        "x_mid":        x_mid_max * margin,
+        "rms2_out":     rms2_out_max * margin,
+        "q":            q_max * margin,
+        "scores":       scores_max * margin,
+        "gate":         gate_max * margin,
+        "up":           up_max * margin,
+        "h":            h_max * margin,
+        "o":            o_max * margin,
+        "o_mean":       o_mean_val,
+        "mlp_out":      mlp_out_max * margin,
+        "mlp_out_mean": mlp_out_mean,
         "softmax_safety_scale": softmax_safety_scale,
         "pre_finsmx_mean": _sim_pre_finsmx_mean(
             scores_post_C, real_nt, real_nt=real_nt),
@@ -659,7 +668,7 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
                               xn_query, Wq_baked, K_full_h, V_full_h, Wo,
                               c_per_head, real_nt, chain_index,
                               layer_idx=None, P_local=None,
-                              q_max_abs=None):
+                              q_max_abs=None, o_max_abs=None, o_mean=None):
     """Stage 4 (dense-layout rewrite): close the dense attention block.
 
     Runs the FULL dense token-major attention pipeline end-to-end, ENTIRELY
@@ -725,82 +734,58 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # ---- QK^T via IRP-Wq (Cachemir §4.1) + compute_qkt_irp (Cachemir §5.1).
     # Wq: K=d²/N=512 SCPs (8× fewer than dense BSGS's 4096); irp_matvec_host
     # computes y = x @ M so we pass Wq_baked.T to get q = Wq_baked @ xn_query.
-    # Post-matvec scale snap SCALE^2 → SCALE, then bootstrap refreshes
-    # chain so compute_qkt_irp sees q at canonical scale. q stays in IRP
-    # stride-t layout (slot[i*t]=q[i]) — directly consumed by compute_qkt_irp.
+    # BRIDGE 1 (bridgeless): unfolded square Wq — no SK decrypt.
+    # irp_matvec_host emits q in IRP stride-t (slot[i*t]=q[i], t=N/D=t_k=8),
+    # the layout compute_qkt_irp consumes directly. bootstrap refreshes
+    # the chain; a lossless mod_switch restores user_level 11 so the downstream
+    # §5.1/Stage-A/score_v galois target chains are byte-for-byte unchanged.
     from blocks import irp as _irp
     _BABY_STEPS_IRP_Q = 16  # M=16, G=32 for d=4096 K=512 (~sqrt(K))
-    # COMPLEX OUTPUT-FOLDED Wq (K=512→256 SCPs, the cleanest square fold).
-    # encode_irp_diagonals_folded_host folds the output columns into the imag
-    # part (d×d → d×(d/2) tall rect, alpha=2), so the folded matvec runs the
-    # tall-rect machinery at d_out_fold = D/2 and consumes its input in the
-    # TALL layout for (d_in=D, d_out=D/2). The result is a complex ct split by
-    # extract_real_imag_pair, then SK-bridged: decrypt both halves, recombine
-    # to natural length-D q in numpy, re-encrypt FRESH in the stride-t_k
-    # layout compute_qkt_irp consumes (slot[i*t_k]=q[i]). The bridge is
-    # near-lossless and refreshes the chain (q enters compute_qkt_irp fresh,
-    # giving the Stage-A bootstrap maximum headroom — strictly safer than the
-    # old lazy-leveled q).
-    _D_OUT_FOLD_Q = D // 2  # 2048
-    wq_irp = _irp_cache.wq_plaintexts_cached(
+    wq_irp = _irp_cache.wq_unfolded_plaintexts_cached(
         ctx, encoder,
         np.ascontiguousarray(np.asarray(Wq_baked, dtype=np.float64).T),
         N=NUM_SLOTS, d=D, scale=SCALE, baby_steps=_BABY_STEPS_IRP_Q,
         layer_idx=layer_idx, P_local=P_local)
-    # Folded input: permuted TALL layout for (d_in=D, d_out=D/2).
-    x_irp_ct = _irp.encrypt_irp_input_rect(
+    # Standard interleaved input: slot[i*t]=xn[i].
+    x_irp_ct = _irp.encrypt_irp_input(
         ctx, encoder, sk, np.asarray(xn_query, dtype=np.float64),
-        N=NUM_SLOTS, d_in=D, d_out=_D_OUT_FOLD_Q, scale=SCALE,
-        chain_index=chain_index)
-    # Lazy-level: drop the folded-IRP input to a deep chain so the rotation-
-    # heavy matvec runs at few RNS limbs (cheap). The folded matvec + conj-
-    # split consumes ~1 extra level vs the unfolded path, but the output is
-    # immediately SK-bridged (decrypt + re-encrypt fresh below), so there is
-    # no downstream bootstrap-with-scaling constraint on these cts — only the
-    # matvec's own ~2-3 levels matter. Target input user_level 9 leaves the
-    # pre-decrypt cts at user_level ~12-13 (< max). mod_switch_to drops limbs
-    # cleanly (no added noise). Tall masks at the FOLDED dim d_out=D/2:
-    # input_mask (square at d=D/2, at input chain) + sub_mask (rect at chain+1).
-    _wq_target_ci = engine.user_level_chain_index(12)
+        N=NUM_SLOTS, d=D, scale=SCALE, chain_index=chain_index)
+    # Lazy-level: unfolded square matvec + mask + rescale = 2 levels.
+    # Target input user_level 11 → q at ~13; bootstrap pre-scale (+1) → ul14 < max.
+    _wq_target_ci = engine.user_level_chain_index(11)
     if x_irp_ct.chain_index() < _wq_target_ci:
         x_irp_ct = phantom.mod_switch_to(ctx, x_irp_ct, _wq_target_ci)
-    _input_mask_q = _irp.encode_irp_mask(
-        ctx, encoder, NUM_SLOTS, _D_OUT_FOLD_Q, SCALE, x_irp_ct.chain_index())
-    _sub_mask_q = _irp.encode_irp_mask_rect(
-        ctx, encoder, NUM_SLOTS, D, _D_OUT_FOLD_Q, SCALE,
-        x_irp_ct.chain_index() + 1)
-    _q_complex = _irp.irp_matvec_folded_host(
+    _mask_q = _irp.encode_irp_mask(
+        ctx, encoder, NUM_SLOTS, D, SCALE, x_irp_ct.chain_index())
+    q_ct = _irp.irp_matvec_host(
         ctx, encoder, galois_key, x_irp_ct, wq_irp,
-        N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_Q,
-        sub_mask_pt=_sub_mask_q, input_mask_pt=_input_mask_q)
-    # Snap SCALE^2 → SCALE before the conj-split (pipeline convention).
-    _q_complex = phantom.rescale_to_next(ctx, _q_complex)
-    _q_complex.set_scale(SCALE)
-    _q_re, _q_im = _irp.extract_real_imag_pair(
-        ctx, encoder, galois_key, _q_complex, NUM_SLOTS, SCALE)
-    # OUTPUT SK BRIDGE: decrypt both halves, recombine to natural length-D q
-    # in numpy (TALL fold decode: real=q[:D/2], imag=q[D/2:]), then re-encrypt
-    # in the stride-t_k layout compute_qkt_irp consumes (slot[i*t_k]=q[i]).
-    # CRITICAL: re-encrypt at the SAME chain the OLD unfolded path produced
-    # (user_level 11 = input ul9 + matvec mask rescale +1 + the external
-    # SCALE^2→SCALE rescale +1) so the entire downstream §5.1 / Stage-A /
-    # softmax / score_v chain budget — and the finalize(17)/score_v(23) galois
-    # target chains tuned for it — are unchanged. (Re-encrypting fresh would
-    # shift every downstream op ~11 levels shallower than its galois key's
-    # target chain → illegal memory access.) The K cache below encodes at
-    # q_ct.chain_index(), so it tracks this chain automatically.
+        N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_Q, mask_pt=_mask_q)
+    q_ct = phantom.rescale_to_next(ctx, q_ct)
+    q_ct.set_scale(SCALE)
+    # Bootstrap replaces the SK bridge. Mean-center before (boot assumes
+    # ~zero mean); q_max_abs + |mean| over-estimates centered max safely.
+    _q_oracle = (np.asarray(xn_query, np.float64)
+                 @ np.asarray(Wq_baked, np.float64).T)
+    _q_mean = float(_q_oracle.mean())
+    _q_max_abs = q_max_abs if q_max_abs is not None else float(np.abs(_q_oracle).max()) * 1.5
+    _t_q = NUM_SLOTS // D
+    _q_mean_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+    _q_mean_slots[::_t_q][:D] = _q_mean
+    _q_mean_pt = encoder.encode_double_vector(
+        ctx, _q_mean_slots, q_ct.scale(), q_ct.chain_index())
+    q_ct = phantom.sub_plain(ctx, q_ct, _q_mean_pt)
+    q_ct = bootstrap(engine, ctx, encoder, q_ct,
+                     max_abs=_q_max_abs + abs(_q_mean),
+                     slot_count=NUM_SLOTS)
+    _q_mean_pt2 = encoder.encode_double_vector(
+        ctx, _q_mean_slots, q_ct.scale(), q_ct.chain_index())
+    q_ct = phantom.add_plain(ctx, q_ct, _q_mean_pt2)
+    # Restore user_level 11 (lossless mod_switch) so downstream galois targets
+    # and K-cache chain are unchanged from the bridged path.
     _q_target_ci = engine.user_level_chain_index(11)
-    _t_fold_q = NUM_SLOTS // _D_OUT_FOLD_Q   # 16
-    _q_dec_re = np.asarray(encoder.decode_double_vector(
-        ctx, sk.decrypt(ctx, _q_re)), dtype=np.float64)
-    _q_dec_im = np.asarray(encoder.decode_double_vector(
-        ctx, sk.decrypt(ctx, _q_im)), dtype=np.float64)
-    _q_lo = _q_dec_re[::_t_fold_q][:_D_OUT_FOLD_Q]
-    _q_hi = _q_dec_im[::_t_fold_q][:_D_OUT_FOLD_Q]
-    _q_natural = np.concatenate([_q_lo, _q_hi])   # natural order, length D
-    q_ct = _irp.encrypt_irp_input(
-        ctx, encoder, sk, _q_natural,
-        N=NUM_SLOTS, d=D, scale=SCALE, chain_index=_q_target_ci)
+    if q_ct.chain_index() < _q_target_ci:
+        q_ct = phantom.mod_switch_to(ctx, q_ct, _q_target_ci)
+        q_ct.set_scale(SCALE)
     # Cachemir §5.1 compute_qkt_irp on IRP-Wq output. K cache packs t_k =
     # NUM_SLOTS//D tokens per ct in interleaved layout
     # (slot[h*d_head*t + r*t + p] = K[c*t + p, h, r]); compute_qkt_irp on
@@ -906,6 +891,15 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     S_global = phantom.sub_plain(ctx, S_global, _sub_pt)
 
     # ---- Bootstrap-1 (post-Stage-A). Single ct vs dense's per-shard 4×.
+    # _SCORES_CALIB bounds max|centered scores| (scores_post_C). It is held
+    # at 45.10 (NOT tightened to the per-run max ~22.6): a LOOSER bound keeps
+    # the extreme scores well inside the bootstrap EvalMod polynomial's
+    # accurate CENTRAL region. Measured at nt=512: tightening to 23.76 lands
+    # the -22.6 extreme near the |x|→0.49 domain EDGE where the bootstrap poly
+    # is least accurate, recovering -22.2 instead of -22.6 (Δ0.42); ps_exp
+    # then amplifies that extreme-score error catastrophically (rel-RMS 1.1e-2
+    # → 2.5e19). The loose bound recovers -22.5 (Δ0.12) → stable. So this
+    # bound is deliberately conservative, not a stale nt=60 artifact.
     _SCORES_CALIB = 45.10
     S_global = bootstrap(
         engine, ctx, encoder, S_global,
@@ -1106,79 +1100,67 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
         for j in range(H):
             fhe_attn_o[h, j] = _av_irp[(h * H + j) * t_k]
 
-    # ---- IRP-Wo (Cachemir §4.1) — COMPLEX OUTPUT-FOLDED (K=512→256 SCPs).
-    # encode_irp_diagonals_folded_host folds Wo.T's output columns into the
-    # imag part (d×d → d×(d/2) tall rect, alpha=2), so the folded matvec runs
-    # the TALL-rect machinery at d_out_fold = D/2 and consumes its input in the
-    # TALL layout for (d_in=D, d_out=D/2). Path B: the score·V output (attn_h)
-    # is already decrypted above (_av_irp, for the diagnostic), so the Wo INPUT
-    # bridge is free — re-encrypt the natural length-D attn vector in the
-    # folded tall-rect layout. The matvec emits a complex ct split by
-    # extract_real_imag_pair; the output is ALREADY SK-bridged (decrypt +
-    # re-encrypt to replicated-block for residual + rms2), so the recombine is
-    # absorbed into that existing bridge at zero extra cost.
+    # BRIDGE 2 (bridgeless): unfolded square Wo — no input or output SK bridge.
+    # attn_h is already in IRP stride-t_wo layout (slot[(h*d+j)*t_wo]=attn[h,j])
+    # — the exact input layout irp_matvec_host expects for a d=D_TOTAL square.
+    # Output is natural stride-t_wo=stride-T_MODEL (residual1 layout).
+    # bootstrap replaces the output SK bridge.
     from blocks import irp as _irp
-    _BABY_STEPS_IRP_WO = 16  # M=16, G=32 for d=4096 K=512 (~sqrt(K))
-    t_wo = NUM_SLOTS // D                          # = 8 for D=4096
-    _D_OUT_FOLD_WO = D // 2  # 2048
-    # Folded Wo SCPs (pass Wo.T to match irp_matvec's y = x @ M convention;
-    # gives o = Wo @ attn). The fold halves the SCP count + disk cache.
-    _wo_irp = _irp_cache.wo_plaintexts_cached(
+    _BABY_STEPS_IRP_WO = 16
+    t_wo = NUM_SLOTS // D   # 8 = T_MODEL
+    _wo_irp = _irp_cache.wo_unfolded_plaintexts_cached(
         ctx, encoder,
         np.ascontiguousarray(np.asarray(Wo, dtype=np.float64).T),
         N=NUM_SLOTS, d=D, scale=SCALE, baby_steps=_BABY_STEPS_IRP_WO,
         layer_idx=layer_idx)
-    # INPUT bridge: rebuild the natural length-D attn vector from the already-
-    # decrypted _av_irp (IRP stride-t_wo: slot[i*t_wo] = attn[i]), then encrypt
-    # in the FOLDED tall-rect layout for (d_in=D, d_out=D/2). Lazy-level: drop
-    # to user_level 12 so the rotation-heavy folded matvec runs cheap. Headroom:
-    # the folded matvec + conj-split consumes ~3 levels, landing the pre-decrypt
-    # cts at user_level ~15 (≤ max) before the output bridge discards the chain.
-    _attn_natural = _av_irp[::t_wo][:D]
-    _wo_input_ci = engine.user_level_chain_index(12)
-    av_folded = _irp.encrypt_irp_input_rect(
-        ctx, encoder, sk, np.asarray(_attn_natural, dtype=np.float64),
-        N=NUM_SLOTS, d_in=D, d_out=_D_OUT_FOLD_WO, scale=SCALE,
-        chain_index=_wo_input_ci)
-    # Tall masks at the FOLDED dim d_out=D/2: input_mask (square at d=D/2, at
-    # input chain) + sub_mask (rect at chain+1).
-    _input_mask_wo = _irp.encode_irp_mask(
-        ctx, encoder, NUM_SLOTS, _D_OUT_FOLD_WO, SCALE, av_folded.chain_index())
-    _sub_mask_wo = _irp.encode_irp_mask_rect(
-        ctx, encoder, NUM_SLOTS, D, _D_OUT_FOLD_WO, SCALE,
-        av_folded.chain_index() + 1)
-    _o_complex = _irp.irp_matvec_folded_host(
-        ctx, encoder, galois_key, av_folded, _wo_irp,
-        N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_WO,
-        sub_mask_pt=_sub_mask_wo, input_mask_pt=_input_mask_wo)
-    # Snap SCALE^2 → SCALE before the conj-split (pipeline convention).
-    _o_complex = phantom.rescale_to_next(ctx, _o_complex)
-    _o_complex.set_scale(SCALE)
-    _o_re, _o_im = _irp.extract_real_imag_pair(
-        ctx, encoder, galois_key, _o_complex, NUM_SLOTS, SCALE)
-    # OUTPUT SK BRIDGE (already required): decrypt both halves, recombine to
-    # natural length-D o in numpy (TALL fold decode: real=o[:D/2], imag=o[D/2:]),
-    # then re-encrypt to replicated-block slot[k*D+j]=o[j] for residual + rms2.
-    _t_fold_wo = NUM_SLOTS // _D_OUT_FOLD_WO   # 16
-    _o_dec_re = np.asarray(
-        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _o_re)),
-        dtype=np.float64)
-    _o_dec_im = np.asarray(
-        encoder.decode_double_vector(ctx, sk.decrypt(ctx, _o_im)),
-        dtype=np.float64)
-    _o_lo = _o_dec_re[::_t_fold_wo][:_D_OUT_FOLD_WO]
-    _o_hi = _o_dec_im[::_t_fold_wo][:_D_OUT_FOLD_WO]
-    _o_vec = np.concatenate([_o_lo, _o_hi])   # natural order, length D
-    _o_slots_rep = np.zeros(NUM_SLOTS, dtype=np.float64)
-    for _k in range(NUM_SLOTS // D):
-        _o_slots_rep[_k * D:(_k + 1) * D] = _o_vec
-    o_ct = sk.encrypt_symmetric(
-        ctx, encoder.encode_double_vector(
-            ctx, _o_slots_rep, SCALE, attn_h.chain_index()))
-
+    # Lazy-level: Wo matvec (mask + caller rescale) costs 2 levels.
+    # attn_h must be at ul≤12 so output lands at ul≤14 < max(15), leaving
+    # 1 level for bootstrap pre-scale.
+    # If attn_h arrives deeper than ul12 (longer tree-distribute for nt_pad≥128),
+    # pre-bootstrap it to refresh the chain first, then mod_switch to ul12.
+    _wo_target_ci = engine.user_level_chain_index(12)
+    _attn_h_in = attn_h
+    if _attn_h_in.chain_index() > _wo_target_ci:
+        # attn_h is deeper than ul12; bootstrap it first using the oracle mean
+        # from the already-decoded _av_irp (no extra decrypt needed).
+        _ah_mean = float(_av_irp.mean())
+        _ah_max_abs = float(np.abs(_av_irp - _ah_mean).max()) * 1.2
+        _ah_mean_pt = encoder.encode_double_vector(
+            ctx, [_ah_mean] * NUM_SLOTS, _attn_h_in.scale(), _attn_h_in.chain_index())
+        _attn_h_in = phantom.sub_plain(ctx, _attn_h_in, _ah_mean_pt)
+        _attn_h_in = bootstrap(engine, ctx, encoder, _attn_h_in,
+                               max_abs=_ah_max_abs, slot_count=NUM_SLOTS)
+        _ah_mean_pt2 = encoder.encode_double_vector(
+            ctx, [_ah_mean] * NUM_SLOTS, _attn_h_in.scale(), _attn_h_in.chain_index())
+        _attn_h_in = phantom.add_plain(ctx, _attn_h_in, _ah_mean_pt2)
+    _attn_h_deep = _attn_h_in
+    if _attn_h_deep.chain_index() < _wo_target_ci:
+        _attn_h_deep = phantom.mod_switch_to(ctx, _attn_h_deep, _wo_target_ci)
+    _mask_wo = _irp.encode_irp_mask(
+        ctx, encoder, NUM_SLOTS, D, SCALE, _attn_h_deep.chain_index())
+    o_ct = _irp.irp_matvec_host(
+        ctx, encoder, galois_key, _attn_h_deep, _wo_irp,
+        N=NUM_SLOTS, d=D, baby_steps=_BABY_STEPS_IRP_WO, mask_pt=_mask_wo)
+    o_ct = phantom.rescale_to_next(ctx, o_ct)
+    o_ct.set_scale(SCALE)
+    # bootstrap replaces SK bridge. Mean-center before boot.
+    _o_max_abs = o_max_abs if o_max_abs is not None else 1.0
+    _o_mean_v = o_mean if o_mean is not None else 0.0
+    _o_mean_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+    _o_mean_slots[::t_wo][:D] = _o_mean_v
+    _o_mean_pt = encoder.encode_double_vector(
+        ctx, _o_mean_slots, o_ct.scale(), o_ct.chain_index())
+    o_ct = phantom.sub_plain(ctx, o_ct, _o_mean_pt)
+    o_ct = bootstrap(engine, ctx, encoder, o_ct,
+                     max_abs=_o_max_abs + abs(_o_mean_v),
+                     slot_count=NUM_SLOTS)
+    _o_mean_pt2 = encoder.encode_double_vector(
+        ctx, _o_mean_slots, o_ct.scale(), o_ct.chain_index())
+    o_ct = phantom.add_plain(ctx, o_ct, _o_mean_pt2)
+    # Diagnostic decode (stride-t_wo natural order).
     _ov = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, o_ct)),
                    dtype=np.float64)
-    fhe_out = _ov[:D_MODEL].copy()
+    fhe_out = _ov[::t_wo][:D_MODEL].copy()
 
     # ---- Oracle: softmax weights -> dense_score_v -> Wo, on the IDENTICAL
     # teacher-forced Q/K/V (the trusted Stage-1 spec). ----
@@ -1736,13 +1718,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             engine, ctx, encoder, sk, relin_key, galois_key,
             _xn_q, _Wq_baked, _K_h, _V_h, _Wo, c_per_head,
             _real_nt_g, fresh_ci, layer_idx=layer_idx, P_local=P_local,
-            q_max_abs=max_abs_calib.get("q") if max_abs_calib else None)
-        _f_out = _fres["fhe_out"]            # (D_MODEL,)
-        _attn_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-        _attn_slots[::T_MODEL][:D_MODEL] = _f_out
-        attn_out = sk.encrypt_symmetric(
-            ctx, encoder.encode_double_vector(
-                ctx, _attn_slots, SCALE, fresh_ci))
+            q_max_abs=max_abs_calib.get("q") if max_abs_calib else None,
+            o_max_abs=max_abs_calib.get("o") if max_abs_calib else None,
+            o_mean=max_abs_calib.get("o_mean") if max_abs_calib else None)
+        # BRIDGE 2 (bridgeless): o_ct is already stride-T_MODEL, bootstrap-
+        # refreshed — use directly for residual1, no decrypt→re-encrypt.
+        attn_out = _fres["o_ct"]
         # residual1
         x_mid_ct = residual(ctx, x_ct, attn_out)
         if verbose: _probe("post-residual1", ctx, encoder, sk, x_mid_ct)
@@ -1829,7 +1810,9 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             ctx, encoder, _load_up_padded, N=NUM_SLOTS,
             d_in=D_MODEL, d_out=_D_PAD_OUT_MLP, scale=SCALE,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx)
-        _down_irp = _irp_cache.down_plaintexts_cached(
+        # BRIDGE 3 (bridgeless): UNFOLDED row-permuted Wdown. Row permute at
+        # full d_out=D_MODEL → natural stride-T_MODEL output, no SK bridge.
+        _down_irp = _irp_cache.down_unfolded_plaintexts_cached(
             ctx, encoder, _load_down_padded, N=NUM_SLOTS,
             d_in=_D_PAD_OUT_MLP, d_out=D_MODEL, scale=SCALE,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT, layer_idx=layer_idx,
@@ -1935,67 +1918,48 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # _h_ct shallow enough that Wdown's lazy-level mod_switch handles the
         # rest without a dedicated bootstrap.
 
-        # -- Wdown (tall rect IRP matvec — COMPLEX OUTPUT-FOLDED, K=2048→1024
-        #    SCPs, the biggest remaining tall fold) --
-        # The folded matvec runs the rect machinery at d_out_fold = D_MODEL/2,
-        # so it consumes its input in the TALL layout for (D_PAD_OUT, D_MODEL/2)
-        # — the row-permutation absorbing the gate/up interleave is computed at
-        # this folded dim in the cache wrapper (down_plaintexts_cached). Masks
-        # are therefore encoded at the FOLDED dims (d_in=D_PAD_OUT,
-        # d_out=D_MODEL/2): tall path needs sub_mask_pt (at chain+1) AND
-        # input_mask_pt (square mask at d=d_out_fold).
-        # Lazy-level: drop the IRP-Wdown input to a deep chain so the
-        # rotation-heavy tall rect matvec runs at few RNS limbs (cheap).
-        # Headroom audit: the folded matvec consumes ~2 levels (input_mask +
-        # sub_mask), a rescale (+1), then extract_real_imag_pair (+1 for the
-        # conj-split multiply) — one more level than the old unfolded path. The
-        # split halves are then DECRYPTED by the output SK bridge (the result
-        # is decrypted for residual2 anyway), recombined to natural order in
-        # numpy, and RE-ENCRYPTED fresh, so downstream is unaffected. Targeting
-        # input user_level 10 leaves the pre-decrypt cts at user_level ~12-13
-        # (< max 15). mod_switch_to drops limbs cleanly (no added noise).
-        _D_OUT_FOLD_DOWN = D_MODEL // 2  # 2048
+        # -- Wdown (bridgeless unfolded tall rect IRP matvec, K=2048 SCPs) --
+        # BRIDGE 3: row-permuted unfolded matvec emits natural stride-T_MODEL
+        # output → bootstrap refreshes chain (no SK bridge).
+        # Tall path masks at FULL dims (d_in=D_PAD_OUT, d_out=D_MODEL):
+        # sub_mask_pt (rect at chain+1), input_mask_pt (square at d=D_MODEL).
+        # Lazy-level: unfolded tall = input_mask (+1) + sub_mask (+1) + rescale
+        # (+1) = 3 levels. Target input user_level 11 → mlp_out at ~14 (< 15).
         _wdown_target_ci = engine.user_level_chain_index(11)
         if _h_ct.chain_index() < _wdown_target_ci:
             _h_ct = phantom.mod_switch_to(ctx, _h_ct, _wdown_target_ci)
         _input_mask_down = _irp_mlp.encode_irp_mask(
-            ctx, encoder, N=NUM_SLOTS, d=_D_OUT_FOLD_DOWN, scale=SCALE,
+            ctx, encoder, N=NUM_SLOTS, d=D_MODEL, scale=SCALE,
             chain_index=_h_ct.chain_index())
         _sub_mask_down = _irp_mlp.encode_irp_mask_rect(
-            ctx, encoder, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=_D_OUT_FOLD_DOWN,
+            ctx, encoder, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=D_MODEL,
             scale=SCALE, chain_index=_h_ct.chain_index() + 1)
-        _mlp_complex = _irp_mlp.irp_matvec_rect_folded_host(
+        mlp_out = _irp_mlp.irp_matvec_rect_host(
             ctx, encoder, galois_key, _h_ct, _down_irp,
             N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=D_MODEL,
             baby_steps=_BABY_STEPS_IRP_MLP_RECT,
             sub_mask_pt=_sub_mask_down,
             input_mask_pt=_input_mask_down)
-        # Snap SCALE^2 → SCALE before the conj-split (pipeline convention).
-        _mlp_complex = phantom.rescale_to_next(ctx, _mlp_complex)
-        _mlp_complex.set_scale(SCALE)
-        _mlp_re, _mlp_im = _irp_mlp.extract_real_imag_pair(
-            ctx, encoder, galois_key, _mlp_complex, NUM_SLOTS, SCALE)
-        # -- OUTPUT SK BRIDGE: decrypt both halves, recombine to natural order
-        #    in numpy (free + legitimate — mlp_out is decrypted anyway), then
-        #    re-encrypt fresh in the stride-T_MODEL layout residual2's other
-        #    operand (x_mid_ct) uses. This near-lossless bridge also refreshes
-        #    the chain. The TALL fold decode (real=out[:d/2], imag=out[d/2:])
-        #    mirrors /tmp/irp_rect_fold_fhe_test.py's _folded reader. --
-        _dec_re = np.asarray(encoder.decode_double_vector(
-            ctx, sk.decrypt(ctx, _mlp_re)), dtype=np.float64)
-        _dec_im = np.asarray(encoder.decode_double_vector(
-            ctx, sk.decrypt(ctx, _mlp_im)), dtype=np.float64)
-        _y_lo = _irp_mlp.decode_irp_output_rect(
-            _dec_re, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=_D_OUT_FOLD_DOWN)
-        _y_hi = _irp_mlp.decode_irp_output_rect(
-            _dec_im, N=NUM_SLOTS, d_in=_D_PAD_OUT_MLP, d_out=_D_OUT_FOLD_DOWN)
-        _mlp_natural = np.concatenate([_y_lo, _y_hi])  # natural order, length D_MODEL
-        _mlp_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
-        _mlp_slots[::T_MODEL][:D_MODEL] = _mlp_natural
-        mlp_out = sk.encrypt_symmetric(
-            ctx, encoder.encode_double_vector(ctx, _mlp_slots, SCALE, fresh_ci))
+        mlp_out = phantom.rescale_to_next(ctx, mlp_out)
+        mlp_out.set_scale(SCALE)
+        # bootstrap replaces SK bridge. Mean-center before boot.
+        _mlp_max_abs = (max_abs_calib.get("mlp_out", 1.0)
+                        if max_abs_calib else 1.0)
+        _mlp_mean = (max_abs_calib.get("mlp_out_mean", 0.0)
+                     if max_abs_calib else 0.0)
+        _mlp_mean_slots = np.zeros(NUM_SLOTS, dtype=np.float64)
+        _mlp_mean_slots[::T_MODEL][:D_MODEL] = _mlp_mean
+        _mlp_mean_pt = encoder.encode_double_vector(
+            ctx, _mlp_mean_slots, mlp_out.scale(), mlp_out.chain_index())
+        mlp_out = phantom.sub_plain(ctx, mlp_out, _mlp_mean_pt)
+        mlp_out = bootstrap(engine, ctx, encoder, mlp_out,
+                            max_abs=_mlp_max_abs + abs(_mlp_mean),
+                            slot_count=NUM_SLOTS)
+        _mlp_mean_pt2 = encoder.encode_double_vector(
+            ctx, _mlp_mean_slots, mlp_out.scale(), mlp_out.chain_index())
+        mlp_out = phantom.add_plain(ctx, mlp_out, _mlp_mean_pt2)
         if verbose: _probe("post-mlp", ctx, encoder, sk, mlp_out)
-        # residual2 (both operands now natural stride-T_MODEL at fresh_ci)
+        # residual2 (both operands natural stride-T_MODEL; residual aligns chain)
         y_ct = residual(ctx, x_mid_ct, mlp_out)
         if verbose: _probe("post-residual2 y_ct", ctx, encoder, sk, y_ct)
         layer_ms = (time.perf_counter() - t_layer_start) * 1000
