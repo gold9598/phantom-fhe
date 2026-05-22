@@ -3,9 +3,12 @@
 #include <cuComplex.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "cuda_wrapper.cuh"
 #include "ntt.cuh"
@@ -22,10 +25,22 @@ namespace phantom {
             std::uint64_t q0,
             std::size_t N);
 
+    // Int64 expand (full-scale SCPs): per-tower mod-q_j reduction, scale_2 == 1.
     __global__ void light_pt_expand_per_tower_kernel(
             const std::int64_t *src_signed,
             std::uint64_t *dst,
             const DModulus *moduli,
+            std::size_t num_towers,
+            std::size_t N);
+
+    // Int16 expand (quantized IRP weight SCPs): multiplies each int16 coeff
+    // (stored at coeff_scale) by scale_2 to restore the full message scale,
+    // then reduces mod q_j per RNS tower.
+    __global__ void light_pt_expand_per_tower_i16_kernel(
+            const std::int16_t *src_signed,
+            std::uint64_t *dst,
+            const DModulus *moduli,
+            std::int64_t scale_2,
             std::size_t num_towers,
             std::size_t N);
 
@@ -34,6 +49,20 @@ namespace phantom {
             if (err != cudaSuccess) {
                 throw std::runtime_error(std::string("SingleChainPlaintext: ") + what +
                                          " failed: " + cudaGetErrorString(err));
+            }
+        }
+
+        // Narrow signed int64 coefficients (already centered in [-q0/2, q0/2))
+        // to int16. Only invoked when the host range-check confirms every coeff
+        // fits int16 (quantized IRP weight SCPs at coeff_scale=2^16).
+        __global__ void narrow_i64_to_i16_kernel(
+                const std::int64_t *__restrict__ src,
+                std::int16_t *__restrict__ dst,
+                std::size_t N) {
+            for (std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+                 tid < N;
+                 tid += blockDim.x * gridDim.x) {
+                dst[tid] = static_cast<std::int16_t>(src[tid]);
             }
         }
     }
@@ -88,14 +117,68 @@ namespace phantom {
         return *this;
     }
 
+    // ===== PinnedHostInt16Buffer =====
+
+    PinnedHostInt16Buffer::PinnedHostInt16Buffer(std::size_t n) : n_(n) {
+        if (n == 0) return;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n * sizeof(std::int16_t)),
+                   "cudaMallocHost");
+    }
+
+    PinnedHostInt16Buffer::~PinnedHostInt16Buffer() {
+        if (ptr_ != nullptr) {
+            cudaFreeHost(ptr_);
+            ptr_ = nullptr;
+        }
+    }
+
+    PinnedHostInt16Buffer::PinnedHostInt16Buffer(const PinnedHostInt16Buffer &other) : n_(other.n_) {
+        if (n_ == 0) return;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n_ * sizeof(std::int16_t)),
+                   "cudaMallocHost (copy)");
+        std::memcpy(ptr_, other.ptr_, n_ * sizeof(std::int16_t));
+    }
+
+    PinnedHostInt16Buffer &PinnedHostInt16Buffer::operator=(const PinnedHostInt16Buffer &other) {
+        if (this == &other) return *this;
+        if (ptr_ != nullptr) { cudaFreeHost(ptr_); ptr_ = nullptr; }
+        n_ = other.n_;
+        if (n_ == 0) return *this;
+        check_cuda(cudaMallocHost(reinterpret_cast<void **>(&ptr_), n_ * sizeof(std::int16_t)),
+                   "cudaMallocHost (copy-assign)");
+        std::memcpy(ptr_, other.ptr_, n_ * sizeof(std::int16_t));
+        return *this;
+    }
+
+    PinnedHostInt16Buffer::PinnedHostInt16Buffer(PinnedHostInt16Buffer &&other) noexcept
+            : ptr_(other.ptr_), n_(other.n_) {
+        other.ptr_ = nullptr;
+        other.n_ = 0;
+    }
+
+    PinnedHostInt16Buffer &PinnedHostInt16Buffer::operator=(PinnedHostInt16Buffer &&other) noexcept {
+        if (this != &other) {
+            if (ptr_ != nullptr) cudaFreeHost(ptr_);
+            ptr_ = other.ptr_;
+            n_ = other.n_;
+            other.ptr_ = nullptr;
+            other.n_ = 0;
+        }
+        return *this;
+    }
+
     // ===== encode_single_chain_plaintext =====
 
     SingleChainPlaintext encode_single_chain_plaintext(
             const PhantomContext &ctx,
             PhantomCKKSEncoder &encoder,
             const std::vector<std::complex<double>> &slots,
-            double scale) {
+            double scale,
+            double coeff_scale) {
         const auto &stream = cudaStreamPerThread;
+
+        // coeff_scale <= 0 means "use scale" (full-scale SCP, scale_2 == 1).
+        const double enc_scale = (coeff_scale > 0.0) ? coeff_scale : scale;
 
         // Encode at chain_index = 1 (first usable index) to drive q_0 selection.
         // Single-chain storage is level-agnostic; the picked level only fixes
@@ -108,7 +191,7 @@ namespace phantom {
         }
 
         PhantomPlaintext full_pt;
-        encoder.encode<cuDoubleComplex>(ctx, v, scale, full_pt, chain_index);
+        encoder.encode<cuDoubleComplex>(ctx, v, enc_scale, full_pt, chain_index);
 
         const auto &cd = ctx.get_context_data(chain_index);
         const auto &mods = cd.parms().coeff_modulus();
@@ -126,22 +209,50 @@ namespace phantom {
                                        /*coeff_modulus_size=*/1,
                                        /*start_modulus_idx=*/0, stream);
 
-        // Signed-center on device into a temporary int64 buffer, then D2H
-        // copy into pinned host memory.
+        // Signed-center on device into an int64 buffer, then D2H to host.
         auto d_signed = phantom::util::make_cuda_auto_ptr<std::int64_t>(N, stream);
         const std::size_t threads = 256;
         const std::size_t blocks = (N + threads - 1) / threads;
         light_pt_signed_center_kernel<<<blocks, threads, 0, stream>>>(
                 tower0.get(), d_signed.get(), q0, N);
 
-        SingleChainPlaintext out;
-        out.scale = scale;
-        out.coeffs = PinnedHostInt64Buffer(N);
-        check_cuda(cudaMemcpyAsync(out.coeffs.data(), d_signed.get(),
+        std::vector<std::int64_t> host64(N);
+        check_cuda(cudaMemcpyAsync(host64.data(), d_signed.get(),
                                    N * sizeof(std::int64_t),
                                    cudaMemcpyDeviceToHost, stream),
                    "D2H signed coeffs");
         check_cuda(cudaStreamSynchronize(stream), "stream sync after encode");
+
+        // Adaptive storage: int16 when every coeff fits (quantized IRP weight
+        // SCPs at coeff_scale=2^16), int64 otherwise (full-scale SCPs whose
+        // coeffs at the 2^40 message scale far exceed int16). Lossless in both.
+        bool fits_i16 = true;
+        for (std::size_t i = 0; i < N; ++i) {
+            if (host64[i] < INT16_MIN || host64[i] > INT16_MAX) {
+                fits_i16 = false;
+                break;
+            }
+        }
+
+        SingleChainPlaintext out;
+        out.scale = scale;
+        out.coeff_scale = enc_scale;
+        out.is_int16 = fits_i16;
+        if (fits_i16) {
+            // Narrow on device then D2H the compact int16 buffer.
+            auto d_i16 = phantom::util::make_cuda_auto_ptr<std::int16_t>(N, stream);
+            narrow_i64_to_i16_kernel<<<blocks, threads, 0, stream>>>(
+                    d_signed.get(), d_i16.get(), N);
+            out.coeffs = PinnedHostInt16Buffer(N);
+            check_cuda(cudaMemcpyAsync(out.coeffs.data(), d_i16.get(),
+                                       N * sizeof(std::int16_t),
+                                       cudaMemcpyDeviceToHost, stream),
+                       "D2H int16 coeffs");
+            check_cuda(cudaStreamSynchronize(stream), "stream sync after narrow");
+        } else {
+            out.coeffs64 = PinnedHostInt64Buffer(N);
+            std::memcpy(out.coeffs64.data(), host64.data(), N * sizeof(std::int64_t));
+        }
         return out;
     }
 
@@ -157,18 +268,10 @@ namespace phantom {
         const std::size_t coeff_modulus_size = mods.size();
         const std::size_t N = cd.parms().poly_modulus_degree();
 
-        if (scp.coeffs.size() != N) {
+        if (scp.N() != N) {
             throw std::invalid_argument(
                     "expand_single_chain_to_full: coeff length != N");
         }
-
-        // H2D async into a device scratch buffer first, since the source lives
-        // in pinned host memory.
-        auto d_signed = phantom::util::make_cuda_auto_ptr<std::int64_t>(N, stream);
-        check_cuda(cudaMemcpyAsync(d_signed.get(), scp.coeffs.data(),
-                                   N * sizeof(std::int64_t),
-                                   cudaMemcpyHostToDevice, stream),
-                   "H2D signed coeffs");
 
         PhantomPlaintext pt;
         pt.set_chain_index(target_chain_index);
@@ -179,12 +282,31 @@ namespace phantom {
         const std::size_t threads = 256;
         const std::size_t total = coeff_modulus_size * N;
         const std::size_t blocks = (total + threads - 1) / threads;
-        light_pt_expand_per_tower_kernel<<<blocks, threads, 0, stream>>>(
-                d_signed.get(),
-                pt.data(),
-                moduli,
-                coeff_modulus_size,
-                N);
+
+        if (scp.is_int16) {
+            // scale_2 restores the full message scale (scp.scale) from the
+            // coeffs' quantization scale (scp.coeff_scale); 1 if they are equal.
+            const std::int64_t scale_2 = (scp.coeff_scale > 0.0)
+                    ? static_cast<std::int64_t>(std::llround(scp.scale / scp.coeff_scale))
+                    : 1;
+            auto d_signed = phantom::util::make_cuda_auto_ptr<std::int16_t>(N, stream);
+            check_cuda(cudaMemcpyAsync(d_signed.get(), scp.coeffs.data(),
+                                       N * sizeof(std::int16_t),
+                                       cudaMemcpyHostToDevice, stream),
+                       "H2D int16 coeffs");
+            light_pt_expand_per_tower_i16_kernel<<<blocks, threads, 0, stream>>>(
+                    d_signed.get(), pt.data(), moduli, scale_2,
+                    coeff_modulus_size, N);
+        } else {
+            auto d_signed = phantom::util::make_cuda_auto_ptr<std::int64_t>(N, stream);
+            check_cuda(cudaMemcpyAsync(d_signed.get(), scp.coeffs64.data(),
+                                       N * sizeof(std::int64_t),
+                                       cudaMemcpyHostToDevice, stream),
+                       "H2D int64 coeffs");
+            light_pt_expand_per_tower_kernel<<<blocks, threads, 0, stream>>>(
+                    d_signed.get(), pt.data(), moduli,
+                    coeff_modulus_size, N);
+        }
 
         nwt_2d_radix8_forward_inplace(pt.data(), ctx.gpu_rns_tables(),
                                       coeff_modulus_size, 0, stream);
