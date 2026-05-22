@@ -101,3 +101,7 @@ _deps
 
 # oh-my-claudecode local agent state
 .omc/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
