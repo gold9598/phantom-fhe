@@ -660,6 +660,7 @@ namespace phantom {
             const std::int64_t *__restrict__ src_signed,
             std::uint64_t *__restrict__ dst,  // size num_towers * N
             const DModulus *__restrict__ moduli,
+            std::int64_t scale_2,
             std::size_t num_towers,
             std::size_t N) {
         const std::size_t total = num_towers * N;
@@ -671,7 +672,7 @@ namespace phantom {
             const DModulus mod = moduli[j];
             const std::uint64_t qj = mod.value();
             const std::uint64_t mu_hi = mod.const_ratio()[1];
-            const std::int64_t c = src_signed[i];
+            const std::int64_t c = src_signed[i] * scale_2;
             std::uint64_t out;
             if (c >= 0) {
                 out = barrett_reduce_uint64_uint64(static_cast<std::uint64_t>(c), qj, mu_hi);
@@ -860,6 +861,7 @@ namespace phantom {
             light.coeffs_int64.get(),
             pt.data(),
             moduli,
+            /*scale_2=*/1,
             coeff_modulus_size,
             N);
 
