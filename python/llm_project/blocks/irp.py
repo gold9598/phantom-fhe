@@ -18,6 +18,26 @@ import numpy as np
 import pyPhantom as phantom
 
 
+# Quantization scale for IRP WEIGHT SingleChainPlaintexts. The signed-centered
+# IRP diagonal coefficients are stored as int16 at this scale; the full message
+# scale (engine user_scale, 2^40) is restored at expand time by the per-tower
+# scale_2 = round(scale / coeff_scale) multiply in the C++ kernel.
+#
+# Scale choice: int16 holds +/-32767. The coeffs must use enough of that range
+# that integer ROUNDING is negligible. Empirically (random N(0,0.02) weights,
+# the worst case): at 2^16 coeffs peak ~22 -> rounding loses ~7%/coeff -> output
+# rel-RMS ~5.6e-2 (catastrophic). At 2^24 coeffs peak ~5600 -> rel-RMS ~2e-4
+# (well below the ~4.2e-3 baseline) with ~6x int16 headroom against per-weight
+# outliers. 2^24 is the lossless sweet spot that still fits int16 (4x smaller
+# cache than int64). Larger scales (>=2^28) overflow int16 and fall back to
+# int64 storage in the encoder (lossless but no size win).
+#
+# Only the IRP weight encoders below pass this; every other SCP (rmsnorm gammas,
+# merge-bootstrap constants, masks, the complex-bridge half/neg-half constants)
+# encodes at full scale, where coeff_scale == scale => scale_2 == 1 (unchanged).
+IRP_COEFF_SCALE = 2.0 ** 24
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -126,7 +146,8 @@ def encode_irp_diagonals_host(
     # Pass numpy complex arrays directly — avoids the GIL-held tolist()
     # marshalling that previously dominated the Wq IRP pre-encode phase
     # (~50 ms per call × 256 SCPs × 32 layers = ~6 min per worker).
-    return [phantom.encode_single_chain_plaintext(ctx, encoder, s, scale)
+    return [phantom.encode_single_chain_plaintext(
+                ctx, encoder, s, scale, IRP_COEFF_SCALE)
             for s in slot_arrays]
 
 
@@ -890,7 +911,7 @@ def encode_irp_diagonals_rect_pair_host(
             # Pass numpy complex array directly — fast path via binding's
             # numpy overload (no Python iteration of 65K complex objects).
             plaintexts.append(phantom.encode_single_chain_plaintext(
-                ctx, encoder, combined, scale))
+                ctx, encoder, combined, scale, IRP_COEFF_SCALE))
     return plaintexts
 
 
