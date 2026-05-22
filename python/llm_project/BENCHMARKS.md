@@ -13,6 +13,31 @@ LLaMA-3.1-8B decoder layer (layer 0) against a HuggingFace fp32 reference.
 Wall time has ±15% run-to-run variance from GPU thermal/scheduling state
 — consistent within a single warm session.
 
+## Full-forward precision sweep (32-layer, idx0, use17, bridgeless, 62 GB box)
+
+Same IRP / complex-fold / bridgeless pipeline at every SCP precision — only the
+stored coefficient dtype varies (`IRP_COEFF_SCALE`). Warm = SCP cache built;
+FHE↔PT prediction agrees and 0 errors on all four:
+
+| precision (branch) | SCP dtype | warm total | per-layer | fhe-compute/layer | per-layer rel-RMS |
+|---|---|---|---|---|---|
+| quant-64bit | int64 | **277.8 s** | 8.68 s | 7.39 s | 1.6e-3 – 2.3e-2 |
+| quant-32bit | int32 | **169.7 s** | 5.31 s | ~5 s | ~5e-3 |
+| quant-16bit | int16 | **97.3 s** | 3.04 s | ~3 s | ~1e-2 |
+| quant-8bit | int8-BFP | **84.3 s** | 2.63 s | 2.6 s | ~1e-2 |
+
+- **Speed:** monotonic with byte-width — **int64 → int8 = 3.3×** faster, from the
+  cheaper per-tower expand/load of the narrower dtype.
+- **Accuracy:** quantization is **near-lossless** in this pipeline — int64-IRP
+  rel-RMS (~1e-2) ≈ int16/int8. The ~1e-2 is the IRP+use17+bridgeless pipeline,
+  not the integer width.
+- Cold (first run, full IRP cache build): int8 498 s, int32 489 s, int64 555.7 s.
+
+The separate **dense `baseline`** branch is a *different* pipeline (not the
+precision control): int64 at 383.1 s / rel-RMS ~5e-4 — slower *and* tighter than
+quant-64bit purely because of the dense (non-IRP) algorithm, so it conflates
+pipeline with precision and is excluded from the sweep above.
+
 ## Per-stage breakdown (1916 ms)
 
 ```
