@@ -6,7 +6,7 @@ modularly: a value of v becomes v - round(v). Both a non-zero mean and a large
 per-slot magnitude break the bootstrap, so callers must scale inputs into the
 safe domain before calling `engine.bootstrap_inplace`.
 
-`bootstrap_safe`: given a static caller-provided bound `max_abs`, pre-scales
+`bootstrap`: given a static caller-provided bound `max_abs`, pre-scales
 `ct` by `target_mag / max_abs` into [-target_mag, target_mag], runs
 `engine.bootstrap_inplace`, then unscales. Uses `target_mag=0.49` by default
 (the best precision without crossing the polynomial's mod-1 wrap point).
@@ -22,7 +22,7 @@ sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/build/lib")
 import pyPhantom as phantom
 
 
-def bootstrap_safe(engine, ctx, encoder, ct, max_abs, slot_count, target_mag=0.49):
+def bootstrap(engine, ctx, encoder, ct, max_abs, slot_count, target_mag=0.49):
     """SK-free bootstrap with static input range.
 
     Pre-scales `ct` by `target_mag / max_abs` so post-scale slots fit inside
@@ -44,7 +44,7 @@ def bootstrap_safe(engine, ctx, encoder, ct, max_abs, slot_count, target_mag=0.4
     if needs_scale:
         if engine.user_level(ct) >= engine.max_user_level():
             raise ValueError(
-                f"bootstrap_safe: input at user_level {engine.user_level(ct)} "
+                f"bootstrap: input at user_level {engine.user_level(ct)} "
                 f"(== max_user_level {engine.max_user_level()}) requires scaling "
                 f"(max_abs={max_abs} > target_mag={target_mag}); "
                 "bootstrap one level earlier in the pipeline.")
@@ -83,7 +83,7 @@ def merge_bootstrap(engine, ctx, encoder, ct1, ct2, max_abs, slot_count,
 
     Pre-scaling is absorbed into the merge multiplications: ct1 is multiplied
     by `sd` (real scale-down) and ct2 by `sd·i` (complex). Both consume
-    exactly the 1 level a bootstrap_safe(ct) would have used for its own
+    exactly the 1 level a bootstrap(ct) would have used for its own
     scale-down. Summing the two scaled cts is free (same chain). The merged
     ct's slot magnitudes are ≤ target_mag, so bootstrap_inplace runs directly
     (no internal scaling). Conjugate, split, and fold the rescale-up

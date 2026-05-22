@@ -138,7 +138,7 @@ Plus a chain layout that uses the_lib's distinct prime pools:
       the new chain, prints avg/max bits, compares to the_lib reference
       (`/home/yongwoo-oh/the_lib/build/bin/examples/ckks_bootstrapping_cuda`
       avg = 6.64e-07 = ~20.5 bits)
-- [ ] `bootstrap_safe`: revisit per-site `max_abs` ceilings — at ~20
+- [ ] `bootstrap`: revisit per-site `max_abs` ceilings — at ~20
       bits absolute precision, the pre-scale at `attn_pre_psexp`
       (max_abs=45.1), `mlp_post_wgate`/`wup` (1.66/1.78), and
       `mlp_post_swiglu` (1.26) may be unnecessary for moderate-range
