@@ -6,46 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
-#ifdef EVALMOD_STAGE_DEBUG
-#include "secretkey.h"
-#include <cstdio>
-#include <functional>
-#include <mutex>
-#endif
-
 namespace phantom {
-
-#ifdef EVALMOD_STAGE_DEBUG
-// ----------------------------------------------------------------------------
-// Stage-probe state (set by the test/probe before calling evalmod_k28_r3).
-// Holds the secret key + the analytical reference inputs (one value per slot
-// in the first N_PROBE slots). The instrumentation inside sine_chebyshev_k28
-// decrypts a clone of each intermediate ciphertext, decodes, computes the
-// analytical reference at the same input, and prints
-//   bits = -log2(mean_abs_err)  over the first N_PROBE slots.
-// ----------------------------------------------------------------------------
-namespace {
-struct StageProbeState {
-    const PhantomSecretKey *sk = nullptr;
-    std::vector<double> vals;  // input values at slots [0..N_PROBE-1]
-};
-StageProbeState g_probe_state;
-std::mutex g_probe_mutex;
-}  // namespace
-
-void evalmod_set_stage_probe(const PhantomSecretKey *sk,
-                             const std::vector<double> &vals) {
-    std::lock_guard<std::mutex> lk(g_probe_mutex);
-    g_probe_state.sk = sk;
-    g_probe_state.vals = vals;
-}
-
-void evalmod_clear_stage_probe() {
-    std::lock_guard<std::mutex> lk(g_probe_mutex);
-    g_probe_state.sk = nullptr;
-    g_probe_state.vals.clear();
-}
-#endif  // EVALMOD_STAGE_DEBUG
 
 // ============================================================================
 // Chebyshev coefficients for K=7 sine (lapis evalmod_coeffs.rs).
@@ -152,81 +113,6 @@ constexpr std::array<std::array<double, 8>, 3> K28_REM_COEFFS = {{
 constexpr int  EVALMOD_R       = 3;
 constexpr int  CHEB_MAX_POWER  = 8;
 constexpr int  CHEB_BABY_K28   = 7;
-
-#ifdef EVALMOD_STAGE_DEBUG
-// Reference function signature: takes input x ∈ ℝ, returns analytical ref value.
-// Used by report_stage to score the decrypted ct against the cleartext stage value.
-using StageRefFn = std::function<double(double)>;
-
-// Helper: relinearize a TRIO copy so we can decrypt. No effect on original.
-void probe_relinearize_if_needed(const PhantomContext &ctx,
-                                 PhantomCiphertext &c,
-                                 const PhantomRelinKey &rk) {
-    if (c.size() > 2) {
-        relinearize_inplace(ctx, c, rk);
-    }
-}
-
-// Decrypt + decode `ct` (cloning so original is untouched), compute the
-// analytical stage value at each input slot via `ref_fn`, then print
-// stage name + bits-of-precision (avg over N_PROBE slots, max over same).
-void report_stage(const PhantomContext &ctx,
-                  PhantomCKKSEncoder &enc,
-                  const PhantomCiphertext &ct,
-                  const PhantomRelinKey &rk,
-                  const char *stage_name,
-                  const StageRefFn &ref_fn) {
-    std::lock_guard<std::mutex> lk(g_probe_mutex);
-    if (g_probe_state.sk == nullptr || g_probe_state.vals.empty()) return;
-    const auto &vals = g_probe_state.vals;
-    const size_t n = vals.size();
-
-    PhantomCiphertext clone = ct;
-    probe_relinearize_if_needed(ctx, clone, rk);
-
-    PhantomPlaintext dec_pt;
-    // decrypt() is non-const in the API, but we treat our captured pointer as
-    // logically const (we never mutate it) — cast away const at the call site.
-    const_cast<PhantomSecretKey *>(g_probe_state.sk)->decrypt(ctx, clone, dec_pt);
-    std::vector<double> decoded;
-    enc.decode(ctx, dec_pt, decoded);
-
-    double sum_abs = 0.0;
-    double max_abs = 0.0;
-    double ref0 = 0.0, dec0 = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        const double ref = ref_fn(vals[i]);
-        const double err = std::abs(decoded[i] - ref);
-        sum_abs += err;
-        if (err > max_abs) max_abs = err;
-        if (i == 0) { ref0 = ref; dec0 = decoded[0]; }
-    }
-    const double avg = sum_abs / double(n);
-    const double bits_avg = (avg > 0.0) ? -std::log2(avg) : 99.0;
-    const double bits_max = (max_abs > 0.0) ? -std::log2(max_abs) : 99.0;
-    std::fprintf(stderr,
-        "[STAGE %-22s] bits(avg)=%6.2f  bits(max)=%6.2f  avg_err=%.3e  max_err=%.3e  "
-        "dec[0]=%+.6e ref[0]=%+.6e  chain=%zu  size=%zu\n",
-        stage_name, bits_avg, bits_max, avg, max_abs,
-        dec0, ref0, clone.chain_index(), clone.size());
-    std::fflush(stderr);
-}
-
-// Chebyshev T_k(x) via cos(k·acos(x)) — works for |x| ≤ 1.
-double cheb_T(int k, double x) {
-    // For |x|<1 (our case after vals/(4K)), cos(k·acos(x)) is the standard form.
-    if (x > 1.0) x = 1.0;
-    if (x < -1.0) x = -1.0;
-    return std::cos(double(k) * std::acos(x));
-}
-
-// Weighted-sum reference: coeffs[0] + Σ_{i≥1} coeffs[i] · T_i(x).
-double ref_weighted_sum(const double *coeffs, size_t n_coeffs, double x) {
-    double s = coeffs[0];
-    for (size_t i = 1; i < n_coeffs; ++i) s += coeffs[i] * cheb_T(int(i), x);
-    return s;
-}
-#endif  // EVALMOD_STAGE_DEBUG
 
 // ----------------------------------------------------------------------------
 // Tiny helpers wrapping phantom's public ops.
@@ -667,17 +553,6 @@ sine_chebyshev_k28(const PhantomContext &ctx,
     auto baby = build_chebyshev_basis(ctx, enc, ct, CHEB_BABY_K28, rk, target_scale);
     PhantomCiphertext &t7 = baby[6];
 
-#ifdef EVALMOD_STAGE_DEBUG
-    // Stage 1: baby basis T_1..T_7
-    for (int k = 1; k <= CHEB_BABY_K28; ++k) {
-        char name[32];
-        std::snprintf(name, sizeof(name), "basis[%d]=T_%d", k, k);
-        const int kk = k;
-        report_stage(ctx, enc, baby[k - 1], rk, name,
-                     [kk](double x) { return cheb_T(kk, x); });
-    }
-#endif
-
     // T_14 = 2·T_7² − 1   (depth d+1).
     PhantomCiphertext t14 = square_and_relin(ctx, t7, rk);
     rescale_to_next_inplace(ctx, t14);
@@ -685,22 +560,12 @@ sine_chebyshev_k28(const PhantomContext &ctx,
     add_scalar_inplace(ctx, enc, t14, -0.5);
     double_ct(ctx, t14);
 
-#ifdef EVALMOD_STAGE_DEBUG
-    report_stage(ctx, enc, t14, rk, "T_14",
-                 [](double x) { return cheb_T(14, x); });
-#endif
-
     // T_28 = 2·T_14² − 1   (depth d+2).
     PhantomCiphertext t28 = square_and_relin(ctx, t14, rk);
     rescale_to_next_inplace(ctx, t28);
     snap_scale(t28, target_scale);
     add_scalar_inplace(ctx, enc, t28, -0.5);
     double_ct(ctx, t28);
-
-#ifdef EVALMOD_STAGE_DEBUG
-    report_stage(ctx, enc, t28, rk, "T_28",
-                 [](double x) { return cheb_T(28, x); });
-#endif
 
     // Weighted sums over baby (depth d) → output at d+1. Critically,
     // we do NOT pre-align baby up to T_14 level; we let ws's internal
@@ -738,11 +603,6 @@ sine_chebyshev_k28(const PhantomContext &ctx,
         sub_inplace(ctx, t21, t7_a);            // − T_7
     }
 
-#ifdef EVALMOD_STAGE_DEBUG
-    report_stage(ctx, enc, t21, rk, "T_21",
-                 [](double x) { return cheb_T(21, x); });
-#endif
-
     // T_49 = 2·T_28·T_21 − T_7  (depth d+3). DEFERRED relin: this matches
     // the_lib's `paterson_stockmeyer_basis` (multiply WITHOUT rk → TRIO).
     // After this, t49 is a 3-component ciphertext; later we'll subtract it
@@ -762,27 +622,12 @@ sine_chebyshev_k28(const PhantomContext &ctx,
         sub_inplace(ctx, t49, t7_b);            // − T_7  (TRIO − DUO)
     }
 
-#ifdef EVALMOD_STAGE_DEBUG
-    report_stage(ctx, enc, t49, rk, "T_49",
-                 [](double x) { return cheb_T(49, x); });
-#endif
-
     // aux_ct = ws_aux + T_28   (depth d+2). ws_aux at d+1 → align down.
     // Both DUO (eager-relin upstream). Stays DUO.
     PhantomCiphertext aux_ct = ws_aux;
     PhantomCiphertext t28_for_aux = t28;
     align_pair(ctx, aux_ct, t28_for_aux);       // both at d+2
     add_inplace(ctx, aux_ct, t28_for_aux);
-
-#ifdef EVALMOD_STAGE_DEBUG
-    // aux_ct = ws(aux_coeffs, T_1..T_7) + T_28
-    report_stage(ctx, enc, aux_ct, rk, "aux_ct",
-                 [](double x) {
-                     return ref_weighted_sum(K28_AUX_COEFFS.data(),
-                                             K28_AUX_COEFFS.size(), x)
-                            + cheb_T(28, x);
-                 });
-#endif
 
     // quotient = (T_14 + ws_q0) · ws_q1 + ws_q2.
     // The_lib's chebyshev_paterson_stockmeyer WITH rk → eager relin → DUO.
@@ -799,17 +644,6 @@ sine_chebyshev_k28(const PhantomContext &ctx,
         add_inplace(ctx, quotient, q2);
     }
 
-#ifdef EVALMOD_STAGE_DEBUG
-    // quotient = (T_14 + ws_q0(x)) · ws_q1(x) + ws_q2(x)
-    report_stage(ctx, enc, quotient, rk, "quotient",
-                 [](double x) {
-                     const double q0 = ref_weighted_sum(K28_QUOT_COEFFS[0].data(), 8, x);
-                     const double q1 = ref_weighted_sum(K28_QUOT_COEFFS[1].data(), 8, x);
-                     const double q2 = ref_weighted_sum(K28_QUOT_COEFFS[2].data(), 8, x);
-                     return (cheb_T(14, x) + q0) * q1 + q2;
-                 });
-#endif
-
     // remainder = (T_14 + ws_r0) · ws_r1 + ws_r2.
     // The_lib's chebyshev_paterson_stockmeyer WITHOUT rk → TRIO. We mirror
     // this so the final result-add TRIO+TRIO sizes match.
@@ -824,17 +658,6 @@ sine_chebyshev_k28(const PhantomContext &ctx,
         add_inplace(ctx, remainder, r2);        // TRIO + DUO → TRIO
     }
 
-#ifdef EVALMOD_STAGE_DEBUG
-    // remainder = (T_14 + ws_r0(x)) · ws_r1(x) + ws_r2(x)
-    report_stage(ctx, enc, remainder, rk, "remainder",
-                 [](double x) {
-                     const double r0 = ref_weighted_sum(K28_REM_COEFFS[0].data(), 8, x);
-                     const double r1 = ref_weighted_sum(K28_REM_COEFFS[1].data(), 8, x);
-                     const double r2 = ref_weighted_sum(K28_REM_COEFFS[2].data(), 8, x);
-                     return (cheb_T(14, x) + r0) * r1 + r2;
-                 });
-#endif
-
     // result = aux_ct · quotient + remainder − T_49   (depth d+3).
     // aux_ct (DUO) · quotient (DUO) WITHOUT relin → TRIO. Then add remainder
     // (TRIO) and subtract T_49 (TRIO). Single relin at the end converts the
@@ -844,20 +667,6 @@ sine_chebyshev_k28(const PhantomContext &ctx,
     rescale_to_next_inplace(ctx, result);       // d+3
     snap_scale(result, target_scale);
 
-#ifdef EVALMOD_STAGE_DEBUG
-    // aux_ct · quotient (TRIO, just after rescale, before remainder/T_49 fold).
-    report_stage(ctx, enc, result, rk, "aux*quotient",
-                 [](double x) {
-                     const double aux = ref_weighted_sum(K28_AUX_COEFFS.data(),
-                                                         K28_AUX_COEFFS.size(), x)
-                                        + cheb_T(28, x);
-                     const double q0 = ref_weighted_sum(K28_QUOT_COEFFS[0].data(), 8, x);
-                     const double q1 = ref_weighted_sum(K28_QUOT_COEFFS[1].data(), 8, x);
-                     const double q2 = ref_weighted_sum(K28_QUOT_COEFFS[2].data(), 8, x);
-                     const double quot = (cheb_T(14, x) + q0) * q1 + q2;
-                     return aux * quot;
-                 });
-#endif
     {
         PhantomCiphertext rem = remainder;
         align_to(ctx, rem, result.chain_index());
@@ -873,25 +682,6 @@ sine_chebyshev_k28(const PhantomContext &ctx,
     // collapsed from what was previously 3 separate relins (T_49, remainder,
     // result), saving 3 × ~2 bits = ~6 bits of key-switching noise.
     relinearize_inplace(ctx, result, rk);
-
-#ifdef EVALMOD_STAGE_DEBUG
-    // Final sine polynomial output (before R=3 DA): aux·quot + rem − T_49.
-    report_stage(ctx, enc, result, rk, "sine_final",
-                 [](double x) {
-                     const double aux = ref_weighted_sum(K28_AUX_COEFFS.data(),
-                                                         K28_AUX_COEFFS.size(), x)
-                                        + cheb_T(28, x);
-                     const double q0 = ref_weighted_sum(K28_QUOT_COEFFS[0].data(), 8, x);
-                     const double q1 = ref_weighted_sum(K28_QUOT_COEFFS[1].data(), 8, x);
-                     const double q2 = ref_weighted_sum(K28_QUOT_COEFFS[2].data(), 8, x);
-                     const double quot = (cheb_T(14, x) + q0) * q1 + q2;
-                     const double r0 = ref_weighted_sum(K28_REM_COEFFS[0].data(), 8, x);
-                     const double r1 = ref_weighted_sum(K28_REM_COEFFS[1].data(), 8, x);
-                     const double r2 = ref_weighted_sum(K28_REM_COEFFS[2].data(), 8, x);
-                     const double rem  = (cheb_T(14, x) + r0) * r1 + r2;
-                     return aux * quot + rem - cheb_T(49, x);
-                 });
-#endif
 
     return result;
 }

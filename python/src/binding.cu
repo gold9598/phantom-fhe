@@ -362,15 +362,6 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::call_guard<py::gil_scoped_release>(),
           "EvalMod K=28 R=4: returns sin(2π·28·x)/(2π) under encryption.");
 
-#ifdef EVALMOD_STAGE_DEBUG
-    m.def("evalmod_set_stage_probe", &phantom::evalmod_set_stage_probe,
-          py::arg("sk"), py::arg("vals"),
-          "DEBUG: set secret key + input values for per-stage decrypt-and-measure "
-          "inside the next evalmod_k28_r3 call.");
-    m.def("evalmod_clear_stage_probe", &phantom::evalmod_clear_stage_probe,
-          "DEBUG: clear the stage-probe state.");
-#endif
-
     // ===== CKKSEngine: user-facing facade with bootstrap =====
     py::class_<phantom::CKKSEngineConfig>(m, "ckks_engine_config")
             .def(py::init<>())
@@ -408,9 +399,6 @@ PYBIND11_MODULE(pyPhantom, m) {
             .def("decrypt_decode", &phantom::CKKSEngine::decrypt_decode,
                  py::call_guard<py::gil_scoped_release>())
             .def("bootstrap_inplace", &phantom::CKKSEngine::bootstrap_inplace,
-                 py::call_guard<py::gil_scoped_release>())
-            .def("bootstrap_inplace_debug",
-                 &phantom::CKKSEngine::bootstrap_inplace_debug,
                  py::call_guard<py::gil_scoped_release>())
             .def("context", &phantom::CKKSEngine::context, py::return_value_policy::reference_internal)
             .def("encoder", &phantom::CKKSEngine::mutable_encoder, py::return_value_policy::reference_internal)
