@@ -224,18 +224,19 @@ def irp_matvec_host(
 
     babies_chain = babies[0].chain_index()
 
-    giant_partials: List[Optional[object]] = [None] * G
-    for j in range(M):
-        for g in range(G):
-            scp = plaintexts[j * G + g]
-            pt = phantom.expand_single_chain_to_full(ctx, scp, babies_chain)
-            prod = phantom.multiply_plain(ctx, babies[j], pt)
-            del pt  # Drop the expanded plaintext immediately to release GPU mem.
-            if giant_partials[g] is None:
-                giant_partials[g] = prod
-            else:
-                giant_partials[g] = phantom.add(ctx, giant_partials[g], prod)
-            del prod
+    giant_partials: List[Optional[object]] = []
+    for g in range(G):
+        # giant_partials[g] = Sum_j plaintexts[j*G + g] . babies[j], computed in
+        # one fused MAC kernel (numerically equivalent to the per-term
+        # multiply_plain + add loop). expand_single_chain_to_full yields
+        # full-RNS NTT-form plaintexts for every SCP dtype; fused_mac_accumulate
+        # gathers them with no re-expand / no extra NTT.
+        pts_g = [
+            phantom.expand_single_chain_to_full(ctx, plaintexts[j * G + g], babies_chain)
+            for j in range(M)
+        ]
+        giant_partials.append(phantom.fused_mac_accumulate(ctx, babies, pts_g))
+        del pts_g
 
     acc = giant_partials[0]
     for g in range(1, G):
