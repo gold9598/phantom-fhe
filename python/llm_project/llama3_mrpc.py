@@ -1390,7 +1390,7 @@ def fhe_attention_dense_full(engine, ctx, encoder, sk, relin_key, galois_key,
     # pre-decrypt cts at user_level ~12-13 (< max). mod_switch_to drops limbs
     # cleanly (no added noise). Tall masks at the FOLDED dim d_out=D/2:
     # input_mask (square at d=D/2, at input chain) + sub_mask (rect at chain+1).
-    _wq_target_ci = engine.user_level_chain_index(9)
+    _wq_target_ci = engine.user_level_chain_index(12)
     if x_irp_ct.chain_index() < _wq_target_ci:
         x_irp_ct = phantom.mod_switch_to(ctx, x_irp_ct, _wq_target_ci)
     _input_mask_q = _irp.encode_irp_mask(
@@ -2584,7 +2584,7 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
         # input user_level 10 leaves the pre-decrypt cts at user_level ~12-13
         # (< max 15). mod_switch_to drops limbs cleanly (no added noise).
         _D_OUT_FOLD_DOWN = D_MODEL // 2  # 2048
-        _wdown_target_ci = engine.user_level_chain_index(10)
+        _wdown_target_ci = engine.user_level_chain_index(11)
         if _h_ct.chain_index() < _wdown_target_ci:
             _h_ct = phantom.mod_switch_to(ctx, _h_ct, _wdown_target_ci)
         _input_mask_down = _irp_mlp.encode_irp_mask(
