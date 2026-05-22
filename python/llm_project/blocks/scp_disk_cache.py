@@ -43,9 +43,11 @@ from typing import Any
 import pyPhantom as phantom
 
 
-# v2: per-SCP .bin files hold int16 coeffs and the index carries coeff_scale.
-# Bumped from v1 (int64) so stale caches are rejected and cold-re-encoded.
-CACHE_VERSION = 2
+# v3 (quant-32bit): per-SCP .bin files hold int16/int32/int64 coeffs (adaptive
+# width, disambiguated by byte length in scp_from_bytes) and the index carries
+# coeff_scale. Bumped from v2 (int16 @ 2^24) so stale caches are rejected and
+# cold-re-encoded at the int32 (2^32) scale. v1 was int64.
+CACHE_VERSION = 3
 
 
 def _is_scp(obj: Any) -> bool:

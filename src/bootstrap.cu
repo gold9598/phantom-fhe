@@ -720,6 +720,42 @@ namespace phantom {
         }
     }
 
+    // Int32 variant of light_pt_expand_per_tower_i16_kernel for
+    // SingleChainPlaintext storage (coeffs stored as int32 at coeff_scale).
+    // Quantized IRP weight SCPs at coeff_scale=2^32 have ~21-bit coeffs that
+    // overflow int16 but fit int32; scale_2=2^8 restores the 2^40 message
+    // scale. The product |coeff| * scale_2 (~2^21 * 2^8 ~ 2^29; worst case
+    // ~2^31 * 2^8 = 2^39) fits int64 with margin.
+    __global__ void light_pt_expand_per_tower_i32_kernel(
+            const std::int32_t *__restrict__ src_signed,
+            std::uint64_t *__restrict__ dst,  // size num_towers * N
+            const DModulus *__restrict__ moduli,
+            std::int64_t scale_2,
+            std::size_t num_towers,
+            std::size_t N) {
+        const std::size_t total = num_towers * N;
+        for (std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+             tid < total;
+             tid += blockDim.x * gridDim.x) {
+            const std::size_t j = tid / N;
+            const std::size_t i = tid - j * N;
+            const DModulus mod = moduli[j];
+            const std::uint64_t qj = mod.value();
+            const std::uint64_t mu_hi = mod.const_ratio()[1];
+            const std::int64_t c =
+                static_cast<std::int64_t>(src_signed[i]) * scale_2;
+            std::uint64_t out;
+            if (c >= 0) {
+                out = barrett_reduce_uint64_uint64(static_cast<std::uint64_t>(c), qj, mu_hi);
+            } else {
+                const std::uint64_t mag = static_cast<std::uint64_t>(-c);
+                std::uint64_t mag_mod = barrett_reduce_uint64_uint64(mag, qj, mu_hi);
+                out = (mag_mod == 0) ? 0ULL : (qj - mag_mod);
+            }
+            dst[tid] = out;
+        }
+    }
+
     // Encode a complex diagonal into a compact LightPlaintext.
     //
     // Implementation (one-shot, slow path used only at key generation):

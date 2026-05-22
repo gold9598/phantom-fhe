@@ -12,15 +12,17 @@ Key schema:
   Wup   : up_L{layer}_di{d_in}_do{d_out}_b{baby_steps}_s{scale_tag}
   Wdown : down_L{layer}_di{d_in}_do{d_out}_b{baby_steps}_s{scale_tag}
 
-On-disk format (version 3, one blob file per weight):
+On-disk format (version 4, one blob file per weight):
   8-byte magic  : b'IRPCV2\n\x00'
   4-byte uint32 : header_len (little-endian)
   header_len bytes : UTF-8 JSON
-        {"version":3,"count":K,"scale":f,"coeff_scale":f,"N":n}
-  K * (N * 2) bytes : raw int16 SCP coefficients back-to-back
+        {"version":4,"count":K,"scale":f,"coeff_scale":f,
+         "is_int16":b,"is_int32":b,"N":n}
+  K * (N * w) bytes : raw SCP coefficients back-to-back, where the per-coeff
+        width w is 2 (int16), 4 (int32) or 8 (int64) per the storage flags.
 
 Cold run: encodes K SCPs, writes ONE blob file via tmp+rename.
-Warm run: opens ONE file, mmap's it, slices K contiguous N*2-byte
+Warm run: opens ONE file, mmap's it, slices K contiguous N*w-byte
 chunks, calls phantom.scp_from_bytes per chunk — typically 200-300 MB/s
 off NVMe with zero per-SCP open overhead.
 """
@@ -41,10 +43,11 @@ import pyPhantom as phantom
 
 
 _MAGIC = b'IRPCV2\n\x00'
-# v3: SCP coeffs stored as int16 (N * 2 B) with a per-blob coeff_scale in the
-# header. Incompatible with the v2 int64 (N * 8 B) blobs, which are rejected by
-# the version check so a stale cache cold-re-encodes at the quantized scale.
-_CACHE_VERSION = 3
+# v4 (quant-32bit): SCP coeffs stored at the adaptive width recorded by the
+# is_int16/is_int32 header flags (N*2 / N*4 / N*8 B) with a per-blob coeff_scale.
+# Bumped from v3 (int16-only @ 2^24) so stale int16 blobs are rejected by the
+# version check and the cache cold-re-encodes at the int32 (2^32) scale.
+_CACHE_VERSION = 4
 
 
 def _scale_tag(scale: float) -> str:
@@ -256,12 +259,15 @@ def _save_blob(path: str, plaintexts: list) -> None:
     scale = float(plaintexts[0].get_scale())
     coeff_scale = float(plaintexts[0].get_coeff_scale())
     is_int16 = bool(plaintexts[0].get_is_int16())
+    is_int32 = bool(plaintexts[0].get_is_int32())
     N = int(plaintexts[0].N)
-    scp_bytes = N * (2 if is_int16 else 8)  # int16 (quantized) vs int64
+    # int16 (2 B) / int32 (4 B) quantized vs int64 (8 B) full-scale.
+    scp_bytes = N * (2 if is_int16 else 4 if is_int32 else 8)
 
     header_bytes = json.dumps(
         {"version": _CACHE_VERSION, "count": K, "scale": scale,
-         "coeff_scale": coeff_scale, "is_int16": is_int16, "N": N}
+         "coeff_scale": coeff_scale, "is_int16": is_int16,
+         "is_int32": is_int32, "N": N}
     ).encode("utf-8")
     header_len = len(header_bytes)
 
@@ -304,8 +310,9 @@ def _load_blob(path: str) -> list:
             scale = float(header["scale"])
             coeff_scale = float(header.get("coeff_scale", scale))
             is_int16 = bool(header.get("is_int16", True))
+            is_int32 = bool(header.get("is_int32", False))
             N = int(header["N"])
-            scp_bytes = N * (2 if is_int16 else 8)
+            scp_bytes = N * (2 if is_int16 else 4 if is_int32 else 8)
             data_offset = 12 + header_len
             plaintexts = []
             for i in range(K):

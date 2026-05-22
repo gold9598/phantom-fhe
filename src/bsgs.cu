@@ -35,6 +35,14 @@ namespace phantom {
             std::size_t num_towers,
             std::size_t N);
 
+    __global__ void light_pt_expand_per_tower_i32_kernel(
+            const std::int32_t *src_signed,
+            std::uint64_t *dst,
+            const DModulus *moduli,
+            std::int64_t scale_2,
+            std::size_t num_towers,
+            std::size_t N);
+
     namespace {
 
         inline bool is_power_of_two(std::size_t x) {
@@ -306,7 +314,7 @@ namespace phantom {
 
                 // H2D async into a device scratch buffer first, since the source
                 // lives in pinned host memory. Dispatch on the SCP's storage
-                // width: int16 (quantized) applies scale_2; int64 (full-scale).
+                // width: int16/int32 (quantized) apply scale_2; int64 (full-scale).
                 if (scp.is_int16) {
                     const std::int64_t scale_2 = (scp.coeff_scale > 0.0)
                             ? static_cast<std::int64_t>(std::llround(scp.scale / scp.coeff_scale))
@@ -316,6 +324,17 @@ namespace phantom {
                                     N * sizeof(std::int16_t),
                                     cudaMemcpyHostToDevice, stream);
                     light_pt_expand_per_tower_i16_kernel<<<blocks, threads, 0, stream>>>(
+                            d_signed.get(), pt_dst, base_rns, scale_2,
+                            num_towers, N);
+                } else if (scp.is_int32) {
+                    const std::int64_t scale_2 = (scp.coeff_scale > 0.0)
+                            ? static_cast<std::int64_t>(std::llround(scp.scale / scp.coeff_scale))
+                            : 1;
+                    auto d_signed = phantom::util::make_cuda_auto_ptr<std::int32_t>(N, stream);
+                    cudaMemcpyAsync(d_signed.get(), scp.coeffs32.data(),
+                                    N * sizeof(std::int32_t),
+                                    cudaMemcpyHostToDevice, stream);
+                    light_pt_expand_per_tower_i32_kernel<<<blocks, threads, 0, stream>>>(
                             d_signed.get(), pt_dst, base_rns, scale_2,
                             num_towers, N);
                 } else {

@@ -454,22 +454,25 @@ PYBIND11_MODULE(pyPhantom, m) {
                                    [](const phantom::SingleChainPlaintext &p) { return p.coeff_scale; })
             .def_property_readonly("is_int16",
                                    [](const phantom::SingleChainPlaintext &p) { return p.is_int16; })
+            .def_property_readonly("is_int32",
+                                   [](const phantom::SingleChainPlaintext &p) { return p.is_int32; })
             .def_property_readonly("nbytes",
                                    [](const phantom::SingleChainPlaintext &p) { return p.nbytes(); })
             .def_property_readonly("N",
                                    [](const phantom::SingleChainPlaintext &p) { return p.N(); })
-            // Raw coeffs as py::bytes (int16 -> N*2, int64 -> N*8 depending on
-            // is_int16). Releases the GIL during the copy so concurrent workers
-            // can serialize cache entries in parallel; the SCP buffer is in
-            // pinned host memory and is safe to read while other threads run.
+            // Raw coeffs as py::bytes (int16 -> N*2, int32 -> N*4, int64 -> N*8
+            // depending on is_int16/is_int32). Releases the GIL during the copy
+            // so concurrent workers can serialize cache entries in parallel; the
+            // SCP buffer is in pinned host memory and is safe to read while other
+            // threads run.
             .def("coeffs_bytes",
                  [](const phantom::SingleChainPlaintext &p) {
                      return py::bytes(reinterpret_cast<const char *>(p.coeff_ptr()),
                                       p.nbytes());
                  },
                  "Return the SCP's coefficient buffer as raw bytes (length N*2 "
-                 "for int16, N*8 for int64). Pair with scp_from_bytes to "
-                 "round-trip an SCP to/from disk.")
+                 "for int16, N*4 for int32, N*8 for int64). Pair with "
+                 "scp_from_bytes to round-trip an SCP to/from disk.")
             .def("get_scale",
                  [](const phantom::SingleChainPlaintext &p) { return p.scale; },
                  "Return the SCP's effective (reported) scale.")
@@ -479,7 +482,10 @@ PYBIND11_MODULE(pyPhantom, m) {
                  "full-scale SCPs, 2^16 for quantized IRP weight SCPs).")
             .def("get_is_int16",
                  [](const phantom::SingleChainPlaintext &p) { return p.is_int16; },
-                 "True if coeffs are stored as int16 (quantized), False if int64.");
+                 "True if coeffs are stored as int16 (quantized), False otherwise.")
+            .def("get_is_int32",
+                 [](const phantom::SingleChainPlaintext &p) { return p.is_int32; },
+                 "True if coeffs are stored as int32 (quantized), False otherwise.");
 
     // numpy-array fast path for encode_single_chain_plaintext: pybind11
     // dispatches here when callers pass a numpy complex128 array directly.
@@ -556,14 +562,17 @@ PYBIND11_MODULE(pyPhantom, m) {
               // Python object.
               std::string s(data);
               // Adaptive: byte length selects the storage width (int16 -> N*2,
-              // int64 -> N*8). Round-trips coeffs_bytes() for either case.
+              // int32 -> N*4, int64 -> N*8). Round-trips coeffs_bytes() for any
+              // case (the three widths are distinct multiples of N).
               const bool is_i16 = (s.size() == N * sizeof(std::int16_t));
+              const bool is_i32 = (s.size() == N * sizeof(std::int32_t));
               const bool is_i64 = (s.size() == N * sizeof(std::int64_t));
-              if (!is_i16 && !is_i64) {
+              if (!is_i16 && !is_i32 && !is_i64) {
                   throw std::runtime_error(
                       "scp_from_bytes: byte length mismatch (got " +
                       std::to_string(s.size()) + ", expected " +
-                      std::to_string(N * sizeof(std::int16_t)) + " or " +
+                      std::to_string(N * sizeof(std::int16_t)) + ", " +
+                      std::to_string(N * sizeof(std::int32_t)) + " or " +
                       std::to_string(N * sizeof(std::int64_t)) + ")");
               }
               // The pinned-host allocation + memcpy are pure C++; release
@@ -574,9 +583,13 @@ PYBIND11_MODULE(pyPhantom, m) {
               out.scale = scale;
               out.coeff_scale = (coeff_scale > 0.0) ? coeff_scale : scale;
               out.is_int16 = is_i16;
+              out.is_int32 = is_i32;
               if (is_i16) {
                   out.coeffs = phantom::PinnedHostInt16Buffer(N);
                   std::memcpy(out.coeffs.data(), s.data(), s.size());
+              } else if (is_i32) {
+                  out.coeffs32 = phantom::PinnedHostInt32Buffer(N);
+                  std::memcpy(out.coeffs32.data(), s.data(), s.size());
               } else {
                   out.coeffs64 = phantom::PinnedHostInt64Buffer(N);
                   std::memcpy(out.coeffs64.data(), s.data(), s.size());
@@ -586,8 +599,9 @@ PYBIND11_MODULE(pyPhantom, m) {
           py::arg("data"), py::arg("scale"), py::arg("N"),
           py::arg("coeff_scale") = 0.0,
           "Reconstruct a SingleChainPlaintext from raw coefficient bytes "
-          "(length N*2 for int16, N*8 for int64), an effective scale, and a "
-          "coeff_scale (default 0 = use scale). Inverse of coeffs_bytes().");
+          "(length N*2 for int16, N*4 for int32, N*8 for int64), an effective "
+          "scale, and a coeff_scale (default 0 = use scale). Inverse of "
+          "coeffs_bytes().");
 
     m.def("expand_single_chain_to_full", &phantom::expand_single_chain_to_full,
           py::arg("context"), py::arg("scp"), py::arg("target_chain_index"),

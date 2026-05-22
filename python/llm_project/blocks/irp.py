@@ -19,23 +19,22 @@ import pyPhantom as phantom
 
 
 # Quantization scale for IRP WEIGHT SingleChainPlaintexts. The signed-centered
-# IRP diagonal coefficients are stored as int16 at this scale; the full message
+# IRP diagonal coefficients are stored as int32 at this scale; the full message
 # scale (engine user_scale, 2^40) is restored at expand time by the per-tower
 # scale_2 = round(scale / coeff_scale) multiply in the C++ kernel.
 #
-# Scale choice: int16 holds +/-32767. The coeffs must use enough of that range
-# that integer ROUNDING is negligible. Empirically (random N(0,0.02) weights,
-# the worst case): at 2^16 coeffs peak ~22 -> rounding loses ~7%/coeff -> output
-# rel-RMS ~5.6e-2 (catastrophic). At 2^24 coeffs peak ~5600 -> rel-RMS ~2e-4
-# (well below the ~4.2e-3 baseline) with ~6x int16 headroom against per-weight
-# outliers. 2^24 is the lossless sweet spot that still fits int16 (4x smaller
-# cache than int64). Larger scales (>=2^28) overflow int16 and fall back to
-# int64 storage in the encoder (lossless but no size win).
+# quant-32bit (conservative checkpoint): at 2^32 the IRP coeffs are ~21 bits,
+# overflowing int16 (+/-32767) but sitting deep inside int32 (+/-2^31, ~10 bits
+# of headroom). The encoder's adaptive storage selects the int32 tier; integer
+# rounding at this scale is trivially lossless (rel-RMS == baseline). scale_2 =
+# 2^40 / 2^32 = 2^8 is fused per-tower in the int32 expand kernel. Stored int32
+# (4 B) is 2x smaller than int64 (8 B) — the conservative size win vs the int16
+# (2^24, 4x) variant on quant-16bit.
 #
 # Only the IRP weight encoders below pass this; every other SCP (rmsnorm gammas,
 # merge-bootstrap constants, masks, the complex-bridge half/neg-half constants)
 # encodes at full scale, where coeff_scale == scale => scale_2 == 1 (unchanged).
-IRP_COEFF_SCALE = 2.0 ** 24
+IRP_COEFF_SCALE = 2.0 ** 32
 
 
 # ---------------------------------------------------------------------------
