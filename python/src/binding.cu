@@ -635,6 +635,10 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     m.def("bsgs_required_steps", &phantom::bsgs_required_steps, py::arg("baby_steps"));
 
+    m.def("fused_mac_accumulate", &phantom::fused_mac_accumulate,
+          py::arg("ctx"), py::arg("babies"), py::arg("plaintexts"),
+          py::call_guard<py::gil_scoped_release>());
+
     m.def("bsgs_matmul_preencoded", &phantom::bsgs_matmul_preencoded,
           py::arg("context"), py::arg("galois_key"), py::arg("x"), py::arg("diags"),
           py::call_guard<py::gil_scoped_release>());
