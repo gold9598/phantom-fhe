@@ -357,26 +357,58 @@ namespace phantom {
         key_switch_inner_prod(cx.get(), t_mod_up.get(), relin_keys.public_keys_ptr(), rns_tool, modulus_QP,
                               reduction_threshold, s);
 
-        // mod down
-        for (size_t i = 0; i < 2; i++) {
+        // mod down + add-to-ct.
+        //
+        // keyswitch produces two output polynomials (cx[0], cx[1]); each needs a
+        // moddown_from_NTT followed by add_to_ct_kernel. The two polynomials are
+        // fully data-independent: their cx halves are disjoint (offset i*size_QlP_n),
+        // their destination ct halves are disjoint (offset i*size_Ql_n / i*size_Q*n),
+        // and moddown_from_NTT allocates its `delta` (and BGV `temp_t`) scratch
+        // per-call on the supplied stream, so the two calls never alias.
+        //
+        // Run poly 0 on the caller stream `s` and poly 1 concurrently on a second
+        // stream `s2`, synchronised by CUDA events so the result is bit-identical to
+        // the serial path. `s2` waits for the keyswitch MAC (key_switch_inner_prod,
+        // dispatched on `s` above) before reading cx; `s` waits for `s2` to finish
+        // before returning, so the cx/t_mod_up frees and any downstream work on `s`
+        // are correctly ordered after poly 1.
+        auto moddown_and_add = [&](size_t i, const cudaStream_t &stream) {
             auto cx_i = cx.get() + i * size_QlP_n;
-            rns_tool.moddown_from_NTT(cx_i, cx_i, context.gpu_rns_tables(), scheme, s);
-        }
-
-        for (size_t i = 0; i < 2; i++) {
-            auto cx_i = cx.get() + i * size_QlP_n;
+            rns_tool.moddown_from_NTT(cx_i, cx_i, context.gpu_rns_tables(), scheme, stream);
 
             if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
                 auto ct_i = encrypted.data() + i * size_Q * n;
-                auto t_cx = make_cuda_auto_ptr<uint64_t>(size_Q * n, s);
-                rns_tool.ExpandCRTBasis_Ql_Q(t_cx.get(), cx_i, s);
-                add_to_ct_kernel<<<(size_Q * n) / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                auto t_cx = make_cuda_auto_ptr<uint64_t>(size_Q * n, stream);
+                rns_tool.ExpandCRTBasis_Ql_Q(t_cx.get(), cx_i, stream);
+                add_to_ct_kernel<<<(size_Q * n) / blockDimGlb.x, blockDimGlb, 0, stream>>>(
                         ct_i, t_cx.get(), rns_tool.base_Q().base(), n, size_Q);
             } else {
                 auto ct_i = encrypted.data() + i * size_Ql_n;
-                add_to_ct_kernel<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                add_to_ct_kernel<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, stream>>>(
                         ct_i, cx_i, rns_tool.base_Ql().base(), n, size_Ql);
             }
-        }
+        };
+
+        cudaStream_t s2;
+        cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+        cudaEvent_t ev_inner, ev_s2;
+        cudaEventCreateWithFlags(&ev_inner, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&ev_s2, cudaEventDisableTiming);
+
+        // s2 must observe the keyswitch MAC output before it reads cx.
+        cudaEventRecord(ev_inner, s);
+        cudaStreamWaitEvent(s2, ev_inner, 0);
+
+        // poly 0 on s, poly 1 concurrently on s2.
+        moddown_and_add(0, s);
+        moddown_and_add(1, s2);
+
+        // s waits for s2 to finish before returning.
+        cudaEventRecord(ev_s2, s2);
+        cudaStreamWaitEvent(s, ev_s2, 0);
+
+        cudaEventDestroy(ev_inner);
+        cudaEventDestroy(ev_s2);
+        cudaStreamDestroy(s2);
     }
 }
