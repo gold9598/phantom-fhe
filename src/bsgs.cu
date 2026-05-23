@@ -67,15 +67,34 @@ namespace phantom {
         //   acc1 = sum_{b in [0, M)} pooled[b][j][i] * babies[b].c1[j][i]   mod q_j
         //
         // Bit-identical to running M back-to-back (multiply_plain_ntt + add_inplace)
-        // calls: each iteration computes a 128-bit product, adds it to a 128-bit
-        // running accumulator, then Barrett-reduces to [0, q_j) before the next
-        // accumulate. This matches the per-step modular reduction semantics of
-        // the unfused path (which Barrett-reduces inside multiply_rns_poly and
-        // then conditional-subtracts inside add_uint64_uint64_mod).
-        __global__ void mac_accumulate_kernel(
-            const std::uint64_t *__restrict__ pooled,         // M * num_towers * N
-            const std::uint64_t *const *__restrict__ babies_c0_ptrs,  // M pointers
-            const std::uint64_t *const *__restrict__ babies_c1_ptrs,  // M pointers
+        // calls. The unfused path Barrett-reduces each product to [0, q_j) and then
+        // conditional-subtracts on add, so every partial sum is a representative in
+        // [0, q_j). Reducing once at the END (single final Barrett) yields the SAME
+        // residue mod q_j because reduction is a ring homomorphism (associativity of
+        // modular addition): (a + b) mod q == ((a mod q) + (b mod q)) mod q.
+        //
+        // SAFETY (overflow of the 128-bit accumulator): each product pt*baby is
+        // < q_j^2 < 2^120 (q_j < 2^60). Summing K of them stays below K * 2^120, so
+        // K <= 2^7 = 128 keeps the sum below 2^127. To stay correct for ANY M we
+        // flush (Barrett-reduce the accumulator back to a single residue) every
+        // REDUCE_EVERY=64 products; with q_j < 2^60 the worst-case partial sum is
+        // q_j + 64*q_j^2 < 2^127, so the accumulator never overflows. After a flush
+        // the accumulator holds one residue in [0, q_j), preserving bit-identity.
+        //
+        // Structure mirrors phantom's key_switch_inner_prod_c2_and_evk_pipelined
+        // (src/eval_key_switch.cu): cp.async.cg double-buffered software pipeline,
+        // 2 coefficients/thread via 16-byte loads, prefetch baby b+1 while computing
+        // baby b. Grid: (num_towers, N / (MAC_TILE)).
+        static constexpr int MAC_BLOCK = 256;
+        static constexpr int MAC_E     = 2;             // coeffs per thread
+        static constexpr int MAC_TILE  = MAC_BLOCK * MAC_E;
+        static constexpr int MAC_REDUCE_EVERY = 64;     // flush cadence (M-agnostic)
+
+        __global__ __launch_bounds__(MAC_BLOCK, 2)
+        void mac_accumulate_kernel(
+            const std::uint64_t *const *__restrict__ pt_ptrs,           // M pointers to expanded NTT plaintexts
+            const std::uint64_t *const *__restrict__ babies_c0_ptrs,    // M pointers
+            const std::uint64_t *const *__restrict__ babies_c1_ptrs,    // M pointers
             std::uint64_t *__restrict__ out_c0,               // num_towers * N
             std::uint64_t *__restrict__ out_c1,
             const DModulus *__restrict__ moduli,
@@ -84,39 +103,83 @@ namespace phantom {
             std::size_t N) {
             using namespace phantom::arith;
 
-            const std::size_t total = num_towers * N;
-            const std::size_t pt_stride = num_towers * N;  // per-baby stride in pooled
+            const std::size_t j = blockIdx.x;                // one tower per block-row
+            const std::size_t i0 =
+                (std::size_t)blockIdx.y * MAC_TILE + (std::size_t)threadIdx.x * MAC_E;
+            if (i0 >= N) return;                             // tail guard (N % MAC_TILE != 0)
+            const std::size_t off = j * N + i0;              // 16-byte aligned (i0 even)
 
-            for (std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-                 tid < total;
-                 tid += blockDim.x * gridDim.x) {
-                const std::size_t j = tid / N;
-                const std::size_t i = tid - j * N;
-                const DModulus mod = moduli[j];
-                const std::uint64_t qj = mod.value();
-                const std::uint64_t *const ratio = mod.const_ratio();
-                const std::size_t off = j * N + i;
+            const DModulus mod = moduli[j];
+            const std::uint64_t qj = mod.value();
+            const std::uint64_t *const ratio = mod.const_ratio();
 
-                std::uint64_t acc0 = 0;
-                std::uint64_t acc1 = 0;
-                for (std::size_t b = 0; b < M; ++b) {
-                    const std::uint64_t pt_v = pooled[b * pt_stride + off];
-                    const std::uint64_t b0_v = babies_c0_ptrs[b][off];
-                    const std::uint64_t b1_v = babies_c1_ptrs[b][off];
+            // smem[buf][slot][threadIdx.x][elem] -- slot 0=pt, 1=baby0, 2=baby1.
+            __shared__ std::uint64_t smem[2][3][MAC_BLOCK][MAC_E];
 
-                    // 128-bit product + add accumulator + Barrett reduce.
-                    // (acc + pt*baby) < q_j + q_j^2 fits in 128 bits since q_j < 2^60.
-                    uint128_t prod0 = multiply_uint64_uint64(pt_v, b0_v);
-                    uint128_t prod1 = multiply_uint64_uint64(pt_v, b1_v);
-                    uint128_t sum0 = add_uint128_uint64(prod0, acc0);
-                    uint128_t sum1 = add_uint128_uint64(prod1, acc1);
-                    acc0 = barrett_reduce_uint128_uint64(sum0, qj, ratio);
-                    acc1 = barrett_reduce_uint128_uint64(sum1, qj, ratio);
+            auto issue_prefetch = [&](int b, int buf) {
+                const std::uint64_t *p_pt = pt_ptrs[b] + off;
+                const std::uint64_t *p_b0 = babies_c0_ptrs[b] + off;
+                const std::uint64_t *p_b1 = babies_c1_ptrs[b] + off;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                    :: "r"((unsigned)__cvta_generic_to_shared(&smem[buf][0][threadIdx.x][0])),
+                       "l"(p_pt));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                    :: "r"((unsigned)__cvta_generic_to_shared(&smem[buf][1][threadIdx.x][0])),
+                       "l"(p_b0));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                    :: "r"((unsigned)__cvta_generic_to_shared(&smem[buf][2][threadIdx.x][0])),
+                       "l"(p_b1));
+                asm volatile("cp.async.commit_group;\n");
+            };
+
+            // Prime the pipeline.
+            if (M > 0) issue_prefetch(0, 0);
+
+            // Lazy 128-bit accumulators (one per coeff of the pair, per c0/c1).
+            uint128_t acc0_a{0, 0}, acc0_b{0, 0};
+            uint128_t acc1_a{0, 0}, acc1_b{0, 0};
+
+            for (std::size_t b = 0; b < M; ++b) {
+                const int cur = (int)(b & 1);
+                const int nxt = cur ^ 1;
+
+                if (b + 1 < M) {
+                    issue_prefetch((int)(b + 1), nxt);
+                    asm volatile("cp.async.wait_group 1;\n");
+                } else {
+                    asm volatile("cp.async.wait_group 0;\n");
                 }
 
-                out_c0[off] = acc0;
-                out_c1[off] = acc1;
+                const std::uint64_t pt_a = smem[cur][0][threadIdx.x][0];
+                const std::uint64_t pt_b = smem[cur][0][threadIdx.x][1];
+                const std::uint64_t b0_a = smem[cur][1][threadIdx.x][0];
+                const std::uint64_t b0_b = smem[cur][1][threadIdx.x][1];
+                const std::uint64_t b1_a = smem[cur][2][threadIdx.x][0];
+                const std::uint64_t b1_b = smem[cur][2][threadIdx.x][1];
+
+                uint128_t p;
+                p = multiply_uint64_uint64(pt_a, b0_a); add_uint128_uint128(acc0_a, p, acc0_a);
+                p = multiply_uint64_uint64(pt_b, b0_b); add_uint128_uint128(acc0_b, p, acc0_b);
+                p = multiply_uint64_uint64(pt_a, b1_a); add_uint128_uint128(acc1_a, p, acc1_a);
+                p = multiply_uint64_uint64(pt_b, b1_b); add_uint128_uint128(acc1_b, p, acc1_b);
+
+                // M-agnostic overflow guard: flush every MAC_REDUCE_EVERY products
+                // (skip the final iteration -- the tail reduce below covers it).
+                if (((b + 1) % MAC_REDUCE_EVERY) == 0 && (b + 1) < M) {
+                    acc0_a.lo = barrett_reduce_uint128_uint64(acc0_a, qj, ratio); acc0_a.hi = 0;
+                    acc0_b.lo = barrett_reduce_uint128_uint64(acc0_b, qj, ratio); acc0_b.hi = 0;
+                    acc1_a.lo = barrett_reduce_uint128_uint64(acc1_a, qj, ratio); acc1_a.hi = 0;
+                    acc1_b.lo = barrett_reduce_uint128_uint64(acc1_b, qj, ratio); acc1_b.hi = 0;
+                }
             }
+
+            const std::uint64_t r0_a = barrett_reduce_uint128_uint64(acc0_a, qj, ratio);
+            const std::uint64_t r0_b = barrett_reduce_uint128_uint64(acc0_b, qj, ratio);
+            const std::uint64_t r1_a = barrett_reduce_uint128_uint64(acc1_a, qj, ratio);
+            const std::uint64_t r1_b = barrett_reduce_uint128_uint64(acc1_b, qj, ratio);
+
+            st_two_uint64(out_c0 + off, r0_a, r0_b);
+            st_two_uint64(out_c1 + off, r1_a, r1_b);
         }
 
     } // namespace
@@ -366,7 +429,20 @@ namespace phantom {
                                               num_towers, 0, stream);
             }
 
-            // Step 2: allocate output ciphertext (size=2, NTT-form), then fused MAC.
+            // Step 2: build a device pointer array over the pooled buffer so the
+            // kernel can load each baby's plaintext via pt_ptrs[b] directly
+            // (same pattern as babies_c0/c1_ptrs; avoids a contiguous-stride
+            // assumption in the kernel and keeps the signature uniform).
+            std::vector<const std::uint64_t *> h_pt_ptrs(M);
+            for (std::size_t b = 0; b < M; ++b) {
+                h_pt_ptrs[b] = pooled.get() + b * per_poly;
+            }
+            auto d_pt_ptrs = phantom::util::make_cuda_auto_ptr<const std::uint64_t *>(M, stream);
+            cudaMemcpyAsync(d_pt_ptrs.get(), h_pt_ptrs.data(),
+                            M * sizeof(const std::uint64_t *),
+                            cudaMemcpyHostToDevice, stream);
+
+            // Step 3: allocate output ciphertext (size=2, NTT-form), then fused MAC.
             PhantomCiphertext acc;
             acc.resize(ctx, target_ci, /*size=*/2, stream);
             acc.set_ntt_form(true);
@@ -376,11 +452,13 @@ namespace phantom {
             std::uint64_t *out_c0 = acc.data_ptr().get();
             std::uint64_t *out_c1 = out_c0 + per_poly;
 
-            const std::size_t threads = 256;
-            const std::size_t total = num_towers * N;
-            const std::size_t blocks = (total + threads - 1) / threads;
-            mac_accumulate_kernel<<<blocks, threads, 0, stream>>>(
-                    pooled.get(),
+            // Grid: one block-row per tower, ceil(N / MAC_TILE) block-cols
+            // (2 coeffs/thread). In-kernel tail guard covers N % MAC_TILE != 0.
+            const dim3 dim_block(MAC_BLOCK);
+            const dim3 dim_grid((unsigned)num_towers,
+                                (unsigned)((N + MAC_TILE - 1) / MAC_TILE));
+            mac_accumulate_kernel<<<dim_grid, dim_block, 0, stream>>>(
+                    d_pt_ptrs.get(),
                     d_babies_c0_ptrs.get(),
                     d_babies_c1_ptrs.get(),
                     out_c0,
@@ -460,23 +538,21 @@ namespace phantom {
                         M * sizeof(const std::uint64_t *),
                         cudaMemcpyHostToDevice, stream);
 
-        // Gather the already-expanded full-RNS NTT-form plaintexts into one
-        // contiguous pooled buffer (M * num_towers * N), exactly the layout
-        // mac_accumulate_kernel reads: pooled[b * (num_towers*N) + j*N + i].
-        // expand_single_chain_to_full already produced these as full-RNS
-        // tower-major NTT-form at the babies' chain_index, so this is a pure
-        // device-to-device gather: NO re-expand, NO extra NTT.
-        auto pooled = phantom::util::make_cuda_auto_ptr<std::uint64_t>(
-                M * per_poly, stream);
+        // Build device pointer array over the already-expanded plaintexts.
+        // expand_single_chain_to_full produced them as full-RNS tower-major
+        // NTT-form device buffers; read directly, no D2D gather needed.
+        std::vector<const std::uint64_t *> h_pt_ptrs(M);
         for (std::size_t b = 0; b < M; ++b) {
             if (plaintexts[b].chain_index() != target_ci) {
                 throw std::invalid_argument(
                         "fused_mac_accumulate: plaintext chain_index mismatch");
             }
-            cudaMemcpyAsync(pooled.get() + b * per_poly, plaintexts[b].data(),
-                            per_poly * sizeof(std::uint64_t),
-                            cudaMemcpyDeviceToDevice, stream);
+            h_pt_ptrs[b] = plaintexts[b].data();
         }
+        auto d_pt_ptrs = phantom::util::make_cuda_auto_ptr<const std::uint64_t *>(M, stream);
+        cudaMemcpyAsync(d_pt_ptrs.get(), h_pt_ptrs.data(),
+                        M * sizeof(const std::uint64_t *),
+                        cudaMemcpyHostToDevice, stream);
 
         // Output ciphertext: size-2, NTT-form. Scale = babies' scale * pt scale,
         // matching multiply_plain_ntt's new_scale = encrypted.scale() *
@@ -490,11 +566,12 @@ namespace phantom {
         std::uint64_t *out_c0 = acc.data_ptr().get();
         std::uint64_t *out_c1 = out_c0 + per_poly;
 
-        const std::size_t threads = 256;
-        const std::size_t total = num_towers * N;
-        const std::size_t blocks = (total + threads - 1) / threads;
-        mac_accumulate_kernel<<<blocks, threads, 0, stream>>>(
-                pooled.get(),
+        // Grid: one block-row per tower, ceil(N / MAC_TILE) block-cols (2 coeffs/thread).
+        const dim3 dim_block(MAC_BLOCK);
+        const dim3 dim_grid((unsigned)num_towers,
+                            (unsigned)((N + MAC_TILE - 1) / MAC_TILE));
+        mac_accumulate_kernel<<<dim_grid, dim_block, 0, stream>>>(
+                d_pt_ptrs.get(),
                 d_babies_c0_ptrs.get(),
                 d_babies_c1_ptrs.get(),
                 out_c0,
