@@ -1305,7 +1305,8 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
                          shared_wq_cache_lock=None,
                          preloaded_weights=None,
                          precomputed_calib=None,
-                         rp_indep_disk_root=None):
+                         rp_indep_disk_root=None,
+                         all_positions=False):
     """End-to-end FHE classifier: 32 decoder layers + LM head -> Yes/No logits.
 
     Args:
@@ -1998,6 +1999,12 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
             # exactly as in reverted 625ea9c.
             _y_ct_carry = y_ct
 
+    # ---- PPL all-position decode (early return; bypass yes/no LM head)
+    if all_positions:
+        return np.stack(
+            [y_full[i * T_MODEL : i * T_MODEL + D_MODEL] for i in range(num_tokens)],
+            axis=0,
+        )
     # ---- LM head (host-side)
     yes_logit, no_logit = yes_no_logits_np(y_p_fhe, final_norm_g, lm_head_yesno,
                                               eps=meta["rms_norm_eps"])
@@ -2005,6 +2012,28 @@ def run_classifier_fhe(num_tokens, query_position, pytorch_ref, pytorch_pre_norm
     print(f"--- Total layer time: {sum(layer_times)/1000:.1f}s "
           f"(avg {sum(layer_times)/len(layer_times):.0f}ms/layer) ---")
     return yes_logit, no_logit
+
+
+def run_classifier_fhe_all_positions(num_tokens, pytorch_ref, pytorch_pre_norm,
+                                     cos_all_full, sin_all_full, label="ppl_window",
+                                     engine=None, preloaded_weights=None,
+                                     precomputed_calib=None, **kwargs):
+    """PPL wrapper: end-to-end FHE forward returning ALL-POSITION hidden state.
+
+    Thin shim around run_classifier_fhe(all_positions=True). Sets
+    query_position=num_tokens-1 (last real token) and returns the
+    (num_tokens, D_MODEL) post-layer-31 hidden state as a float64 array.
+    The LM-head (final RMSNorm + full-vocab matvec) is NOT applied here;
+    the caller runs it host-side via lm_head_full.full_vocab_logprobs_np.
+    """
+    P_local = num_tokens - 1
+    return run_classifier_fhe(
+        num_tokens, P_local, pytorch_ref, pytorch_pre_norm,
+        cos_all_full, sin_all_full, label=label,
+        engine=engine, preloaded_weights=preloaded_weights,
+        precomputed_calib=precomputed_calib,
+        all_positions=True, **kwargs,
+    )
 
 
 def capture_pytorch_ref_with_model(model, tok, token_ids):
