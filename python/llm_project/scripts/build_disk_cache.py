@@ -35,9 +35,10 @@ import numpy as np
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_THIS_DIR))
+_LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+_REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
-sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, _LLM)
 
 import pyPhantom as phantom  # noqa: E402
 
@@ -117,8 +118,8 @@ def main():
         help="Layer index to start at. Skips layers already saved on disk.")
     args = ap.parse_args()
 
-    from llama3 import load_layer_weights, encode_layer_rp_indep_irps
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from helpers.llama3 import load_layer_weights, encode_layer_rp_indep_irps
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine
     from blocks.scp_disk_cache import save_scp_dict_to_disk, has_cache
 
     os.makedirs(args.out, exist_ok=True)

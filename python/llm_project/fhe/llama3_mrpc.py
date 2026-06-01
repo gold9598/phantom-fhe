@@ -13,34 +13,34 @@ sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
 
 # ---- Phase 1/2/3 re-exports ------------------------------------------------
 # design: doc/design/llama3_mrpc.md#reexport-diagnostics
-from diagnostics import (
+from helpers.diagnostics import (
     _malloc_trim, _probe,
     _PROBE_DECRYPT_STAGES, _PROBE_DUMP_DIR, _PROBE_DUMP_LAYER,
 )
 # design: doc/design/llama3_mrpc.md#reexport-engine-setup
-from engine_setup import (
+from fhe.engine_setup import (
     _make_rms_params_local, _real_nt, _sim_pre_finsmx_mean,
     compute_layer_calib_n, build_user_steps_mrpc, setup_engine,
 )
 # design: doc/design/llama3_mrpc.md#reexport-fhe-attention-dense
-from fhe_attention_dense import (
+from fhe.fhe_attention_dense import (
     K_CACHE_SCALE, _DENSE_WQ_BABY_STEPS,
     encrypt_layer_inputs_multi, fhe_attention_dense_full,
     _LazyLayerWeights, _LAZY_FULL_WEIGHT_CACHE, _LAZY_FULL_WEIGHT_LOCK,
 )
 # design: doc/design/llama3_mrpc.md#reexport-pytorch-ref
-from pytorch_ref import (
+from helpers.pytorch_ref import (
     capture_pytorch_ref_with_model, capture_pytorch_ref, _cached_pytorch_ref,
 )
 # design: doc/design/llama3_mrpc.md#reexport-decoder-layer
-from decoder_layer import ClassifierCtx, run_decoder_layer
+from fhe.decoder_layer import ClassifierCtx, run_decoder_layer
 # ----------------------------------------------------------------------------
 
 from blocks.bootstrap_placement import (
     build_layers_from_table, find_optimal_placement,
 )
 from blocks.lm_head import yes_no_logits_np
-from llama3 import (
+from helpers.llama3 import (
     NUM_SCALE_LEVELS,
     USER_LEVEL_IRP_ATTN,
     PROBE, PROBE_FULL,

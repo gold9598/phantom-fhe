@@ -19,7 +19,7 @@ from blocks.rmsnorm import rmsnorm_forward_stride_t, setup_rmsnorm_weights
 from blocks.silu import silu, fit_silu_coeffs, fit_silu_chebyshev_basis
 from blocks import irp_cache as _irp_cache
 from blocks import calib_cache as _calib_cache
-from llama3 import (
+from helpers.llama3 import (
     NUM_SLOTS, SCALE,
     D_MODEL, D_HEAD, N_HEADS, N_KV_HEADS, N_KV_GROUPS, D_TOTAL,
     T_MODEL, D_HIDDEN,
@@ -28,11 +28,11 @@ from llama3 import (
     load_layer_weights, load_layer_weights_subset,
 )
 
-from diagnostics import (
+from helpers.diagnostics import (
     _probe, _PROBE_DECRYPT_STAGES, _PROBE_DUMP_DIR, _PROBE_DUMP_LAYER,
 )
-from engine_setup import _real_nt, _make_rms_params_local, compute_layer_calib_n
-from fhe_attention_dense import (
+from fhe.engine_setup import _real_nt, _make_rms_params_local, compute_layer_calib_n
+from fhe.fhe_attention_dense import (
     encrypt_layer_inputs_multi, fhe_attention_dense_full,
 )
 
