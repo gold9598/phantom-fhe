@@ -9,11 +9,13 @@ Convention (from irp.py:453-481): both the input encrypt and the output decode
 operate on stride-t = N/d, so the matvec computes y = M @ x with M shape (d,d).
 """
 
+import sys
 import time
 
 import numpy as np
 import pyPhantom as phantom
 
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project/blocks")
 import irp
 
 

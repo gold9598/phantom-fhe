@@ -25,7 +25,6 @@ import numpy as np
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_THIS_DIR))  # python/llm_project -> repo
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
-import pyPhantom as phantom  # noqa: F401
 
 sys.path.insert(0, _THIS_DIR)
 
