@@ -62,3 +62,36 @@ per-layer encoding work that would otherwise blow past the 5090 box's
 The follow-on work (`quantized-plaintext` or similar) will replace the
 fp64 plaintext path with a quantized variant. Reuses everything in
 `cache/` so don't delete those.
+
+---
+
+## Quant-study artifacts (int8 / int16 / int32 / int64)
+
+Full autonomous per-example results and analysis from the quantized-plaintext
+campaign (`AUTONOMOUS_FHE=1`, n=408 MRPC validation set).
+
+### Result CSVs
+
+| File | Branch | Rows | Notes |
+|---|---|---|---|
+| `mrpc_baseline.csv` | baseline | 94 | fp64, n=94 snapshot |
+| `mrpc_baseline_final.csv` | baseline | 408 | fp64, full n=408 |
+| `quant-32bit_auto.csv` | quant-32bit | 408 | int32 plaintext, autonomous sweep |
+| `quant-64bit_auto.csv` | quant-64bit | 408 | int64 plaintext, autonomous sweep |
+
+### Summary
+
+`mrpc_quant_results_summary.md` — headline accuracy/F1 table across int8/16/32/64,
+logit fidelity (max |err|, rel-RMS per layer), and campaign timeline.
+
+### Design and analysis docs
+
+- `doc/design/` — FHE design rationale migrated from in-code comments across all
+  quant branches. Seven files: `README.md`, `llama3_mrpc.md`, `decoder_layer.md`,
+  `engine_setup.md`, `fhe_attention_dense.md`, `pytorch_ref.md`, `diagnostics.md`.
+  The quant-branch modules carry `# design: <file>` pointer comments back here.
+
+- `doc/analysis/` — supporting analysis documents:
+  - `ppl_eval_plan.md` — plan for perplexity evaluation on the FHE pipeline.
+  - `precomputed_calib_variance.md` — study of variance in precomputed calibration
+    data and its impact on quantized inference.
