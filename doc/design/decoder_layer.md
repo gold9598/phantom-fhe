@@ -172,6 +172,26 @@ prime 2^60 ≈ 1.15e18 but apparently triggers a slow path in Phantom's
 `eval_polynomial` — observed to hang on L31 silu). deg=28+ even worse.
 Higher degrees would also push PS depth to 6, busting chain budget.
 
+**GPU-CONFIRMED (2026-06, quant-32bit idx-0): cap-20 is a chain-budget ceiling; mechanism corrected.**
+Raising the cap to 24 or 27 busts the chain at **L1's post-MLP bootstrap**:
+`ValueError: bootstrap: input at user_level 15 (== max_user_level 15) requires scaling`
+— NOT the eval_polynomial hang theorised above. L0 picks deg≤20 and runs clean; L1
+picks deg>20, which consumes **one extra multiplicative level** in Phantom's actual
+`eval_polynomial`, pushing `mlp_out` to ul15 (== max) with no level left for the
+post-MLP bootstrap's pre-scale. The textbook PS-depth formula `ceil(log2(deg+1))`
+reports depth-5 for ALL of deg 20–27 and is blind to this +1 — so the "PS depth 6"
+above was the wrong mechanism but the right conclusion. cap-24 fails identically to cap-27.
+
+The precision gain is **real but blocked**. Numpy fit (bits = −log2 Linf, post-SCALE
+quantization): silu_max=3.5 → deg-27 = 27.97 b vs deg-14 = 14.87 b (+13.1); silu_max=4.0
+→ deg-27 = 24.74 b (+11.7). c_top stays small at these (small-domain) layers (16.4 at
+silu_max=3.5; the "~8e4" above is a wide-domain figure). To unlock deg>20 you must FREE
+one multiplicative level in the MLP segment (gate/up → silu → Wdown → mlp_out leaves
+exactly 1 level of slack that deg-20 fills): bootstrap mlp_out one level earlier, trim a
+level in gate/up/Wdown, or raise max_user_level — a coupled change needing its own FHE
+validation, and it competes with bootstrap-reduction for the same MLP-segment levels.
+Until then the adaptive cap stays at **20** (current code).
+
 ---
 
 ## silu-clenshaw-dispatch
