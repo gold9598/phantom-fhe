@@ -23,10 +23,11 @@ import numpy as np
 # Resolve build/lib and llm_project paths relative to this file so the script
 # runs without modification on any host (5090 dev box, A6000 sweep box, etc.).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_THIS_DIR))  # python/llm_project -> repo
+_LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+_REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
 
-sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, _LLM)
 
 CSV_PATH = "/tmp/mrpc_sweep_results.csv"
 CSV_HEADER = [
@@ -176,8 +177,8 @@ def main():
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
-    from llama3 import PROBE_FULL
-    from llama3_mrpc import run_classifier_fhe, capture_pytorch_ref
+    from helpers.llama3 import PROBE_FULL
+    from fhe.llama3_mrpc import run_classifier_fhe, capture_pytorch_ref
 
     tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
     ds = load_dataset("nyu-mll/glue", "mrpc")["validation"]
@@ -208,7 +209,7 @@ def main():
     # holds plaintexts bound to this engine's (ctx, encoder) — rebuilding
     # the engine per-example would invalidate cached plaintexts and produce
     # zeroed / wrong outputs.
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine
     user_steps, step_categories = build_user_steps_mrpc()
     print(f"Building shared CKKS engine ({len(user_steps)} rotation steps)...",
           flush=True)
