@@ -34,11 +34,13 @@ Two test cases:
 
 import math
 import os
+import sys
 import time
 
 import numpy as np
 import pyPhantom as phantom
 
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project/blocks")
 from rope import apply_rope, build_rope_tables_packed, build_rope_tables_single, rope_required_steps
 
 

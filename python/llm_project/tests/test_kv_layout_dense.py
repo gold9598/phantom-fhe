@@ -20,7 +20,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
 from blocks.kv_layout_dense import (
     next_pow2,
     positions_per_ct,

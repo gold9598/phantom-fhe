@@ -52,9 +52,3 @@ def yes_no_logits_np(y_d, final_norm_g, lm_head_yesno, eps=1e-5):
     return yes_logit, no_logit
 
 
-def fhe_decrypt_extract_y(ctx, encoder, sk, y_ct, t_model, d_model):
-    """Decrypt the final FHE hidden state ct and extract the D_MODEL-sized
-    vector at the query position from its stride-T_MODEL slot layout."""
-    full = np.array(encoder.decode_double_vector(ctx, sk.decrypt(ctx, y_ct)),
-                    dtype=np.float64)
-    return full[::t_model][:d_model]

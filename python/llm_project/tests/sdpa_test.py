@@ -19,7 +19,7 @@ import time
 import numpy as np
 import pyPhantom as phantom
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project/blocks")
 from attention import scaled_dot_product_attention, sdpa_required_steps
 
 
