@@ -183,7 +183,7 @@ def run_ppl_eval(num_windows, csv_path):
         build_user_steps_mrpc,
         setup_engine,
     )
-    from lm_head_full import full_vocab_logprobs_np, next_token_logprobs
+    from blocks.lm_head_full import full_vocab_logprobs_np, next_token_logprobs
 
     # Build engine ONCE and reuse across all windows
     print("Building CKKS engine (once) ...")
