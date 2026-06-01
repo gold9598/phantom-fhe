@@ -77,8 +77,8 @@ for f in python/llm_project/tests/*_test.py; do python3 "$f"; done
 All imports are absolute-qualified from the `llm_project` root:
 
 ```python
-from fhe.engine_setup import build_engine
-from helpers.llama3 import HIDDEN_DIM
+from fhe.engine_setup import setup_engine
+from helpers.llama3 import D_MODEL
 from blocks.irp import irp_matvec_host
 ```
 
