@@ -130,9 +130,9 @@ Plus a chain layout that uses the_lib's distinct prime pools:
       `ckks_rescaled_scale_at()` instead of hand-rolled D_exact computation
 - [ ] Drop the Phase-3.0 guard in `CKKSEngine::bootstrap_inplace`
 
-### ⏸️ Phase 7 — wrappers / tests / llama3.py
+### ⏸️ Phase 7 — wrappers / tests / helpers/llama3.py
 
-- [ ] `bootstrap_test.py`: tighten tolerances to ~20-bit precision
+- [ ] `tests/bootstrap_test.py`: tighten tolerances to ~20-bit precision
       expectation when running on the new chain
 - [ ] Add new probe `probe_bootstrap_to17.py` that runs full bootstrap on
       the new chain, prints avg/max bits, compares to the_lib reference
@@ -144,7 +144,7 @@ Plus a chain layout that uses the_lib's distinct prime pools:
       `mlp_post_swiglu` (1.26) may be unnecessary for moderate-range
       inputs; `attn_pre_finsmx`'s plaintext mean-subtract should also
       be re-evaluated
-- [ ] `llama3.py`: re-derive `freshest_chain_index = 14` (not 16),
+- [ ] `helpers/llama3.py`: re-derive `freshest_chain_index = 14` (not 16),
       adjust per-step galois target chain indices, possibly swap
       `NUM_SCALE_LEVELS = 14` → `18` for more user-level headroom
 
@@ -162,7 +162,7 @@ Plus a chain layout that uses the_lib's distinct prime pools:
 3. **OVER_SCALED state**: `PhantomCiphertext` has no flag for "ct is
    over-scaled, awaiting rescale". Either add one (touches phantom-fhe
    core) or track externally in our wrappers.
-4. **llama3.py level budget**: pipeline currently fits in NSL=14
+4. **helpers/llama3.py level budget**: pipeline currently fits in NSL=14
    (max_user_level=13); switching to NSL=18 (max=17) gives more headroom
    but per-step galois assignments need re-derivation. Some IRP step
    targets may shift.
@@ -180,5 +180,5 @@ Plus a chain layout that uses the_lib's distinct prime pools:
 | `src/single_chain_plaintext.cu` | — | — | — | TBD | — | — |
 | `python/src/binding.cu` | ✅ | ✅ | — | — | — | — |
 | `python/llm_project/blocks/bootstrap.py` | — | — | — | — | — | TBD |
-| `python/llm_project/blocks/bootstrap_test.py` | — | — | — | — | — | TBD |
-| `python/llm_project/llama3.py` | — | — | — | — | — | TBD |
+| `python/llm_project/tests/bootstrap_test.py` | — | — | — | — | — | TBD |
+| `python/llm_project/helpers/llama3.py` | — | — | — | — | — | TBD |
