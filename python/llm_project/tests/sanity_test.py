@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
 import pyPhantom as phantom
 
 sys.path.insert(0, _LLM_PROJECT)
-from llama3 import (LOG_N, NUM_SLOTS, SCALE, SPARSE_HW, NUM_SCALE_LEVELS,
+from helpers.llama3 import (LOG_N, NUM_SLOTS, SCALE, SPARSE_HW, NUM_SCALE_LEVELS,
                      NUM_SPECIAL_PRIMES)
 
 

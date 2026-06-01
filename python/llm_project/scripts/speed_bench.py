@@ -30,9 +30,10 @@ import time
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_THIS_DIR))
+_LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+_REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
-sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, _LLM)
 
 PROBE = "/tmp/llama_probe_full"
 
@@ -58,7 +59,7 @@ def _ptref_subprocess(target_nt, out_path):
     script = f"""
 import os, sys, numpy as np
 sys.path.insert(0, '{os.path.join(_REPO, "build", "lib")}')
-sys.path.insert(0, '{_THIS_DIR}')
+sys.path.insert(0, '{_LLM}')
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
@@ -160,7 +161,7 @@ def main():
 
     # Engine.
     import pyPhantom as phantom  # noqa: F401
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine, run_classifier_fhe
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine, run_classifier_fhe
     user_steps, step_categories = build_user_steps_mrpc()
     print(f"[speed_bench] building CKKS engine...", flush=True)
     engine = setup_engine(user_steps, step_categories=step_categories)

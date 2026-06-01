@@ -30,7 +30,7 @@ from blocks import kv_layout_dense as _dense_oracle
 from blocks import kv_layout_dense_fhe as _dense_fhe
 from blocks import irp_cache as _irp_cache
 from blocks.softmax import softmax_damping_schedule
-from llama3 import (
+from helpers.llama3 import (
     NUM_SLOTS, SCALE,
     D_MODEL, D_HEAD, N_HEADS, N_KV_HEADS, N_KV_GROUPS, D_TOTAL,
     T_MODEL,
@@ -39,7 +39,7 @@ from llama3 import (
     load_layer_weights,
 )
 
-from engine_setup import _real_nt
+from fhe.engine_setup import _real_nt
 
 
 # K cache magnitude pre-scaler.

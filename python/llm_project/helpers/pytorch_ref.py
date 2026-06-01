@@ -7,7 +7,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project")
-from llama3 import PROBE_FULL
+from helpers.llama3 import PROBE_FULL
 
 
 def capture_pytorch_ref_with_model(model, tok, token_ids):
