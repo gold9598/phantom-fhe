@@ -60,11 +60,12 @@ def _malloc_trim():
 # Resolve build/lib and llm_project paths relative to this file so the script
 # runs on any host without modification (5090 dev box, A6000/A100 sweep box).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_THIS_DIR))  # python/llm_project -> repo
+_LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+_REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
 import pyPhantom as phantom  # noqa: F401
 
-sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, _LLM)
 
 # 32 decoder layers in LLaMA-3.1-8B. Mirrors the hardcoded NUM_DECODERS
 # in run_classifier_fhe and llama3.main(); not module-exported there.
@@ -538,7 +539,7 @@ def _rp_indep_build_subprocess_main(disk_root, gpu_id, num_decoders,
     # Pin this child to one GPU and re-import everything inside the
     # child (spawn start method can't pickle module-level closures).
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    sys.path.insert(0, _THIS_DIR)
+    sys.path.insert(0, _LLM)
     sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
     import gc
     import pyPhantom as phantom_child  # noqa: F401 — same module, fresh handle
@@ -600,7 +601,7 @@ def _ptref_prewarm_subprocess_main(miss_specs, gpu_id):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     # Re-import the capture helper inside the child. We can't pickle
     # closures through spawn, so we rebuild the path locally.
-    sys.path.insert(0, _THIS_DIR)
+    sys.path.insert(0, _LLM)
     from fhe.llama3_mrpc import capture_pytorch_ref_with_model
 
     tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")

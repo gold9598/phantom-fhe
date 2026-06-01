@@ -35,9 +35,10 @@ import numpy as np
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_THIS_DIR))
+_LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+_REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
-sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, _LLM)
 
 import pyPhantom as phantom  # noqa: E402
 

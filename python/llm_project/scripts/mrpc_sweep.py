@@ -23,10 +23,11 @@ import numpy as np
 # Resolve build/lib and llm_project paths relative to this file so the script
 # runs without modification on any host (5090 dev box, A6000 sweep box, etc.).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_THIS_DIR))  # python/llm_project -> repo
+_LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+_REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
 sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
 
-sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, _LLM)
 
 CSV_PATH = "/tmp/mrpc_sweep_results.csv"
 CSV_HEADER = [

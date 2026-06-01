@@ -39,8 +39,9 @@ def main():
     # Ensure llm_project + build/lib on path so capture_pytorch_ref_with_model
     # imports cleanly.
     _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-    _REPO = os.path.dirname(os.path.dirname(_THIS_DIR))
-    sys.path.insert(0, _THIS_DIR)
+    _LLM = os.path.dirname(_THIS_DIR)   # llm_project/ (one level up from scripts/)
+    _REPO = os.path.dirname(os.path.dirname(_LLM))  # phantom-fhe repo root
+    sys.path.insert(0, _LLM)
     sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
 
     from datasets import load_dataset
