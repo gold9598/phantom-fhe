@@ -117,8 +117,8 @@ def main():
         help="Layer index to start at. Skips layers already saved on disk.")
     args = ap.parse_args()
 
-    from llama3 import load_layer_weights, encode_layer_rp_indep_irps
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from helpers.llama3 import load_layer_weights, encode_layer_rp_indep_irps
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine
     from blocks.scp_disk_cache import save_scp_dict_to_disk, has_cache
 
     os.makedirs(args.out, exist_ok=True)

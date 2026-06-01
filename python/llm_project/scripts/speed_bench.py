@@ -160,7 +160,7 @@ def main():
 
     # Engine.
     import pyPhantom as phantom  # noqa: F401
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine, run_classifier_fhe
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine, run_classifier_fhe
     user_steps, step_categories = build_user_steps_mrpc()
     print(f"[speed_bench] building CKKS engine...", flush=True)
     engine = setup_engine(user_steps, step_categories=step_categories)

@@ -113,10 +113,10 @@ def main():
              "(e.g. --nt 512 to match Cachemir's benchmark).")
     args = ap.parse_args()
 
-    from llama3 import load_layer_weights, PROBE_FULL  # noqa: F401
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from helpers.llama3 import load_layer_weights, PROBE_FULL  # noqa: F401
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine
     from blocks.scp_disk_cache import save_scp_dict_to_disk
-    from llama3 import encode_layer_wq_irp, rope_matrix_np
+    from helpers.llama3 import encode_layer_wq_irp, rope_matrix_np
 
     # 1. Resolve which num_tokens values to encode for.
     if args.nt:

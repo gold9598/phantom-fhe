@@ -176,8 +176,8 @@ def main():
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
-    from llama3 import PROBE_FULL
-    from llama3_mrpc import run_classifier_fhe, capture_pytorch_ref
+    from helpers.llama3 import PROBE_FULL
+    from fhe.llama3_mrpc import run_classifier_fhe, capture_pytorch_ref
 
     tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
     ds = load_dataset("nyu-mll/glue", "mrpc")["validation"]
@@ -208,7 +208,7 @@ def main():
     # holds plaintexts bound to this engine's (ctx, encoder) — rebuilding
     # the engine per-example would invalidate cached plaintexts and produce
     # zeroed / wrong outputs.
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine
     user_steps, step_categories = build_user_steps_mrpc()
     print(f"Building shared CKKS engine ({len(user_steps)} rotation steps)...",
           flush=True)

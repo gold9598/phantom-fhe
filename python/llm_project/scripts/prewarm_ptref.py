@@ -46,7 +46,7 @@ def main():
     from datasets import load_dataset
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
-    from llama3_mrpc import capture_pytorch_ref_with_model
+    from fhe.llama3_mrpc import capture_pytorch_ref_with_model
 
     PROMPT_FMT = ("Are these two sentences paraphrases of each other?\n"
                   "Sentence 1: {s1}\nSentence 2: {s2}\n"

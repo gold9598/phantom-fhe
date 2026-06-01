@@ -21,7 +21,7 @@ from blocks.rmsnorm import rmsnorm_required_steps_stride_t
 from blocks.softmax import (
     softmax_damping_schedule, softmax_required_steps,
 )
-from llama3 import (
+from helpers.llama3 import (
     LOG_N, N, NUM_SLOTS, SCALE,
     D_MODEL, D_HEAD, N_HEADS, N_KV_HEADS, N_KV_GROUPS, D_TOTAL,
     T_MODEL,

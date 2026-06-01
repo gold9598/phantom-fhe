@@ -542,8 +542,8 @@ def _rp_indep_build_subprocess_main(disk_root, gpu_id, num_decoders,
     sys.path.insert(0, os.path.join(_REPO, "build", "lib"))
     import gc
     import pyPhantom as phantom_child  # noqa: F401 — same module, fresh handle
-    from llama3 import load_layer_weights, encode_layer_rp_indep_irps
-    from llama3_mrpc import build_user_steps_mrpc, setup_engine
+    from helpers.llama3 import load_layer_weights, encode_layer_rp_indep_irps
+    from fhe.llama3_mrpc import build_user_steps_mrpc, setup_engine
     from blocks.scp_disk_cache import save_scp_dict_to_disk
 
     print(f"  [rp_indep-subproc] PID={os.getpid()} GPU={gpu_id} "
@@ -601,7 +601,7 @@ def _ptref_prewarm_subprocess_main(miss_specs, gpu_id):
     # Re-import the capture helper inside the child. We can't pickle
     # closures through spawn, so we rebuild the path locally.
     sys.path.insert(0, _THIS_DIR)
-    from llama3_mrpc import capture_pytorch_ref_with_model
+    from fhe.llama3_mrpc import capture_pytorch_ref_with_model
 
     tok = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B")
     t_load0 = time.perf_counter()
@@ -823,10 +823,10 @@ def main():
     # mrpc_sweep_parallel"` is cheap (mirrors mrpc_sweep.py).
     from datasets import load_dataset
     from transformers import AutoTokenizer
-    from llama3 import (PROBE_FULL, load_layer_weights,
+    from helpers.llama3 import (PROBE_FULL, load_layer_weights,
                           load_layer_weights_subset,
                           encode_layer_rp_indep_irps)
-    from llama3_mrpc import (run_classifier_fhe, capture_pytorch_ref,
+    from fhe.llama3_mrpc import (run_classifier_fhe, capture_pytorch_ref,
                               capture_pytorch_ref_with_model,
                               build_user_steps_mrpc, setup_engine)
 
@@ -930,7 +930,7 @@ def main():
 
     import gc as _gc
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from llama3_mrpc import compute_layer_calib_n, BOOT_CALIB_MARGIN
+    from fhe.llama3_mrpc import compute_layer_calib_n, BOOT_CALIB_MARGIN
     ref_cos = cos_all_full[:ref_n]
     ref_sin = sin_all_full[:ref_n]
 
