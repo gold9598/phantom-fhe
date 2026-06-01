@@ -6,7 +6,7 @@ import math
 import random
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project/blocks")
 
 import numpy as np
 import pyPhantom as phantom
