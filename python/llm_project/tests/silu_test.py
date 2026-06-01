@@ -4,9 +4,12 @@ SiLU (deg-8 Chebyshev fit on [-2, 2]) round-trip test.
 
 import math
 import random
+import sys
 
 import numpy as np
 import pyPhantom as phantom
+
+sys.path.insert(0, "/home/yongwoo-oh/phantom-fhe/python/llm_project/blocks")
 from silu import silu, SILU_COEFFS_DEG5_R2
 
 

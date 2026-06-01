@@ -66,23 +66,6 @@ def softmax_required_steps(num_tokens, stride):
     return steps
 
 
-def softmax_forward(ctx, encoder, relin_key, galois_key, scores_ct,
-                    num_tokens, num_squarings, extra_scale, target_mag,
-                    iters, reduce_count, stride):
-    """ps_exp_init -> damped squarings -> finalize_softmax.
-
-    Caller is responsible for masking non-meaningful slots before calling this.
-    """
-    damps = softmax_damping_schedule(num_squarings, num_tokens, extra_scale, target_mag)
-    e_ct = phantom.ps_exp_init(
-        ctx, encoder, relin_key, scores_ct,
-        num_tokens, num_squarings, extra_scale)
-    phantom.square_iterations_damped_inplace(ctx, encoder, relin_key, e_ct, damps)
-    return phantom.finalize_softmax(
-        ctx, encoder, relin_key, galois_key, e_ct,
-        reduce_count, stride, iters)
-
-
 def reference_softmax(scores):
     """Numerically-stable max-shifted softmax (numpy reference)."""
     s = np.asarray(scores, dtype=np.float64)
