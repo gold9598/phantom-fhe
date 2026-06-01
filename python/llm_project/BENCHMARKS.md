@@ -181,10 +181,10 @@ pure-Python implementations (`rmsnorm_forward_stride_t` in
 `score_times_v_irp` in `blocks/attention.py`). K/V cache is interleaved
 across tokens per the Cachemir paper §5.1.
 
-Only `sk.encrypt_symmetric` (initial input encryption at the client
-boundary, `llama3.py:638-640`) and `sk.decrypt(y_ct)` (test-harness
-reference compare, `llama3.py:810`) touch the secret key — both at
-boundaries, not in the decoder body.
+Only `sk.encrypt_symmetric` (client-boundary input encryption in
+`fhe/fhe_attention_dense.py` — `encrypt_layer_inputs_multi`) and
+`sk.decrypt` (diagnostic/test reference compare in `fhe/decoder_layer.py`)
+touch the secret key — both at boundaries, not in the decoder body.
 
 ### Bootstrap mechanism
 
@@ -234,30 +234,29 @@ paper's 1.98×) because the IRP layout shifts already include free decrypt+re-en
 level resets that the search recognises as zero-cost level moves.
 
 **Phase 4 — headline script rewire.**
-Both `llama3_simulation.py` and `llama3.py` are rewired to use the Cachemir
-blocks end-to-end.
+The production entry is `fhe/llama3_mrpc.py` (MRPC, 32-layer + LM head);
+`scripts/llama3_simulation.py` is the plaintext-shim reference
+(decrypt+re-encrypt instead of bootstrap).
 
 ## Files
 
 ```
-python/llm_project/llama3.py                  # real EvalMod path (production)
-python/llm_project/llama3_simulation.py       # plaintext-shim path (reference only,
-                                              # decrypt+re-encrypt instead of bootstrap)
-
-python/llm_project/blocks/irp.py              # Cachemir §4.1 IRP (square + rect)
-python/llm_project/blocks/kv_cache.py         # Cachemir §5 KV cache + ct·ct attn
-python/llm_project/blocks/bootstrap_placement.py  # Cachemir §6 DAG placement
-
-python/llm_project/blocks/attention.py        # IRP-aware attention orchestration
-python/llm_project/blocks/mlp.py              # MLP forward + setup helpers
-python/llm_project/blocks/rmsnorm.py          # RMSNorm forward + setup
-python/llm_project/blocks/softmax.py          # softmax helpers + composition
-python/llm_project/blocks/silu.py             # SiLU coefficient table + forward
-python/llm_project/blocks/rope.py             # RoPE precompute + apply
-python/llm_project/blocks/linear.py           # FD linear (legacy diagonal path)
-python/llm_project/blocks/bootstrap.py        # mean-centered EvalMod wrapper
-python/llm_project/blocks/residual.py         # residual add helper
+python/llm_project/fhe/llama3_mrpc.py            # production MRPC entry (32-layer + LM head)
+python/llm_project/fhe/decoder_layer.py          # one decoder layer
+python/llm_project/fhe/engine_setup.py           # CKKS engine build + galois steps + calibration
+python/llm_project/fhe/fhe_attention_dense.py    # dense IRP attention (QK^T, softmax, score·V, Wo)
+python/llm_project/helpers/llama3.py             # constants, numpy reference helpers, weight loaders
+python/llm_project/helpers/pytorch_ref.py        # PyTorch reference capture + on-disk cache
+python/llm_project/helpers/diagnostics.py        # _probe (decrypt+print), _malloc_trim
+python/llm_project/scripts/llama3_simulation.py  # plaintext-shim reference (decrypt+re-encrypt)
+python/llm_project/scripts/mrpc_sweep.py         # MRPC sweep driver
+python/llm_project/blocks/irp.py                 # Cachemir §4.1 IRP (square + rect; quant-delta file)
+python/llm_project/blocks/attention.py           # IRP attention kernels (compute_qkt_irp, finalize_softmax_irp_t, score_times_v_irp)
+python/llm_project/blocks/bootstrap_placement.py # Cachemir §6 DAG placement
+python/llm_project/blocks/{bootstrap,rmsnorm,softmax,silu,rope,residual,linear}.py  # kernels
 ```
+
+blocks/ also holds the per-branch quant delta: `irp.py` / `irp_cache.py` / `scp_disk_cache.py`.
 
 ## Reproduce
 
@@ -267,20 +266,18 @@ Build (from repo root):
 cmake --build build -j 8
 ```
 
-Run headlines:
+Run from `python/llm_project`:
 
 ```bash
-PYTHONPATH=build/lib python3 python/llm_project/llama3.py             # real bootstrap
-PYTHONPATH=build/lib python3 python/llm_project/llama3_simulation.py  # reference-only
+cd python/llm_project
+HF_HUB_OFFLINE=1 USE_BOOTSTRAP_17=1 python3 -u fhe/llama3_mrpc.py --idx 0   # one MRPC example (real bootstrap)
+python3 scripts/llama3_simulation.py                                          # plaintext-shim reference
 ```
 
-Run all 11 block regression tests:
+Run all block regression tests:
 
 ```bash
-for f in python/llm_project/blocks/{silu,ps,replicate,softmax,rmsnorm,rope,bsgs}_test.py \
-         python/llm_project/blocks/{linear_fd,mlp_test,mlp_complex_test,sdpa_test}.py; do
-    PYTHONPATH=build/lib python3 "$f"
-done
+for f in python/llm_project/tests/*_test.py; do python3 "$f"; done
 ```
 
 ## C++ surface added
